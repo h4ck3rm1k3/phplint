@@ -1,0 +1,452 @@
+IMPLEMENTATION MODULE Typecast
+
+IMPORT Types
+IMPORT Scanner
+IMPORT Search
+IMPORT Globals
+IMPORT Classes
+# Break circular depency:
+###IMPORT Expressions
+$ RECORD * Expressions_ParseExpr(void);
+$ RECORD * Expressions_ParseStaticExpr(void);
+IMPORT str
+IMPORT m2
+
+
+FUNCTION ParseType(s: STRING): Type
+(*
+	Parse the type in cast(s,...) where s follows this syntax:
+
+		type = type_name { index } | array;
+
+		type_name = "boolean" | "int" | "float" | "string" | "resource"
+			| "object" | CLASS_NAME;
+		
+		array = "array" [ index { index } ] type_name;
+
+		index = "[]" | "[int]" | "[string]";
+
+	Note that there is not a "mixed" type as there is no way to check at
+	runtime is something do is "mixed", nor are possible arrays of mixed.
+	Returns the parsed type or NIL if fails.
+*)
+VAR
+	i: INTEGER
+	token: STRING  # can be NIL, "[", "]" or "array" or type name
+	token_lc: STRING  # the token in lower-case letters
+
+
+	FUNCTION nextToken()
+	(*
+		Scan tokens of the type descriptor. Possible tokens are:
+		"[", "]", NIL (end of the string), "anythingelse".
+		Set variable token and token_lc.
+	*)
+	VAR	
+		c: STRING
+		j: INTEGER
+	BEGIN
+		IF i >= length(s) THEN
+			token = NIL
+			token_lc = NIL
+			RETURN
+		END
+		c = s[i]
+		IF (c = "[") OR (c = "]") THEN
+			token = c
+			token_lc = token
+			i = i + 1
+			RETURN
+		END
+		j = index(s, i, "[]")
+		IF j < 0 THEN
+			token = s[i,length(s)]
+			token_lc = tolower(token)
+			i = length(s)
+			RETURN
+		END
+		token = s[i,j]
+		token_lc = tolower(token)
+		i = j
+	END
+
+
+	FUNCTION isKeyword(k: STRING): BOOLEAN
+	(*
+		Checks if the token equals the keyword k. k must be in lower-case
+		letters. Warns if they match, but with different combination of uppre-
+		and lower-case letters, for example "String".
+	*)
+	BEGIN
+		IF k = token_lc THEN
+			IF k <> token THEN
+				Scanner.Error("spelling check: expected " + k + " but found " + token)
+			END
+			RETURN TRUE
+		ELSE
+			RETURN FALSE
+		END
+	END
+
+
+	FUNCTION ParseTypeName(): Type
+	(*
+		Parse type_name.
+		Return NIL if fails.
+	*)
+	VAR
+		c: Class
+	BEGIN
+		IF token = NIL THEN
+			Scanner.Error("missing type")
+			RETURN NIL
+		ELSIF isKeyword("boolean") OR isKeyword("bool") THEN
+			nextToken()
+			RETURN boolean_type
+		ELSIF isKeyword("int") OR isKeyword("integer") THEN
+			nextToken()
+			RETURN int_type
+		ELSIF isKeyword("float") OR isKeyword("double") OR isKeyword("real") THEN
+			nextToken()
+			RETURN float_type
+		ELSIF isKeyword("string") THEN
+			nextToken()
+			RETURN string_type
+		ELSIF isKeyword("resource") THEN
+			nextToken()
+			RETURN resource_type
+		ELSIF isKeyword("object") THEN
+			nextToken()
+			RETURN object_type
+		ELSIF match(token, Globals.BARE_ID_OR_QUALIFIED_NAME) THEN
+			IF token[0] <> "\\" THEN
+				# Make class name absolute because cast() cannot resolve NS,
+				# the SearchClass() must not apply "use" statements:
+				token = "\\" + token
+			END
+			c = SearchClass(token)
+			IF c = NIL THEN
+				Scanner.Error("class not found: " + token)
+				RETURN NIL
+			ELSE
+				nextToken()
+				RETURN c[type]
+			END
+		ELSE
+			Scanner.Error("invalid syntax in type: " + token)
+			RETURN NIL
+		END
+	END
+
+
+	FUNCTION ParseArray(): Type
+	(*
+		Parse array[][]T. We enter with token="[" of the first index.
+	*)
+	VAR
+		a: Type
+	BEGIN
+		IF token <> "[" THEN
+			Scanner.Error("missing `[' after array")
+			RETURN NIL
+		END
+		nextToken()
+		a = {array, void, NIL, NIL}
+		IF isKeyword("int") THEN
+			nextToken()
+			a[index_type] = int
+		ELSIF isKeyword("string") THEN
+			nextToken()
+			a[index_type] = string
+		ELSIF token = "]" THEN
+			a[index_type] = mixed
+		ELSE
+			Scanner.Error("invalid index: " + token)
+			RETURN NIL
+		END
+		IF token <> "]" THEN
+			Scanner.Error("missing `]'")
+			RETURN NIL
+		END
+		nextToken()
+		IF token = "[" THEN
+			a[elem_type] = ParseArray()
+		ELSE
+			a[elem_type] = ParseTypeName()
+		END
+		IF a[elem_type] = NIL THEN
+			RETURN NIL
+		END
+		RETURN a
+	END
+
+
+	FUNCTION ParseIndeces(t: Type): Type
+	(*
+		Parses T[][]. t is the type of T. We enter with token="["
+		of the first index.
+		Returns the type or NIL if fails.
+	*)
+	VAR
+		a: Type
+	BEGIN
+		a = {array, void, NIL, NIL}
+		nextToken()
+		IF isKeyword("int") THEN
+			a[index_type] = int
+			nextToken()
+		ELSIF isKeyword("string") THEN
+			a[index_type] = string
+			nextToken()
+		ELSIF token = "]" THEN
+			a[index_type] = mixed
+		END
+		IF token <> "]" THEN
+			Scanner.Error("missing `]'")
+			RETURN NIL
+		END
+		nextToken()
+		IF token = "[" THEN
+			a[elem_type] = ParseIndeces(t)
+			IF a[elem_type] = NIL THEN
+				RETURN NIL
+			END
+		ELSE
+			a[elem_type] = t
+		END
+		RETURN a
+	END
+
+
+VAR
+	t: Type
+BEGIN
+	i = 0
+	nextToken()
+
+	IF isKeyword("array") THEN
+		# Old type syntax array[][]T:
+		nextToken()
+		t = ParseArray()
+	ELSE
+		# New type syntax T[][]:
+		t = ParseTypeName()
+		IF t = NIL THEN
+			RETURN NIL
+		END
+		IF token = "[" THEN
+			t = ParseIndeces(t)
+		END
+	END
+
+	IF t = NIL THEN
+		# Parsing failed.
+		RETURN NIL
+	ELSIF token <> NIL THEN
+		Scanner.Error("unexpected symbol: " + token)
+	END
+
+	RETURN t
+END
+
+
+FUNCTION err(to: Type, from: Type)
+BEGIN
+	Scanner.Error("cast(" + TypeToString(to) + ", "
+	+ TypeToString(from) + "): invalid typecast")
+END
+
+
+FUNCTION check_cast_types(to: Type, from: Type)
+(*
+	In cast(to,from) checks the types according to the general rules
+	that follow:
+
+	1. cast() can be used to map a mixed into a well known type
+	or a general object into a well known class.
+
+	2. cast() can project an object of a given class in one of its parent
+	classes: cast(parent, child).
+
+	3. cast() can check the structure of an array for a well known type
+	of its index or of its elements.
+
+	4. cast() always succeeds in converting any type in itself, with the
+	only exception of mixed that never appear in "to".
+
+	5. In any case, cast() does not perform runtime conversions of values but
+	it merely checks type compatibility, so for example converting int into
+	string still requires the `(string)' typecast already available in PHP.
+*)
+VAR
+	to_idx, from_idx: INTEGER
+	to_elem, from_elem: Type
+BEGIN
+	# If either the "to" or the "from" types were not recognized,
+	# an error was already raised, then skip checks:
+	IF (to = NIL) OR (from = NIL) THEN
+		RETURN
+	END
+
+	IF SameType(to, from) THEN
+		# ok
+		RETURN
+	END
+	
+	SWITCH from[basetype] DO
+
+	CASE boolean:
+		err(to, from)
+
+	CASE int:
+		IF to = float_type THEN
+			err(to, from)
+		ELSIF to = string_type THEN
+			err(to, from)
+		ELSE
+			err(to, from)
+		END
+
+	CASE float:
+		IF to = int_type THEN
+			err(to, from)
+		ELSIF to = string_type THEN
+			err(to, from)
+		ELSE
+			err(to, from)
+		END
+
+	CASE string:
+		IF to = int_type THEN
+			err(to, from)
+		ELSIF to = float_type THEN
+			err(to, from)
+		ELSE
+			err(to, from)
+		END
+	
+	CASE resource:
+		err(to, from)
+
+	CASE object:
+		IF to[basetype] = object THEN
+			IF (from[class] = NIL) OR IsSubclassOf(to[class], from[class]) THEN
+				# ok
+			ELSE
+				err(to, from)
+			END
+		ELSE
+			err(to, from)
+		END
+
+	CASE array:
+		IF to[basetype] = array THEN
+
+			# Compare indices:
+
+			to_idx = to[index_type]
+			from_idx = from[index_type]
+			SWITCH from_idx DO
+			CASE void:
+				# unknown, performing runtime check
+			CASE int:
+				IF to_idx = string THEN
+					err(to, from)
+				END
+			CASE string:
+				IF to_idx = int THEN
+					err(to, from)
+				END
+			CASE mixed:
+				# both int and string
+			END
+
+			# Compare elements:
+
+			to_elem = to[elem_type]
+			from_elem = from[elem_type]
+
+			IF from_elem = NIL THEN
+				# from unknown, runtime check
+
+			ELSIF to_elem = NIL THEN
+				# to anything, no runtime check
+
+			ELSE
+				check_cast_types(to_elem, from_elem)
+
+			END
+
+		ELSE
+			err(to, from)
+		END
+
+	CASE mixed:
+		# ok
+
+	ELSE
+		err(to, from)
+
+	END
+END
+
+
+FUNCTION EvaluateCastCall(): Type
+VAR
+	type: Type
+	inside_call: BOOLEAN
+	to_result: Result
+	from_result: Result
+BEGIN
+	ReadSym()
+
+	(*
+		Parsing the destination type (first arg of cast(T,V)). T must
+		be a static expr only in the user code, but the PHP
+		implementation itself of the cast() function it is a
+		variable. Then to avoid error messages while parsing the
+		recursive call inside the code of the cast() function itsef,
+		here we must only require the proper expression syntax based on
+		the context of the parser.
+	*)
+	type = NIL
+	inside_call = (curr_func <> NIL) AND (curr_func[name] = "cast")
+	IF inside_call THEN
+$		Typecast_to_result = Expressions_ParseExpr();
+		type = NIL
+	ELSE
+$		Typecast_to_result = Expressions_ParseStaticExpr();
+		IF to_result = NIL THEN
+			# error already raised by ParseStaticExpr()
+			type = NIL
+
+		ELSIF to_result[type] <> string_type THEN
+			Scanner.Error("invalid type: expected string but found "
+			+ TypeToString(to_result[type]))
+			type = NIL
+
+		ELSIF to_result[value] = NIL THEN
+			# failed to parse the static expr - already signaled by ParseStaticExpr()
+			type = NIL
+
+		ELSE
+			type = ParseType(to_result[value])
+		END
+	END
+
+	Scanner.Expect(sym_comma, "expected `,'")
+	ReadSym()
+
+$	Typecast_from_result = Expressions_ParseExpr();
+
+	IF from_result <> NIL THEN
+		check_cast_types(type, from_result[type])
+	END
+
+	Expect(sym_rround, "expected `)'")
+	ReadSym()
+
+	RETURN type
+END
+
+END

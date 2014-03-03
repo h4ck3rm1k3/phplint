@@ -1,0 +1,25 @@
+
+BEGIN parsing of 5-colliding-methods.php
+1:	<?php
+2:	
+3:	# colliding inherited methods
+4:	
+5:	interface IF1
+6:	{
+7:		/*. void .*/ function m(/*. int .*/ $i);
+8:	}
+9:	
+10:	abstract class ABS
+11:	{
+12:		abstract /*. void .*/ function m(/*. int .*/ $i);
+13:	}
+14:	
+15:	class C extends ABS implements IF1
+16:	{ }
+17:	
+18:	?>
+==== 15: ERROR: in class `C': missing implementation of the abstract method `ABS::m()'
+==== 15: ERROR: in class `C': missing implementation of the abstract method `IF1::m()'
+END parsing of 5-colliding-methods.php
+==== 5-colliding-methods.php:15: notice: unused class `C'
+Overall test results: 2 errors, 0 warnings.

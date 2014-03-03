@@ -1,0 +1,105 @@
+DEFINITION MODULE Namespace
+(*
+	Terminology we use here:
+
+	Name: a sequence of one or more identifiers spearated by "\", possibly
+	with a leading "\":
+
+		name = ["\"] identifier { "\" identifier };
+	
+	Fully qualified name: a name with a leading "\":
+
+		fully_qualified_name = "\" identifier { "\" identifier };
+
+	Qualified name: name composed by at least two identifiers separated by "\":
+
+		qualified_name = identifier "\" identifier { "\" identifier };
+	
+	Leading identifier: the first identifier of a qualified name.
+
+	Absolute name: an identifier or a qualified name that identifies
+	an item (constant, function or class):
+
+		absolute_name = identifier { "\" identifier };
+
+*)
+
+FUNCTION inNamespace(): BOOLEAN
+(*
+	Return TRUE if we are inside a namespace.
+*)
+
+FUNCTION isFullyQualified(name: STRING): BOOLEAN
+(*
+	Returns TRUE if the name is fully qualified.
+*)
+
+FUNCTION isQualified(name: STRING): BOOLEAN
+(*
+	Returns TRUE if name is a qualified name.
+*)
+
+FUNCTION isIdentifier(name: STRING): BOOLEAN
+(*
+	Returns TRUE if name is a bare identifier.
+*)
+
+FUNCTION Absolute(id: STRING): STRING
+(*
+	Makes absolute the identifier according to the current
+	namespace. For example, if the current namespace is a\b then
+	Absolute("f") ==> "a\b\f"; if the current namespace is global
+	then simply returns id.
+*)
+
+FUNCTION CheckBareID(id: STRING): STRING
+(*
+	Displays an error if the ID contains at least a \, that is is not
+	a bare ID. Returns a valid bare ID just to continue parsing.
+*)
+
+FUNCTION AddUse(ns: STRING, alias: STRING)
+(*
+	Add `use NS as ALIAS' clause to the current package.
+	Parameters:
+	ns: target NS (identifier or qualified name).
+	alias: ID of the alias NS; if NIL, the last word of NS is used (identifier).
+*)
+
+FUNCTION ApplyUse(name: STRING, is_class: BOOLEAN): STRING
+(*
+	If the name is absolute, return the normalized fully qualified name
+	(that is, the leading \ is removed).
+	Otherwise, apply current `use' clauses to the non-absolute name.
+	Only for classes, the `use' target is applied also to bare identifiers,
+	not only to the leading identifier.
+	Only the first matching `use' clause is applied.
+	Inside a NS, if no `use' clause applies, then the current NS is
+	prepended and the resulting fully qualified name is returned.
+	Otherwise, simply returns the name.
+	Example:
+	namespace myns;
+	use a\b\c as z;
+	then
+	ApplyUse("\\x\\y", ?) ==> "x\\y"
+	ApplyUse("z", FALSE) ==> "z"
+	ApplyUse("z", TRUE) ==> "a\\b\\c"
+	ApplyUse("z\\x", ?) ==> "a\\b\\c\\x"
+	ApplyUse("f", ?) ==> "myns\\f"
+*)
+
+FUNCTION ReportUnusedUseClauses()
+(*
+	Reports unused `use' clauses in the current namespace.
+*)
+
+FUNCTION CheckSpelling(ns: STRING)
+(*
+	Raises an error if another NS was defined that differs only by
+	lowercase and uppercase letters.
+
+	Parameters:
+	ns: fully qualified name, qualified name or identifier 
+*)
+
+END

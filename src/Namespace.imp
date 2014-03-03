@@ -1,0 +1,196 @@
+IMPLEMENTATION MODULE Namespace
+
+IMPORT m2
+IMPORT str
+IMPORT Globals
+IMPORT Scanner
+
+
+FUNCTION inNamespace(): BOOLEAN
+BEGIN
+	RETURN curr_package[namespace_current] <> NIL
+END
+
+
+FUNCTION isFullyQualified(name: STRING): BOOLEAN
+BEGIN
+	RETURN name[0] = "\\"
+END
+
+
+FUNCTION isQualified(name: STRING): BOOLEAN
+BEGIN
+	RETURN find(name, "\\") > 0
+END
+
+
+FUNCTION isIdentifier(name: STRING): BOOLEAN
+BEGIN
+	RETURN find(name, "\\") < 0
+END
+
+
+FUNCTION Absolute(id: STRING): STRING
+BEGIN
+	IF inNamespace() THEN
+		RETURN curr_package[namespace_current] + "\\" + id
+	ELSE
+		RETURN id
+	END
+END
+
+
+FUNCTION CheckBareID(id: STRING): STRING
+BEGIN
+	IF isIdentifier(id) THEN
+		RETURN id
+	END
+	Error("qualified identifier not allowed in declaration")
+	RETURN substitute(id, "\\", "_")
+END
+
+
+FUNCTION index_last_sept(q: STRING): INTEGER
+VAR i: INTEGER
+BEGIN
+	FOR i = length(q)-1 TO 0 BY -1 DO
+		IF q[i] = "\\" THEN
+			RETURN i
+		END
+	END
+	RETURN -1
+END
+
+
+FUNCTION AddUse(target: STRING, alias: STRING)
+VAR
+	i: INTEGER
+	use: UseEntry
+BEGIN
+	IF alias = NIL THEN
+		i = index_last_sept(target)
+		IF i < 0 THEN
+			alias = target
+		ELSE
+			alias = target[i+1,length(target)]
+		END
+	END
+	use[target] = target
+	use[alias] = alias
+	use[used] = 0
+	use[decl_in] = here()
+	curr_package[namespace_use][] = use
+END
+
+
+FUNCTION ApplyUse(name: STRING, is_class: BOOLEAN): STRING
+VAR
+	i, j: INTEGER
+	use: UseEntry
+	leading: STRING
+BEGIN
+	IF isFullyQualified(name) THEN
+		RETURN name[1,length(name)]
+
+	ELSIF isQualified(name) THEN
+		i = find(name, "\\")
+		leading = name[0,i]
+		FOR j = 0 TO count(curr_package[namespace_use])-1 DO
+			use = curr_package[namespace_use][j]
+			IF use[alias] = leading THEN
+				inc(use[used], 1)
+				RETURN use[target] + name[i,length(name)]
+			END
+		END
+
+	ELSIF is_class THEN
+		(* bare identifier of class *)
+		FOR j = 0 TO count(curr_package[namespace_use])-1 DO
+			use = curr_package[namespace_use][j]
+			IF use[alias] = name THEN
+				inc(use[used], 1)
+				RETURN use[target]
+			END
+		END
+
+	END
+
+	(* Here: still unresolved non-absolute name. *)
+
+	IF inNamespace() THEN
+		RETURN curr_package[namespace_current] + "\\" + name
+	ELSE
+		RETURN name
+	END
+END
+
+
+FUNCTION ReportUnusedUseClauses()
+VAR
+	i: INTEGER
+	use: UseEntry
+BEGIN
+	FOR i = 0 TO count(curr_package[namespace_use])-1 DO
+		use = curr_package[namespace_use][i]
+		IF use[used] = 0 THEN
+			Notice2(use[decl_in], "unused clause `use " + use[target]
+			+ " as " + use[alias] + "'")
+		END
+	END
+END
+
+
+FUNCTION CheckSpelling(ns: STRING)
+VAR
+	ns_lower, path: STRING
+	i: INTEGER
+BEGIN
+	IF isFullyQualified(ns) THEN
+		ns = ns[1,length(ns)]
+	END
+	ns_lower = tolower(ns)
+	path = ns_lower + "\\"
+
+	# Search between constants:
+	FOR i = 0 TO count(consts)-1 DO
+		IF str.starts_with(consts[i][name_normalized], path) THEN
+			IF NOT str.starts_with(consts[i][name], ns) THEN
+				Error("namespace was declared `"
+				+ consts[i][name][0,length(ns)]
+				+ "' near " + reference(consts[i][decl_in])
+				+ " that differ by upper/lower-case letters only")
+			END
+			RETURN
+		END
+	END
+
+	# Search between functions:
+	FOR i = 0 TO count(funcs)-1 DO
+		IF str.starts_with(funcs[i][name_lower], path) THEN
+			IF NOT str.starts_with(funcs[i][name], ns) THEN
+				Error("namespace was declared `"
+				+ funcs[i][name][0,length(ns)]
+				+ "' near " + reference(funcs[i][decl_in])
+				+ " that differ by upper/lower-case letters only")
+			END
+			RETURN
+		END
+	END
+
+	# Search between classes:
+	FOR i = 0 TO count(classes)-1 DO
+		IF (classes[i][name_lower] = ns_lower)
+		OR str.starts_with(classes[i][name_lower], path) THEN
+			IF NOT str.starts_with(classes[i][name], ns) THEN
+				Error("namespace was declared `"
+				+ classes[i][name][0,length(ns)]
+				+ "' near " + reference(classes[i][decl_in])
+				+ " that differ by upper/lower-case letters only")
+			END
+			RETURN
+		END
+	END
+
+END
+
+END

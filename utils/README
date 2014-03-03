@@ -1,0 +1,18 @@
+utils
+=====
+
+Table of Contents
+=================
+
+make-libraries-doc
+	Generates documentation about the PHPLint Library (modules + stdlib).
+	Usage: ./make-libraries-doc
+
+make-pure-c-version
+	Builds the pure-c version of the distributable PHPLint package.
+	Used by Makefile.
+
+make-tokens-module
+	Builds src/Tokens.imp module that maps symbols into strings.
+	Defined symbols are read from src/Scanner.def.
+	Used by Makefile.

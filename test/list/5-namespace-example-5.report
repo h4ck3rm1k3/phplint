@@ -1,0 +1,19 @@
+
+BEGIN parsing of 5-namespace-example-5.php
+1:	<?php
+2:	namespace Foo\Bar\subnamespace;
+3:	
+4:	const FOO = 1;
+5:	function foo() {}
+6:	class foo
+==== 5: notice: guessed signature of the function `Foo\Bar\subnamespace\foo()' as void()
+7:	{
+8:	    static function staticmethod() {}
+9:	}
+==== 8: notice: guessed signature of the method `Foo\Bar\subnamespace\foo::staticmethod()' as public static void()
+10:	?>
+END parsing of 5-namespace-example-5.php
+==== 5-namespace-example-5.php:4: notice: unused constant `Foo\Bar\subnamespace\FOO'
+==== 5-namespace-example-5.php:5: notice: unused function `Foo\Bar\subnamespace\foo()'
+==== 5-namespace-example-5.php:6: notice: unused class `Foo\Bar\subnamespace\foo'
+Overall test results: 0 errors, 0 warnings.

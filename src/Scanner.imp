@@ -1,0 +1,2032 @@
+IMPLEMENTATION MODULE Scanner
+
+IMPORT m2, io, buffer, str, FileName, Tokens, Globals
+
+TYPE
+	StatusCode = (
+		inside_text,
+		(* text surrounding the PHP code *)
+
+		inside_code,
+		(* parsing PHP statement/expression *)
+
+		inside_x_code,
+		(* inside extended code /*. ... .*/ *)
+
+		inside_embedded_variable,
+		(*
+			found variable embedded in a double quoted string, c=first char of
+			the variable name - implies inside_code
+
+			"xxxx$VAR zzz"
+			      ^ here, c="V"
+		*)
+
+		inside_double_quoted_string
+		(*
+			just after the embedded variable, c=next char after the variable
+			name possibly the closing double quote - implies inside_code
+
+			"xxxx$VAR zzz"
+			         ^ here, c=" "
+		*)
+
+	)
+	
+TYPE
+	Status = RECORD
+
+		code: StatusCode
+
+		inside_code: BOOLEAN
+
+		inside_x_code: BOOLEAN
+
+		inside_embedded_variable: BOOLEAN
+
+		inside_double_quoted_string: BOOLEAN
+
+		sym: SYMBOL
+		(* current symbol *)
+
+		s: STRING
+		(* last string, ID, or number read *)
+
+		fn: STRING
+		(* absolute file name of the file we are parsing. If NIL, no file
+		   is currently opened for parsing *)
+
+		fd: FILE
+		(* the file we are parsing *)
+
+		line: STRING
+		(* current line being parsed *)
+
+		line_n: INTEGER
+		(* current line no. First line is the no. 1 *)
+
+		line_idx: INTEGER
+		(* offset of the current char in line *)
+
+		line_pos: INTEGER
+		(* text editor idea of the position of the current char *)
+
+		c: STRING
+		(* current char to be parsed, or NIL if end of the file *)
+	END
+
+VAR
+
+	fd: FILE
+	(* the file we are parsing *)
+
+	code: StatusCode
+
+	line: STRING
+	(* current line being parsed *)
+
+	line_n: INTEGER
+	(* current line no. First line is the no. 1 *)
+
+	line_idx: INTEGER
+	(* offset of the current char in line *)
+
+	line_pos: INTEGER
+	(* text editor idea of the position of the current char *)
+
+	c: STRING
+	(* current char to be parsed, or NIL if end of the file *)
+
+
+(*
+	ERROR REPORTING AND ACCOUNTING
+*)
+
+
+FUNCTION mn(c: Class, m: Method): STRING
+BEGIN
+	RETURN "`" + c[name] + "::" + m[name] + "()'"
+END
+
+
+FUNCTION fmt_fn(abs_path: STRING): STRING
+VAR r: STRING
+BEGIN
+	SWITCH print_path_fmt DO
+
+	CASE absolute_path:
+		RETURN abs_path
+	
+	CASE relative_path:
+		RETURN Relative(cwd + "/*", abs_path)
+	
+	CASE shortest_path:
+		r = Relative(cwd + "/*", abs_path)
+		IF length(r) < length(abs_path) THEN
+			RETURN r
+		ELSE
+			RETURN abs_path
+		END
+	END
+END
+
+
+FUNCTION here(): WHERE
+BEGIN
+	RETURN {fn, line_n}
+END
+
+
+FUNCTION reference(w: WHERE): STRING
+BEGIN
+	IF w = NIL THEN
+		RETURN "?:?"
+	ELSIF w[fn] = fn THEN
+		RETURN "line " + itos(w[line_n])
+	ELSE
+		RETURN fmt_fn(w[fn]) + ":" + w[line_n]
+	END
+END
+
+
+FUNCTION PrintWhere(w: WHERE)
+BEGIN
+	IF print_context OR print_source THEN
+		# Human-readable report: make error msgs more evident:
+		print("==== ")
+	END
+
+	IF w = NIL THEN
+		print("?: ")
+	ELSE
+		IF print_file_name
+		OR NOT print_source
+		OR (w[fn] <> fn) THEN
+			print(fmt_fn(w[fn]) + ":")
+		END
+		print(itos(w[line_n]) + ": ")
+	END
+END
+
+
+FUNCTION PrintCurrPos()
+BEGIN
+
+	IF print_context THEN
+		print("\n\t" + line + "\n\t" + repeat(" ", line_pos-1) + "\\_ HERE\n")
+	END
+
+	PrintWhere( here() )
+END
+
+
+FUNCTION Fatal(s: STRING)
+BEGIN
+	PrintCurrPos()
+	print("FATAL ERROR: " + s + "\n")
+	exit(1)
+END
+
+
+FUNCTION UnexpectedSymbol()
+BEGIN
+	Fatal("unexpected symbol " + CodeToName(sym))
+	exit(1)
+END
+
+
+FUNCTION Error(s: STRING)
+BEGIN
+	inc(error_counter, 1)
+	IF NOT print_errors THEN
+		RETURN
+	END
+	PrintCurrPos()
+	print("ERROR: " + s + "\n")
+END
+
+
+FUNCTION Error2(w: WHERE, s: STRING)
+BEGIN
+	inc(error_counter, 1)
+	IF NOT print_errors THEN
+		RETURN
+	END
+	PrintWhere(w)
+	print("ERROR: " + s + "\n")
+END
+
+
+FUNCTION Warning(s: STRING)
+BEGIN
+	inc(warning_counter, 1)
+	IF NOT print_warnings THEN
+		RETURN
+	END
+	PrintCurrPos()
+	print("Warning: " + s + "\n")
+END
+
+
+FUNCTION Warning2(w: WHERE, s: STRING)
+BEGIN
+	inc(warning_counter, 1)
+	IF NOT print_warnings THEN
+		RETURN
+	END
+	PrintWhere(w)
+	print("Warning: " + s + "\n")
+END
+
+
+FUNCTION Notice(s: STRING)
+BEGIN
+	IF NOT print_notices THEN
+		RETURN
+	END
+	PrintCurrPos()
+	print("notice: " + s + "\n")
+END
+
+
+FUNCTION Notice2(w: WHERE, s: STRING)
+BEGIN
+	IF NOT print_notices THEN
+		RETURN
+	END
+	PrintWhere(w)
+	print("notice: " + s + "\n")
+END
+
+
+FUNCTION SymToName(code: INTEGER): STRING
+BEGIN
+	RETURN Tokens.CodeToName(code)
+END
+
+
+FUNCTION Expect(es: SYMBOL, err: STRING)
+BEGIN
+	IF sym = es THEN
+		RETURN
+	END
+	Fatal(err + ", found symbol " + SymToName(sym))
+END
+
+FUNCTION PrintLineSource()
+BEGIN
+	IF print_line_numbers THEN
+		print( itos(line_n) )
+	END
+	print( ":\t" )
+	print( line )
+	print( "\n" )
+END
+
+
+FUNCTION ReadCh()
+BEGIN
+	# update line_n, line_pos:
+	IF c = NIL THEN
+	ELSIF c = "\t" THEN
+		inc(line_pos, tab_size)
+	ELSIF c = "\n" THEN
+		inc(line_n, 1)
+		line_pos = 1
+	ELSE
+		inc(line_pos, 1)
+	END
+
+	# get next char 'c' and update line_idx:
+	IF line = NIL THEN
+		c = NIL
+	ELSIF line_idx < length(line) THEN
+		c = line[line_idx]
+		inc(line_idx, 1)
+	ELSIF line_idx = length(line) THEN
+		c = "\n"
+		inc(line_idx, 1)
+	ELSE
+		TRY line = ReadLine(fd) END
+		IF line = NIL THEN
+			c = NIL
+		ELSIF length(line) = 0 THEN
+			c = "\n"
+		ELSE
+			c = line[0]
+		END
+		line_idx = 1
+		IF print_source AND (line <> NIL) THEN
+			PrintLineSource()
+		END
+	END
+
+	IF DEBUG THEN
+		print(c)
+	END
+END
+
+
+FUNCTION FollowingCharsMatch(s: STRING): BOOLEAN
+BEGIN
+	IF length(line) - line_idx < length(s) THEN
+		RETURN FALSE
+	END
+	RETURN line[line_idx,line_idx + length(s)] = s
+END
+
+
+VAR
+	b: BUFFER
+	(* used to gather chars from IDs, numbers, strings and keywords *)
+
+
+TYPE
+	Keywords = ARRAY OF RECORD  name: STRING  sym: SYMBOL  END
+
+VAR
+	php_keywords: Keywords
+	(* PHP reserved keywords *)
+
+	phplint_keywords: Keywords
+	(* PHPLint meta-language keywords *)
+
+
+FUNCTION SearchKeyword(word: STRING, list: Keywords): SYMBOL
+(*
+	The list MUST be sorted. If not found, return sym_unknown.
+	If sym_unimplemented_keyword raise a fatal error.
+*)
+VAR a, b, i, r: INTEGER  k: SYMBOL
+BEGIN
+	a = 0
+	b = count(list)-1
+	LOOP
+		i = (a + b) DIV 2
+		r = strcmp(word, list[i][name])
+		IF r < 0 THEN
+			b = i - 1
+		ELSIF r > 0 THEN
+			a = i + 1
+		ELSE
+			k = list[i][sym]
+			IF k = sym_unimplemented_keyword THEN
+				Fatal("unimplemented keyword `" + word + "'. I'm sorry...")
+			END
+			RETURN k
+		END
+		IF a > b THEN
+			RETURN sym_unknown
+		END
+	END
+END
+
+
+FUNCTION SearchPhpKeyword(k: STRING): SYMBOL
+BEGIN
+	RETURN SearchKeyword(k, php_keywords)
+END
+
+
+FUNCTION InitScanner()
+BEGIN
+	IF php_keywords <> NIL THEN
+		RETURN
+	END
+	php_keywords = {
+		{ "FALSE",      sym_false },
+		{ "NULL",       sym_null },
+		{ "TRUE",       sym_true },
+		{ "abstract",   sym_abstract },
+		{ "and",        sym_and2 },
+		{ "array",      sym_array },
+		{ "as",         sym_as },
+		{ "bool",       sym_boolean },
+		{ "boolean",    sym_boolean },
+		{ "break",      sym_break },
+		{ "case",       sym_case },
+		{ "catch",      sym_catch },
+		{ "class",      sym_class },
+		{ "clone",      sym_clone },
+		{ "const",      sym_const },
+		{ "continue",   sym_continue },
+		{ "declare",    sym_declare },
+		{ "default",    sym_default },
+		{ "define",     sym_define },
+		{ "die",        sym_exit },
+		{ "do",         sym_do },
+		{ "double",     sym_float },
+		{ "echo",       sym_echo },
+		{ "else",       sym_else },
+		{ "elseif",     sym_elseif },
+		{ "enddeclare", sym_unimplemented_keyword },
+		{ "endfor",     sym_unimplemented_keyword },
+		{ "endforeach", sym_unimplemented_keyword },
+		{ "endif",      sym_unimplemented_keyword },
+		{ "endswitch",  sym_unimplemented_keyword },
+		{ "endwhile",   sym_unimplemented_keyword },
+		{ "exit",       sym_exit },
+		{ "extends",    sym_extends },
+		{ "false",      sym_false },
+		{ "final",      sym_final },
+		{ "float",      sym_float },
+		{ "for",        sym_for },
+		{ "foreach",    sym_foreach },
+		{ "function",   sym_function },
+		{ "global",     sym_global },
+		{ "goto",       sym_goto },
+		{ "if",         sym_if },
+		{ "implements", sym_implements },
+		{ "include",    sym_include },
+		{ "include_once", sym_include_once },
+		{ "instanceof", sym_instanceof },
+		{ "int",        sym_int },
+		{ "integer",    sym_int },
+		{ "interface",  sym_interface },
+		{ "isset",      sym_isset },
+		{ "list",       sym_list },
+		{ "namespace",  sym_namespace },
+		{ "new",        sym_new },
+		{ "null",       sym_null },
+		{ "object",     sym_object },
+		{ "or",         sym_or2 },
+		{ "parent",     sym_parent },
+		{ "print",      sym_print },
+		{ "private",    sym_private },
+		{ "protected",  sym_protected },
+		{ "public",     sym_public },
+		{ "real",       sym_float },
+		{ "require",    sym_require },
+		{ "require_once", sym_require_once },
+		{ "return",     sym_return },
+		{ "self",       sym_self },
+		{ "static",     sym_static },
+		{ "string",     sym_string },
+		{ "switch",     sym_switch },
+		{ "throw",      sym_throw },
+		{ "trigger_error", sym_trigger_error },
+		{ "true",       sym_true },
+		{ "try",        sym_try },
+		{ "use",        sym_use },
+		{ "var",        sym_var },
+		{ "while",      sym_while },
+		{ "xor",        sym_xor }
+	}
+
+	phplint_keywords = {
+		{ "abstract",   sym_x_abstract },
+		{ "args",       sym_x_args },
+		{ "array",      sym_x_array },
+		{ "bool",       sym_x_boolean },
+		{ "boolean",    sym_x_boolean },
+		{ "class",      sym_x_class },
+		{ "const",      sym_x_const },
+		{ "double",     sym_x_float },
+		{ "else",        sym_x_else },
+		{ "end_if_php_ver",  sym_x_end_if_php_ver },
+		{ "extends",    sym_x_extends },
+		{ "final",      sym_x_final },
+		{ "float",      sym_x_float },
+		{ "forward",    sym_x_forward },
+		{ "function",   sym_x_function },
+		{ "if_php_ver_4",    sym_x_if_php_ver_4 },
+		{ "if_php_ver_5",    sym_x_if_php_ver_5 },
+		{ "implements", sym_x_implements },
+		{ "int",        sym_x_int },
+		{ "integer",    sym_x_int },
+		{ "interface",  sym_x_interface },
+		{ "missing_break",   sym_x_missing_break },
+		{ "missing_default", sym_x_missing_default },
+		{ "mixed",      sym_x_mixed },
+		{ "namespace",  sym_x_namespace },
+		{ "object",     sym_x_object },
+		{ "parent",     sym_x_parent },
+		{ "pragma",     sym_x_pragma },
+		{ "private",    sym_x_private },
+		{ "protected",  sym_x_protected },
+		{ "public",     sym_x_public },
+		{ "require_module",  sym_x_require_module },
+		{ "resource",   sym_x_resource },
+		{ "return",     sym_x_return },
+		{ "self",       sym_x_self },
+		{ "static",     sym_x_static },
+		{ "string",     sym_x_string },
+		{ "throws",     sym_x_throws },
+		{ "unchecked",  sym_x_unchecked },
+		{ "void",       sym_x_void }
+	}
+
+END
+
+
+FUNCTION ParseText()
+(*
+	Parse text up to "<?" or "<?php" or "<?=" or EOF. If at least a char of
+	text is found, returns sym=sym_text and s contains the text, otherwise
+	returns sym_open_tag or sym_open_tag_with_echo or sym_eof.
+*)
+
+	FUNCTION is_space(c: STRING): BOOLEAN
+	BEGIN
+		RETURN (c = " ") OR (c = "\t") OR (c = "\n") OR (c = "\r")
+	END
+
+BEGIN
+	b->Reset()
+	(* scan chars up to "<?", "<?= or EOF: *)
+	LOOP
+		IF c = NIL THEN
+			IF b->Length() = 0 THEN
+				sym = sym_eof
+			ELSE
+				sym = sym_text
+				s = b->ToString()
+			END
+			RETURN
+		ELSIF c = "<" THEN
+			IF FollowingCharsMatch("?") THEN
+				IF b->Length() = 0 THEN
+					IF FollowingCharsMatch("?=") THEN
+						# Always allowed since PHP 5.4 -- don't warn:
+						#Warning("using deprecated short tag `<?= EXPR, ... ?>' -- Hint: use `<?php echo EXPR, ... ?>' instead")
+						sym = sym_open_tag_with_echo
+						code = inside_code
+						ReadCh() ReadCh() ReadCh()
+						RETURN
+					ELSIF FollowingCharsMatch("?php") THEN
+						sym = sym_open_tag
+						code = inside_code
+						ReadCh() ReadCh() ReadCh() ReadCh() ReadCh()
+						IF (c <> NIL) AND NOT is_space(c) THEN
+							Fatal("invalid opening tag, expected `<?php' c="
+							+ StringToLiteral(c))
+						END
+						RETURN
+					ELSE
+						Warning("using deprecated short tag `<?' -- Hint: use `<?php' instead")
+						ReadCh() ReadCh()
+						sym = sym_open_tag
+						code = inside_code
+						RETURN
+					END
+				ELSE
+					sym = sym_text
+					s = b->ToString()
+					RETURN
+				END
+			ELSE
+				b->AddString(c)
+				ReadCh()
+			END
+		ELSE
+			b->AddString(c)
+			ReadCh()
+		END
+	END
+END
+
+
+FUNCTION SkipNewLineAfterCloseTag()
+(*
+	The first new-line after "?>" has to be ignored since it is not
+	sent to standard output.
+	All the tests executed on PHP 5.0.4
+
+	We enter with c=">".
+*)
+BEGIN
+	ReadCh()
+	IF c = "\n" THEN  # "?>\n" gives "" on output
+		ReadCh()
+	ELSIF c = "\r" THEN  # "?>\r" gives "" on output
+		ReadCh()
+		IF c = "\n" THEN  # "?>\r\n" gives "" on output
+			ReadCh()
+		END
+	END  # "?>\n\r" gives "\r" on output
+END
+
+
+FUNCTION SkipSingleLineComment(): BOOLEAN
+(*
+	Returns TRUE if closing tag "?>" found.
+*)
+VAR prev: STRING
+BEGIN
+	LOOP
+		prev = c
+		ReadCh()
+		IF c = "\n" THEN
+			ReadCh()
+			RETURN FALSE
+		ELSIF c = NIL THEN
+			Fatal("premature end of the file or missing closing tag")
+		ELSIF (c = ">") AND (prev = "?") THEN
+			SkipNewLineAfterCloseTag()
+			RETURN TRUE
+		END
+	END
+END
+
+
+FUNCTION SkipSpaces(): BOOLEAN
+(*
+	Skip spaces, HT, LF, CR and # comments.
+	Returns TRUE if closing tag "?>" found.
+*)
+BEGIN
+	WHILE (c = " ") OR (c = "\t") OR (c = "#") OR (c = "\n")
+	OR (c = "\r") DO
+		IF c = "#" THEN
+			IF SkipSingleLineComment() THEN
+				RETURN TRUE
+			END
+		ELSE
+			ReadCh()
+		END
+	END
+	RETURN FALSE
+END
+
+
+FUNCTION SkipMultilineComment()
+(*
+	Parse multi-line comment, possibly a docBlock.
+	Returns the result into s="/*...*/".
+*)
+VAR
+	start_line_n: INTEGER
+	c1, c2: STRING
+BEGIN
+	IF DEBUG THEN
+		print("[comment start]")
+	END
+	b->Set("/*")
+	start_line_n = line_n
+	LOOP
+		b->AddString(c)
+		IF c = NIL THEN
+			Fatal("missing closing '*/' in comment beginning in line "
+			+ itos(start_line_n))
+		ELSIF (c = "*") AND (c1 = "/") THEN
+			Warning("possible nested multiline comment in comment beginning in line " + itos(start_line_n))
+		ELSIF (c = "/") AND (c1 = "*") THEN
+			IF c2 = "." THEN
+				Warning("possible missing `.' in multiline comment beginning in line " + itos(start_line_n))
+			END
+			IF DEBUG THEN
+				print("[comment end]")
+			END
+			ReadCh()
+			s = b->ToString()
+			RETURN
+		END
+		c2 = c1
+		c1 = c
+		ReadCh()
+	END
+END
+
+
+FUNCTION ReportChar(ch: INTEGER): STRING
+BEGIN
+	IF (ch >= 32) AND (ch <= 126) THEN
+		RETURN "`" + CHR(ch) + "'"
+	ELSIF ch = 9 THEN
+		RETURN "horizontal tabulator, HT, 9"
+	ELSIF ch = 10 THEN
+		RETURN "line feed, LF, 10"
+	ELSIF ch = 13 THEN
+		RETURN "carriage return, CR, 13"
+	ELSIF ch = 127 THEN
+		RETURN "delete, DEL, 127"
+	ELSIF ch > 127 THEN
+		RETURN "code " + itos(ch)
+	ELSE
+		RETURN "control code " + itos(ch)
+	END
+END
+
+
+FUNCTION ReportCTRL(ch: INTEGER)
+BEGIN
+	IF NOT ctrl_check THEN
+		RETURN
+	END
+	Warning("found control character (" + ReportChar(ch)
+	+ ") in literal string. This msg is reported only once for each string")
+END
+
+
+FUNCTION ReportASCIIExt(ch: INTEGER, in: STRING)
+BEGIN
+	IF NOT ascii_ext_check THEN
+		RETURN
+	END
+	Warning("non-ASCII character code in " + in + " (" + ReportChar(ch)
+	+ "). This msg is reported only once for each " + in)
+END
+
+
+FUNCTION is_id_first_char(c: STRING): BOOLEAN
+(*
+	FIXME: PHP allows also "\x7F" (ASCII DEL).
+	We forbid this char.
+*)
+BEGIN
+	(**** Faster: ****)
+	IF c >= "a" THEN
+		RETURN (c <= "z") OR (c >= "\x80")
+	ELSIF c >= "A" THEN
+		RETURN (c <= "Z") OR (c = "_")
+	ELSE
+		RETURN FALSE
+	END
+	(**** Slower:
+	RETURN (c >= "a") AND ((c <= "z") OR (c >= "\x80"))
+		OR (c >= "A") AND ((c <= "Z") OR (c = "_"))
+	****)
+END
+
+
+FUNCTION is_id_char(c: STRING): BOOLEAN
+BEGIN
+	IF c >= "a" THEN
+		RETURN (c <= "z") OR (c >= "\x7F")
+	ELSIF c >= "A" THEN
+		RETURN (c <= "Z") OR (c = "_")
+	ELSE
+		RETURN (c >= "0") AND (c <= "9")
+	END
+	(****
+	RETURN (c >= "a") AND ((c <= "z") OR (c >= "\x7F"))
+		OR (c >= "A") AND ((c <= "Z") OR (c = "_"))
+		OR (c >= "0") AND (c <= "9")
+	****)
+END
+
+
+FUNCTION is_digit(c: STRING): BOOLEAN
+BEGIN
+	RETURN (c >= "0") AND (c <= "9")
+END
+
+
+FUNCTION is_hex(c: STRING): BOOLEAN
+BEGIN
+	RETURN (c >= "0") AND (c <= "9")
+		OR (c >= "A") AND (c <= "F")
+		OR (c >= "a") AND (c <= "f")
+END
+
+
+FUNCTION hex(c: STRING): INTEGER
+BEGIN
+	IF c <= "9" THEN
+		RETURN ASC(c) - ASC("0")
+	ELSIF c <= "Z" THEN
+		RETURN 10 + ASC(c) - ASC("A")
+	ELSE
+		RETURN 10 + ASC(c) - ASC("a")
+	END
+END
+
+
+VAR
+	here_doc_id: STRING
+	(* LABEL of the here-doc <<<LABEL or now-doc <<<'LABEL'. NIL if not
+	currently parsing a now-doc/here-doc. *)
+
+	end1, end2, end3, end4: STRING
+	(* If currently parsing now-doc/here-doc (that is here_doc_id<>NIL)
+	then these are the possible terminating lines. *)
+
+	wrong_end: STRING
+	(* If currently parsing now-doc/here-doc (that is here_doc_id<>NIL)
+	holds the regex that matches the typical invalid terminating line
+	containing invisible spaces: "^[ \t]*LABEL[ \t]*;[ \t]*\r?$" *)
+
+	start_line_n: INTEGER
+	(* Line at which the literal string begins. It is set for: single
+	quoted, double quoted, now-doc, here-doc in order to give a meaningful
+	error message in case of unclosed string, missing terminating label or
+	premature end of the file. *)
+
+
+FUNCTION ParseSingleQuotedString(): STRING
+(*
+	Parses either single quoted strings (when here_doc_id = NIL)
+	and now-docs (here_doc_id is the ID used after `<<<').
+*)
+VAR
+	start_line_n, ch: INTEGER
+	skip: BOOLEAN
+	report_ctrl, report_ascii_ext: BOOLEAN
+BEGIN
+	b->Empty()
+	skip = FALSE
+	report_ctrl = ctrl_check
+	report_ascii_ext = ascii_ext_check
+	start_line_n = line_n
+	ReadCh()
+	LOOP
+		IF c = NIL THEN
+			IF here_doc_id = NIL THEN
+				Fatal("missing terminating ' character in string beginning in line " + start_line_n)
+			ELSE
+				Fatal("unclosed now-doc string beginning in line " + start_line_n)
+			END
+		END
+
+		ch = ASC(c)
+
+		(* Detect ctrl chars: *)
+		IF report_ctrl
+		AND ((ch < 32) OR (ch = 127))
+		AND ( (here_doc_id = NIL)
+			OR (ch <> 10) AND (ch <> 13) AND (ch <> 9)
+		) THEN
+			ReportCTRL(ch)
+			report_ctrl = FALSE
+		END
+
+		IF report_ascii_ext AND (ch > 127) THEN
+			ReportASCIIExt(ch, "literal string")
+			report_ascii_ext = FALSE
+		END
+
+		IF skip THEN
+			IF (c = "'") OR (c = "\\") THEN
+				b->AddString(c)
+			ELSE
+				b->AddString("\\")
+				b->AddString(c)
+				Warning("invalid escape sequence. Hint: allowed escape sequences are only \\' \\\\")
+			END
+			skip = FALSE
+			ReadCh()
+
+		(* Detect end of the single-quoted string: *)
+		ELSIF (here_doc_id = NIL) AND (c = "'") THEN
+			ReadCh()
+			RETURN b->ToString()
+
+		(* Detect end of the now-doc: *)
+		ELSIF (here_doc_id <> NIL) AND (line_idx = 1)
+		AND match(line, wrong_end) THEN
+
+			(* Detect wrong ending line of the now-doc: *)
+			IF NOT (
+				(line = end1) OR (line = end2)
+				OR (line = end3) OR (line = end4)
+			) THEN
+				Error("invisible spaces in terminating line not allowed (PHPLint restriction): "
+				+ StringToLiteral(line))
+			END
+
+			# skip terminating label:
+			REPEAT
+				ReadCh()
+			UNTIL (c = ";") OR (c = "\n")
+
+			here_doc_id = NIL
+
+			RETURN b->ToString()
+
+		ELSIF (here_doc_id = NIL) AND (c = "\\") THEN
+			skip = TRUE
+			ReadCh()
+		ELSE
+			b->AddString(c)
+			ReadCh()
+		END
+	END
+END
+
+
+FUNCTION ParseDoubleQuotedString(): BOOLEAN
+(*
+	Parses either double quoted strings (when here_doc_id = NIL)
+	and here-docs (here_doc_id is the ID used after `<<<').
+	The differences between double q. strings and here-docs are:
+
+	- strings cannot contain \n \r
+	- strings must be terminated by " and " must be \"
+	- here-docs can contain \n \r
+	- here-docs are terminated when the line begin with
+	  here_doc_id possibly followed by ; end then \n \r
+	
+	Apart from these diff., the two are handled the same way.
+*)
+
+	FUNCTION ParseEscapeCode(): STRING
+	VAR x: INTEGER
+	BEGIN
+		IF c = "n"  THEN
+			ReadCh()
+			RETURN "\n"
+		ELSIF c = "r" THEN
+			ReadCh()
+			RETURN "\r"
+		ELSIF c = "t" THEN
+			ReadCh()
+			RETURN "\t"
+		ELSIF c = "v" THEN
+			ReadCh()
+			RETURN "\x0b"
+		ELSIF c = "f" THEN
+			ReadCh()
+			RETURN "\x0c"
+		ELSIF c = "\\" THEN
+			ReadCh()
+			RETURN "\\"
+		ELSIF c = "$" THEN
+			ReadCh()
+			RETURN "$"
+		ELSIF c = "\"" THEN
+			ReadCh()
+			RETURN "\""
+		ELSIF (c >= "0") AND (c <= "7") THEN
+			x = ASC(c) - ASC("0")
+			ReadCh()
+			IF (c >= "0") AND (c <= "7") THEN
+				x = 8*x + ASC(c) - ASC("0")
+				ReadCh()
+				IF (c >= "0") AND (c <= "7") THEN
+					x = 8*x + ASC(c) - ASC("0")
+					ReadCh()
+				END
+			END
+			IF x > 255 THEN
+				Error("invalid octal code in escape sequence: too big")
+				RETURN NIL
+			END
+			RETURN CHR(x)
+		ELSIF (c = "x") OR (c = "X") THEN
+			ReadCh()
+			IF NOT is_hex(c) THEN
+				Error("invalid hexadecimal digit in escape sequence")
+				RETURN NIL
+			END
+			x = hex(c)
+			ReadCh()
+			IF is_hex(c) THEN
+				x = 16*x + hex(c)
+				ReadCh()
+			END
+			RETURN CHR(x)
+		ELSE
+			Warning("invalid escape sequence. Hint: allowed escape sequences are only \\n \\r \\t \\v \\f \\$ \\\" \\\\ \\0-\\377 (octal) \\x0-\\xff (hexadecimal)")
+			RETURN "\\" + c
+		END
+	END
+
+
+VAR
+	ch: INTEGER
+	report_ctrl, report_ascii_ext: BOOLEAN
+BEGIN
+	b->Empty()
+	report_ctrl = ctrl_check
+	report_ascii_ext = ascii_ext_check
+	LOOP
+		IF c = NIL THEN
+			IF here_doc_id = NIL THEN
+				Fatal("missing terminating \" character in literal string")
+			ELSE
+				Fatal("here-doc `<<< " + here_doc_id + "' not closed"
+				+ " beginning in line " + start_line_n
+				+ ". Expected a line containing exactly `" + here_doc_id
+				+ "' possibly followed by `;' then a new-line, no spaces allowed.")
+			END
+		END
+
+		ch = ASC(c)
+
+		(* Detect ctrl chars: *)
+		IF report_ctrl
+		AND ((ch < 32) OR (ch = 127))
+		AND ( (here_doc_id = NIL)
+			OR (ch <> 10) AND (ch <> 13) AND (ch <> 9)
+		) THEN
+			ReportCTRL(ch)
+			report_ctrl = FALSE
+		END
+
+		(* Detect non-ASCII chars: *)
+		IF report_ascii_ext AND (ch > 127) THEN
+			ReportASCIIExt(ch, "literal string")
+			report_ascii_ext = FALSE
+		END
+
+		(*
+			Detect end of the double quoted string:
+		*)
+		IF (here_doc_id = NIL) AND (c = "\"") THEN
+
+			# skip terminating ":
+			ReadCh()
+
+			s = b->ToString()
+			IF code = inside_double_quoted_string THEN
+				code = inside_code
+				IF s <= "" THEN
+					# String terminated just after prev. embedded var.:
+					# ".....$VAR"
+					# Do not return empty string and skip to next sym.
+					RETURN TRUE
+				ELSE
+					# Some chars found after prev. embedded var.
+					sym = sym_continuing_double_quoted_string
+					RETURN FALSE
+				END
+			ELSE
+				code = inside_code
+				sym = sym_double_quoted_string
+				RETURN FALSE
+			END
+
+		(*
+			Detect end of the here-doc:
+		*)
+		ELSIF (here_doc_id <> NIL) AND (line_idx = 1)
+		AND match(line, wrong_end) THEN
+
+			(* Detect wrong ending line of the here-doc: *)
+			IF NOT (
+				(line = end1) OR (line = end2)
+				OR (line = end3) OR (line = end4)
+			) THEN
+				Error("invisible spaces in terminating line not allowed (PHPLint restriction): "
+				+ StringToLiteral(line))
+			END
+
+			# skip terminating label:
+			REPEAT
+				ReadCh()
+			UNTIL (c = ";") OR (c = "\n")
+
+			here_doc_id = NIL
+
+			s = b->ToString()
+			IF code = inside_double_quoted_string THEN
+				code = inside_code
+				IF s <= "" THEN
+					# String terminated just after prev. embedded var.:
+					# ".....$VAR"
+					# Do not return empty string and skip to next sym.
+					RETURN TRUE
+				ELSE
+					# Some chars found after prev. embedded var.
+					sym = sym_continuing_double_quoted_string
+					RETURN FALSE
+				END
+			ELSE
+				code = inside_code
+				sym = sym_here_doc
+				RETURN FALSE
+			END
+
+		ELSIF c = "\\" THEN
+			ReadCh()
+			b->AddString( ParseEscapeCode() )
+		ELSIF c = "{" THEN
+			b->AddString(c)
+			ReadCh()
+			IF c = "$" THEN
+				Error("embedded variable in string:"
+				+ " curly braces notation not allowed"
+				+ " (PHPLint limitation)")
+				b->AddString(c)
+				ReadCh()
+			END
+		ELSIF c = "$" THEN
+			ReadCh()
+			IF is_id_first_char(c) THEN
+				# WARNING: code optimization: the parser can't evaluate
+				# the resulting string when embedded variables are
+				# present; so it is completely useless to set `s':
+				#s = b->ToString()
+				# We set a dummy value instead:
+				s = "DUMMY_CONTINUATION_DOUBLE_QUOTED_STRING"
+				IF code = inside_code THEN
+					(*
+						Found embedded var. just at the beginning of the
+						string.	 Always returns sym_double_quoted_string
+						or sym_here_doc, although s may be empty.
+					*)
+					code = inside_embedded_variable
+					IF here_doc_id = NIL THEN
+						sym = sym_double_quoted_string
+					ELSE
+						sym = sym_here_doc
+					END
+					RETURN FALSE
+				ELSE (* code = inside_embedded_string *)
+					(*
+						We encountered a sequence of embedded variables
+						"$VAR1$VAR2$VAR3".	Do not return empty strings
+						between them.
+					*)
+					code = inside_embedded_variable
+					sym = sym_continuing_double_quoted_string
+					RETURN s <= ""
+				END
+			ELSE
+				IF c = "[" THEN
+					# FIXME:
+					Error("embedded variable in string:"
+					+ " array selector not allowed"
+					+ " (PHPLint limitation)")
+				ELSIF c = "{" THEN
+					# FIXME:
+					Error("embedded variable in string:"
+					+ " curly braces notation not allowed"
+					+ " (PHPLint limitation)")
+				END
+				b->AddString("$")
+			END
+		ELSE
+			b->AddString(c)
+			ReadCh()
+		END
+	END
+END
+
+
+FUNCTION ParseHereAndNowDoc(): BOOLEAN
+VAR
+	id: STRING
+	single_quoted_label, double_quoted_label: BOOLEAN
+BEGIN
+	# FIXME: the last LF should not be added to the string.
+	# FIXME: cannot be used to initialize class properties in PHP < 5.3.
+
+	start_line_n = line_n
+
+	WHILE (c = " ") OR (c = "\t") DO
+		ReadCh()
+	END
+
+	IF c = "'" THEN
+		single_quoted_label = TRUE
+		ReadCh()
+	ELSIF c = "\"" THEN
+		double_quoted_label = TRUE
+		ReadCh()
+	END
+
+	IF (php_ver = php4) AND (single_quoted_label OR double_quoted_label) THEN
+		Error("quoted label in here-doc allowed only since PHP 5.3.0")
+	END
+
+	# Get the ID into id:
+	IF NOT is_id_first_char(c) THEN
+		Fatal("expected identifier after `<<<'")
+	END
+	b->Set(c)
+	ReadCh()
+	WHILE is_id_char(c) DO
+		b->AddString(c)
+		ReadCh()
+	END
+	id = b->ToString()
+
+	IF single_quoted_label THEN
+		IF c <> "'" THEN
+			Fatal("expected closing single quote in here-doc label")
+		END
+		ReadCh()
+	ELSIF double_quoted_label THEN
+		IF c <> "\"" THEN
+			Fatal("expected closing double quote in here-doc label")
+		END
+		ReadCh()
+	END
+
+	IF (c = " ") OR (c = "\t") THEN
+		Error("spaces not allowed after `<<<" + id + "'")
+	END
+	WHILE (c = " ") OR (c = "\t") OR (c = "\r") DO
+		ReadCh()
+	END
+
+	IF c <> "\n" THEN
+		Fatal("expected end of the line (ASCII code LF) after here-doc ID")
+	END
+	ReadCh()
+
+	here_doc_id = id
+	end1 = id
+	end2 = id + "\r"
+	end3 = id + ";"
+	end4 = id + ";\r"
+	wrong_end = "^[ \t]*" + id + "[ \t]*;?[ \t]*\r?$"
+
+	IF single_quoted_label THEN
+		s = ParseSingleQuotedString()
+		sym = sym_single_quoted_string
+		RETURN FALSE
+	ELSE
+		RETURN ParseDoubleQuotedString()
+	END
+END
+
+
+FUNCTION ParseKeyword()
+(*
+	Parse and ID and set s and sym global vars accordingly. If
+	sym isn't a keyword, set sym=sym_unknown.
+
+	Report as an error IDs that look like a keyword, apart lowercase
+	or uppercase letters. Ex. ForEach, $var, $Var.
+*)
+VAR report_ascii_ext: BOOLEAN  low: STRING
+BEGIN
+	b->Empty()
+	report_ascii_ext = ascii_ext_check
+	LOOP
+		IF report_ascii_ext AND (c >= "\x7F") THEN
+			ReportASCIIExt(ASC(c), "identifier")
+			report_ascii_ext = FALSE
+		END
+		b->AddString(c)
+		ReadCh()
+		IF NOT is_id_char(c) THEN
+			s = b->ToString()
+			EXIT
+		END
+	END
+
+	(* Since PHP and PHPLint share some keywords, it is important
+	   the order of search between php_keywords and phplint_keywords: *)
+	IF code = inside_x_code THEN	
+		sym = SearchKeyword(s, phplint_keywords)
+		IF sym <> sym_unknown THEN
+			RETURN
+		END
+		sym = SearchKeyword(s, php_keywords)
+		IF sym <> sym_unknown THEN
+			Error("invalid keyword `" + s + "' inside PHPLint meta-code")
+			sym = sym_unknown
+			RETURN
+		END
+	ELSE
+		sym = SearchKeyword(s, php_keywords)
+		IF sym <> sym_unknown THEN
+			RETURN
+		END
+		sym = SearchKeyword(s, phplint_keywords)
+		IF sym <> sym_unknown THEN
+			Error("invalid PHPLint keyword `" + s + "' inside PHP code")
+			sym = sym_unknown
+			RETURN
+		END
+	END
+
+	# Not a keyword. Check misspelled PHP keyword:
+	low = tolower(s)
+	sym = SearchKeyword(low, php_keywords)
+	IF sym <> sym_unknown THEN
+		Error("`" + s + "': invalid identifier similar to the keyword `"
+		+ low + "'")
+		#sym = sym_unknown
+		RETURN
+	END
+
+	# Check misspelled PHPLint keyword:
+	sym = SearchKeyword(low, phplint_keywords)
+	IF sym <> sym_unknown THEN
+		Error("`" + s + "': invalid identifier similar to the PHPLint keyword `" + low + "'")
+		sym = sym_unknown
+		RETURN
+	END
+
+END
+
+
+FUNCTION ParseQualifiedIdentifier(): STRING
+(*
+	Parse a qualified identifier, either in PHP code or in meta-code.
+	Precondition: c="\\".
+	Return the full identifier.
+*)
+VAR
+	b: BUFFER
+BEGIN
+	ReadCh()
+	IF SkipSpaces() THEN
+		Fatal("expected identifier after `\\'")
+	END
+	IF NOT is_id_first_char(c) THEN
+		Fatal("expected identifier after `\\'")
+	END
+	LOOP
+		ParseKeyword()
+		IF sym = sym_unknown THEN
+			b->AddString("\\")
+			b->AddString(s)
+		ELSE
+			Fatal("keyword used in qualified identifier")
+		END
+		IF SkipSpaces() THEN
+			EXIT
+		END
+		IF c = "\\" THEN
+			ReadCh()
+		ELSE
+			EXIT
+		END
+	END
+	RETURN b->ToString()
+END
+
+
+FUNCTION ParseNumber(): SYMBOL
+
+	FUNCTION ParseFloat()
+	# We enter this func. with c="."|"e"|"E"
+	BEGIN
+		IF c = "." THEN
+			b->AddString(c)
+			ReadCh()
+			IF NOT is_digit(c) THEN
+				Error("literal float number: required digit after decimal point")
+				RETURN
+			END
+			REPEAT
+				b->AddString(c)
+				ReadCh()
+			UNTIL NOT is_digit(c)
+		END
+		IF (c = "e") OR (c = "E") THEN
+			b->AddString(c)
+			ReadCh()
+			IF (c = "+") OR (c = "-") THEN
+				b->AddString(c)
+				ReadCh()
+			END
+			IF NOT is_digit(c) THEN
+				Error("literal float number: required digit in exponent")
+			END
+			REPEAT
+				b->AddString(c)
+				ReadCh()
+			UNTIL NOT is_digit(c)
+		END
+		s = b->ToString()
+	END
+
+VAR n: INTEGER
+BEGIN
+	(*
+		FIXME: check ranges of int and float
+		       huge integers are translated into float by PHP
+	*)
+	IF c = "0" THEN
+		ReadCh()
+		IF c = "x" THEN
+			# Hexadecimal number:
+			ReadCh()
+			IF NOT is_hex(c) THEN
+				Error("invalid hexadecimal number")
+			ELSE
+				REPEAT
+					n = n << 4 + hex(c)
+					ReadCh()
+				UNTIL NOT is_hex(c)
+			END
+			s = itos(n)
+			RETURN sym_lit_int
+		ELSIF (c >= "0") AND (c <= "7") THEN
+			# Octal number:
+			REPEAT
+				n = 8*n + stoi(c)
+				ReadCh()
+			UNTIL NOT( (c >= "0") AND (c <= "7") )
+			IF is_digit(c) THEN
+				Error("invalid digit `" + c + "' in octal number")
+				ReadCh()
+			END
+			s = itos(n)
+			RETURN sym_lit_int
+		ELSIF is_digit(c) THEN
+			Error("invalid digit `" + c + "' in octal number")
+			ReadCh()
+			s = "0"
+			RETURN sym_lit_int
+		ELSIF c = "." THEN
+			# Float 0.xxxx:
+			b->Empty()
+			b->AddString("0")
+			ParseFloat()
+			RETURN sym_lit_float
+		ELSE
+			# Simply a zero.
+			s = "0"
+			RETURN sym_lit_int
+		END
+	ELSE
+		b->Empty()
+		REPEAT
+			b->AddString(c)
+			ReadCh()
+		UNTIL NOT is_digit(c)
+		IF (c = ".") OR (c = "e") OR (c = "e") THEN
+			ParseFloat()
+			RETURN sym_lit_float
+		ELSE
+			s = b->ToString()
+			RETURN sym_lit_int
+		END
+	END
+END
+
+
+FUNCTION ParseDoc()
+VAR line_start: INTEGER
+BEGIN
+	line_start = line_n
+	WHILE (c = " ") OR (c = "\t") DO
+		ReadCh()
+	END
+	b->Empty()
+	LOOP
+		IF c = NIL THEN
+			Error("unclosed DOC comment openend in line "
+				+ line_start)
+			EXIT
+		ELSIF c = "." THEN
+			ReadCh()
+			IF c = "*" THEN
+				ReadCh()
+				IF c = "/" THEN
+					ReadCh()
+					EXIT
+				ELSE
+					b->AddString(".*")
+				END
+			ELSE
+				b->AddString(".")
+			END
+		ELSIF c = "*" THEN
+			ReadCh()
+			IF c = "/" THEN
+				Error("missing `.' in closing `.*/'")
+				ReadCh()
+				EXIT
+			ELSE
+				b->AddString("*")
+			END
+		ELSE
+			b->AddString(c)
+			ReadCh()
+		END
+	END
+	s = b->ToString()
+END
+
+
+FUNCTION ParseVarName()
+BEGIN
+	ReadCh()
+	IF c = "$" THEN
+		Error("unsupported variable-variable feature $$var -- trying to continue anyway")
+		REPEAT
+			ReadCh()
+		UNTIL c <> "$"
+	END
+	IF NOT is_id_first_char(c) THEN
+		Fatal("missing variable name after `$'")
+	END
+	ParseKeyword()
+	IF sym <> sym_unknown THEN
+		Error("the name `$" + s + "' is a keyword."
+		+ " This is deprecated by PHP and forbidden by PHPLint.")
+	END
+END
+
+
+FUNCTION ParseXCode(): BOOLEAN
+(*
+	Parse symbols of the PHPLint extended syntax.
+
+	On exit from the x-code (".*/" found), or unexpected termination of
+	the comment ("*/" found), or invalid char, returns TRUE so allowing
+	the scanner to skip right to the next symbol.
+*)
+VAR
+	q: STRING
+BEGIN
+	IF SkipSpaces() THEN
+		Fatal("unexpected closing tag inside meta-code")
+	END
+
+	IF c = "(" THEN
+		sym = sym_x_lround
+		ReadCh()
+	ELSIF c = ")" THEN
+		sym = sym_x_rround
+		ReadCh()
+	ELSIF c = "[" THEN
+		sym = sym_x_lsquare
+		ReadCh()
+	ELSIF c = "]" THEN
+		sym = sym_x_rsquare
+		ReadCh()
+	ELSIF c = "{" THEN
+		sym = sym_x_lbrace
+		ReadCh()
+	ELSIF c = "}" THEN
+		sym = sym_x_rbrace
+		ReadCh()
+	ELSIF c = "&" THEN
+		sym = sym_x_bit_and
+		ReadCh()
+	ELSIF c = "=" THEN
+		sym = sym_x_assign
+		ReadCh()
+	ELSIF c = "$" THEN
+		ParseVarName()
+		sym = sym_x_variable
+	ELSIF is_id_first_char(c) THEN
+		ParseKeyword()
+		IF sym = sym_unknown THEN
+			IF s = "DOC" THEN
+				ParseDoc()
+				code = inside_code
+				sym = sym_x_doc
+			ELSE
+				IF SkipSpaces() THEN
+					Fatal("unexpected closing tag inside meta-code")
+				END
+				IF c = "\\" THEN
+					q = s
+					s = q + ParseQualifiedIdentifier()
+				END
+				sym = sym_x_identifier
+			END
+		END
+	ELSIF c = "\\" THEN
+		s = ParseQualifiedIdentifier()
+		sym = sym_x_identifier
+	ELSIF c = "." THEN
+		ReadCh()
+		IF (c = NIL) OR (c <> "*") THEN
+			Error("invalid syntax in extended code")
+			RETURN TRUE
+		END
+		ReadCh()
+		IF (c = NIL) OR (c <> "/") THEN
+			Error("invalid syntax in extended code")
+			RETURN TRUE
+		END
+		ReadCh()
+		code = inside_code
+		RETURN TRUE
+	ELSIF c = "," THEN
+		ReadCh()
+		sym = sym_x_comma
+	ELSIF c = "'" THEN
+		s = ParseSingleQuotedString()
+		sym = sym_x_single_quoted_string
+	ELSIF c = ";" THEN
+		ReadCh()
+		sym = sym_x_semicolon
+	ELSIF c = ":" THEN
+		ReadCh()
+		sym = sym_x_colon
+	ELSIF c = "*" THEN
+		ReadCh()
+		IF c = "/" THEN
+			Error("expected `.*/', found `*/' (missing `.')")
+			ReadCh()
+			code = inside_code
+			RETURN TRUE
+		ELSE
+			Fatal("unexpected char `*' in extended code")
+		END
+	ELSIF c = "<" THEN
+		ReadCh()
+		sym = sym_x_lt
+	ELSIF c = ">" THEN
+		ReadCh()
+		sym = sym_x_gt
+	ELSE
+		Error("unexpected char " + ReportChar(ASC(c)) + " in extended code - ignore")
+		ReadCh()
+	END
+	RETURN FALSE
+END
+
+
+FUNCTION ParseCode(): BOOLEAN
+(*
+	Scan next PHP statement/expression symbol.
+
+	Returns TRUE is the caller must continue with the next symbol.
+*)
+VAR
+	q: STRING
+BEGIN
+	IF SkipSpaces() THEN
+		# Found closing tag "?>".
+		code = inside_text
+		sym = sym_close_tag
+		RETURN FALSE
+	END
+
+	IF is_id_first_char(c) THEN
+		ParseKeyword()
+		IF sym = sym_unknown THEN
+			IF SkipSpaces() THEN
+				sym = sym_identifier
+			ELSIF c = "\\" THEN
+				q = s
+				s = q + ParseQualifiedIdentifier()
+			END
+			sym = sym_identifier
+		END
+	
+	ELSIF c = "\\" THEN
+		s = ParseQualifiedIdentifier()
+		sym = sym_identifier
+
+	ELSIF c = "$" THEN
+		ParseVarName()
+		sym = sym_variable
+
+	ELSIF is_digit(c) THEN
+		sym = ParseNumber()
+
+	ELSIF c = "\"" THEN
+		ReadCh()
+		RETURN ParseDoubleQuotedString()
+		
+	ELSIF c = "'" THEN
+		s = ParseSingleQuotedString()
+		sym = sym_single_quoted_string
+		
+	ELSIF c = "`" THEN
+		Fatal("unimplemented execution operator \"`\". Use shell_exec() instead.")
+	ELSIF c = "@" THEN sym = sym_at ReadCh()
+	ELSIF c = "{" THEN sym = sym_lbrace ReadCh()
+	ELSIF c = "}" THEN sym = sym_rbrace ReadCh()
+	ELSIF c = "[" THEN sym = sym_lsquare ReadCh()
+	ELSIF c = "]" THEN sym = sym_rsquare ReadCh()
+	ELSIF c = "(" THEN sym = sym_lround ReadCh()
+	ELSIF c = ")" THEN sym = sym_rround ReadCh()
+	ELSIF c = "," THEN sym = sym_comma ReadCh()
+	ELSIF c = ";" THEN sym = sym_semicolon ReadCh()
+	ELSIF c = "~" THEN sym = sym_bit_not ReadCh()
+		
+	ELSIF c = ":" THEN
+		ReadCh()
+		IF c = ":" THEN
+			ReadCh()
+			sym = sym_double_colon
+		ELSE
+			sym = sym_colon
+		END
+		
+	ELSIF c = "?" THEN
+		ReadCh()
+		IF c = ">" THEN
+			SkipNewLineAfterCloseTag()
+			code = inside_text
+			sym = sym_close_tag
+		ELSE
+			sym = sym_question
+		END
+		
+	ELSIF c = "+" THEN
+		ReadCh()
+		IF c = "+" THEN
+			ReadCh()
+			sym = sym_incr
+		ELSIF c = "=" THEN
+			ReadCh()
+			sym = sym_plus_assign
+		ELSE
+			sym = sym_plus
+		END
+		
+	ELSIF c = "-" THEN
+		ReadCh()
+		IF c = ">" THEN
+			ReadCh()
+			sym = sym_arrow
+		ELSIF c = "-" THEN
+			ReadCh()
+			sym = sym_decr
+		ELSIF c = "=" THEN
+			ReadCh()
+			sym = sym_minus_assign
+		ELSE
+			sym = sym_minus
+		END
+		
+	ELSIF c = "*" THEN
+		ReadCh()
+		IF c = "=" THEN
+			ReadCh()
+			sym = sym_times_assign
+		ELSE
+			sym = sym_times
+		END
+		
+	ELSIF c = "/" THEN
+		ReadCh()
+		IF c = "*" THEN
+			ReadCh()
+			IF c = "." THEN
+				# Meta-code block:
+				code = inside_x_code
+				ReadCh()
+				RETURN TRUE
+			ELSE
+				SkipMultilineComment()
+				IF (length(s) > 5) AND (s[0,3] = "/**") THEN
+					# phpDocumentor docBlock
+					sym = sym_x_docBlock
+				ELSE
+					# Regular multiline comment
+					RETURN TRUE
+				END
+			END
+		ELSIF c = "/" THEN
+			IF SkipSingleLineComment() THEN
+				# Found closing tag "?>".
+				code = inside_text
+				sym = sym_close_tag
+				RETURN FALSE
+			END
+			RETURN TRUE
+		ELSIF c = "=" THEN
+			sym = sym_div_assign
+			ReadCh()
+		ELSE
+			sym = sym_div
+		END
+		
+	ELSIF c = "%" THEN
+		ReadCh()
+		IF c = "=" THEN
+			sym = sym_mod_assign
+			ReadCh()
+		ELSE
+			sym = sym_mod
+		END
+		
+	ELSIF c = "=" THEN
+		ReadCh()
+		IF c = "=" THEN
+			ReadCh()
+			IF c = "=" THEN
+				ReadCh()
+				sym = sym_eeq
+			ELSE
+				sym = sym_eq
+			END
+		ELSIF c = ">" THEN
+			ReadCh()
+			sym = sym_rarrow
+		ELSE
+			sym = sym_assign
+		END
+		
+	ELSIF c = "<" THEN
+		ReadCh()
+		IF c = "=" THEN
+			sym = sym_le
+			ReadCh()
+		ELSIF c = ">" THEN
+			sym = sym_ne
+			ReadCh()
+		ELSIF c = "<" THEN
+			ReadCh()
+			IF c = "=" THEN
+				ReadCh()
+				sym = sym_lshift_assign
+			ELSIF c = "<" THEN
+				ReadCh()
+				RETURN ParseHereAndNowDoc()
+			ELSE
+				sym = sym_lshift
+			END
+		ELSE
+			sym = sym_lt
+		END
+		
+	ELSIF c = ">" THEN
+		ReadCh()
+		IF c = "=" THEN
+			sym = sym_ge
+			ReadCh()
+		ELSIF c = ">" THEN
+			ReadCh()
+			IF c = "=" THEN
+				ReadCh()
+				sym = sym_rshift_assign
+			ELSE
+				sym = sym_rshift
+			END
+		ELSE
+			sym = sym_gt
+		END
+		
+	ELSIF c = "!" THEN
+		ReadCh()
+		IF c = "=" THEN
+			ReadCh()
+			IF c = "=" THEN
+				ReadCh()
+				sym = sym_nee
+			ELSE
+				sym = sym_ne
+			END
+		ELSE
+			sym = sym_not
+		END
+		
+	ELSIF c = "|" THEN
+		ReadCh()
+		IF c = "|" THEN
+			ReadCh()
+			sym = sym_or
+		ELSIF c = "=" THEN
+			sym = sym_bit_or_assign
+			ReadCh()
+		ELSE
+			sym = sym_bit_or
+		END
+		
+	ELSIF c = "&" THEN
+		ReadCh()
+		IF c = "&" THEN
+			ReadCh()
+			sym = sym_and
+		ELSIF c = "=" THEN
+			sym = sym_bit_and_assign
+			ReadCh()
+		ELSE
+			sym = sym_bit_and
+		END
+		
+	ELSIF c = "." THEN
+		ReadCh()
+		IF c = "=" THEN
+			ReadCh()
+			sym = sym_period_assign
+		ELSE
+			sym = sym_period
+		END
+		
+	ELSIF c = "^" THEN
+		ReadCh()
+		IF c = "=" THEN
+			sym = sym_bit_xor_assign
+			ReadCh()
+		ELSE
+			sym = sym_bit_xor
+		END
+	
+	ELSIF c = NIL THEN
+		sym = sym_eof
+		
+	ELSE
+		Fatal("unexpected character " + ReportChar(ASC(c)))
+	END
+
+	RETURN FALSE
+END
+
+
+FUNCTION ReadSym()
+VAR new_sym_found: BOOLEAN
+BEGIN
+	REPEAT
+
+		new_sym_found = FALSE
+
+		SWITCH code DO
+
+		CASE inside_text:
+			ParseText()
+			new_sym_found = FALSE
+		
+		CASE inside_code:
+			new_sym_found = ParseCode()
+		
+		CASE inside_x_code:
+			new_sym_found = ParseXCode()
+
+		CASE inside_embedded_variable:
+			(*
+				Parsing double quoted string with embedded vars.
+				We are here:
+					"aaaaaa$VARIABLE zzz"
+				    HERE____^
+			*)
+			ParseKeyword()
+			IF sym <> sym_unknown THEN
+				Error("the name `$" + s + "' is a keyword."
+				+ " This is deprecated by PHP and forbidden by PHPLint.")
+			END
+			sym = sym_embedded_variable
+			code = inside_double_quoted_string
+		
+		CASE inside_double_quoted_string:
+			(*
+				Parsing double quoted string with embedded vars.
+				We are here:
+					"...$VARIABLE...."
+				    HERE_________^
+			*)
+			new_sym_found = ParseDoubleQuotedString()
+		
+		END
+
+	UNTIL NOT new_sym_found
+		
+	IF DEBUG THEN
+		print("[")
+		print(Tokens.CodeToName(sym))
+		print("]\n")
+	END
+END
+
+
+FUNCTION Open(abs_fn: STRING): BOOLEAN
+BEGIN
+	fn = abs_fn
+	TRY io.Open(fd, fn, "r")
+	ELSE
+		Error(ERROR_MESSAGE)
+		RETURN FALSE
+	END
+
+	IF print_source THEN
+		print("\nBEGIN parsing of " + fmt_fn(abs_fn) + "\n")
+	END
+
+	code = inside_text
+	TRY line = io.ReadLine(fd) END
+	line_n = 1
+	line_idx = 0
+	line_pos = 0
+	c = NIL
+
+	IF print_source THEN
+		PrintLineSource()
+	END
+
+	ReadCh()
+	ReadSym()
+	RETURN TRUE
+END
+
+
+FUNCTION Suspend(): Status
+VAR r: Status
+BEGIN
+	r[code] = code
+	r[sym] = sym
+	r[fn] = fn
+	r[fd] = fd
+	r[line] = line
+	r[line_n] = line_n
+	r[line_idx] = line_idx
+	r[line_pos] = line_pos
+	r[c] = c
+	r[s] = s
+	RETURN r
+END
+
+
+FUNCTION Resume(r: Status)
+BEGIN
+	code = r[code]
+	sym = r[sym]
+	fn = r[fn]
+	fd = r[fd]
+	line = r[line]
+	line_n = r[line_n]
+	line_idx = r[line_idx]
+	line_pos = r[line_pos]
+	c = r[c]
+	s = r[s]
+END
+
+
+FUNCTION Close()
+BEGIN
+	IF print_source THEN
+		print("END parsing of " + fmt_fn(fn) + "\n")
+	END
+	TRY io.Close(fd) END
+	fn = NIL
+END
+
+
+END

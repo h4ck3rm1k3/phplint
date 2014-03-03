@@ -1,0 +1,167 @@
+IMPLEMENTATION MODULE Template
+
+IMPORT m2
+IMPORT str
+IMPORT Accounting
+IMPORT Globals
+IMPORT Namespace
+IMPORT Scanner
+IMPORT Search
+IMPORT Classes
+
+
+FUNCTION ParseSurrogate(): Class
+(*
+	[unchecked] bare_id [extends ...] [implements ..., ...]
+*)
+VAR
+	c, parent, if: Class
+	unchecked: BOOLEAN
+BEGIN
+	IF sym = sym_x_unchecked THEN
+		unchecked = TRUE
+		ReadSym()
+	END
+
+	Expect(sym_x_identifier, "expected surrogate class name")
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	c = SearchClassByAbsName(s, FALSE)
+	IF c <> NIL THEN
+		Error("class `" + s + "' already declared in "
+		+ reference(c[decl_in]))
+	ELSE
+		c[name] = s
+		c[name_lower] = tolower(s)
+		c[forward] = FALSE
+		c[abstract] = FALSE
+		c[final] = TRUE
+		c[type] = {object, void, NIL, c}
+		c[private] = TRUE
+		c[unchecked] = unchecked
+		classes[] = c
+	END
+	c[decl_in] = here()
+	ReadSym()
+
+	IF sym = sym_x_extends THEN
+		ReadSym()
+		Expect(sym_x_identifier, "expected parent class name after `extend'")
+		parent = SearchClass(s)
+		IF parent = NIL THEN
+			Error("undeclared parent class `" + s + "'")
+		ELSIF IsSubclassOf(parent, c) THEN
+			Error("class " + c[name] + " cannot extend child class "
+			+ parent[name] + ": forbidden circular reference")
+		ELSIF parent[final] THEN
+			Error("can't extend final class `" + parent[name] + "'")
+		ELSIF parent[interface] THEN
+			Error("can't extend interface class `" + parent[name] + "'")
+		ELSE
+			c[extends] = parent
+
+			# Check usage of the `unchecked' attribute:
+			IF unchecked THEN
+				IF NOT IsExceptionClass(parent) THEN
+					Error("invalid `unchecked' attribute for non-exception class "
+					+ parent[name])
+				END
+
+			ELSIF IsSubclassOf(parent, ExceptionClass) AND parent[unchecked]
+			THEN
+				Error("missing `unchecked' attribute extending unchecked exception " + parent[name])
+			END
+
+		END
+		ReadSym()
+	END
+
+	IF sym = sym_x_implements THEN
+		ReadSym()
+		LOOP
+			Expect(sym_x_identifier, "expected interface name")
+			if = SearchClass(s)
+			IF if = NIL THEN
+				Error("undeclared interface class `" + s + "'")
+			ELSIF NOT if[interface] THEN
+				Error("the class `" + s + "' isn't an interface")
+			ELSIF (php_ver = php5) AND (if[name] = "Traversable") THEN
+				Error("can't implement abstract interface `Traversable', use `Iterator' or `IteratorAggregate' instead")
+			ELSIF IsSubclassOf(c, if) THEN
+				Notice("class " + c[name]
+				+ " redundantly extends interface "
+				+ if[name] + " -- ignoring")
+			ELSE
+				c[implements][] = if
+				# FIXME: check multiple recurrence of the same class
+				# not really an error, however
+				AccountClass(if)
+				IF if[deprecated] > "" THEN
+					Warning("implementing deprecated interface `"
+					+ if[name] + "': " + if[deprecated])
+				END
+			END
+			ReadSym()
+			IF sym = sym_x_comma THEN
+				ReadSym()
+			ELSE
+				EXIT
+			END
+		END
+	END
+
+	RETURN c
+END
+
+
+FUNCTION ParseClassDeclTemplate(): ARRAY OF Class
+VAR
+	surrogates: ARRAY OF Class
+BEGIN
+	ReadSym()
+	LOOP
+		surrogates[] = ParseSurrogate()
+		IF sym = sym_x_semicolon THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+	Expect(sym_x_gt, "expected `;' or `>'")
+	ReadSym()
+	RETURN surrogates
+END
+
+
+FUNCTION MangleNamesOfSurrogateClasses(main_class: Class,
+	surrogates: ARRAY OF Class)
+VAR
+	base, base_lower: STRING
+	i: INTEGER
+	c: Class
+BEGIN
+
+	# Retrieves the base name of the class removing the NS:
+	base = main_class[name]
+	i = length(base) - 1
+	LOOP
+		IF i < 0 THEN
+			EXIT
+		ELSIF base[i] = "\\" THEN
+			base_lower = main_class[name_lower][i+1,length(base)]
+			base = base[i+1,length(base)]
+			EXIT
+		END
+		inc(i,-1)
+	END
+
+	FOR i = 0 TO count(surrogates)-1 DO
+		c = surrogates[i]
+		c[name] = c[name] + "@" + base
+		c[name_lower] = c[name_lower] + "@" + base_lower
+	END
+
+END
+
+
+END

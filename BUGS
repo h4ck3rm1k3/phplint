@@ -1,0 +1,42 @@
+KNOWN BUGS
+==========
+
+- Trying to parse this code
+
+<?php
+	$a = array();
+	$a[] = $a;
+	echo $a;
+?>
+
+results in a segmentation violation, due to the recursive linking between
+types of $a and $a[] that consume all the stack space before the crash.
+
+- "args" arguments cannot be passed by reference. This restriction makes
+impossible to declare functions like scanf("...", $x) as PHPLint always
+tells "$x is not defined".
+
+- foreach(EXPR as ...: EXPR must be a proper variable, not a generic
+expression. For example, foreach(array(1,2,3) as ... isn't allowed.
+
+- Heredocs and nowdocs are allowed in initial values of static variables,
+class constants and properties only since PHP >= 5.3.
+
+- $a[][1] = 3;  yields fatal error because PHPLint pretends the [] operator
+  be the very last index.
+
+
+KNOWN MISSING FEATURES
+======================
+
+- Assignment of a single char of a string not allowed in PHPLint:
+
+  $s = "abc";
+  $s[1] = "z"; <== invalid left hand side in assignemnt
+
+  Considering the issues and the complications that might arise from the
+  implementation of such a feature in a future compiled language (also
+  think at func. arg. passed by reference) it is unlikely such a feature
+  will ever be implemented under PHPLint.
+
+

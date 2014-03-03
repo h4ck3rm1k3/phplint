@@ -1,0 +1,168 @@
+
+BEGIN parsing of 5-cast-magic-function.php
+1:	<?php
+2:	
+3:	require_once __DIR__ . "/../../stdlib/cast.php";
+4:	
+5:	# Trick: "if(E);" has the only purpouse to raise and error that displays
+6:	# the detected type of E.
+7:	
+8:	/*. mixed .*/ $m = NULL;
+9:	class MyClass {}
+10:	$obj = new MyClass();
+11:	
+12:	if( cast("boolean", $m) );
+13:	if( cast("int", $m) );
+
+	if( cast("int", $m) );
+	                     \_ HERE
+==== 13: ERROR: `if(EXPR)': expected expression of the type boolean, but found an integer value. Remember that 0 evaluates to FALSE, and any other integer value evaluates to TRUE.
+14:	if( cast("float", $m) );
+
+	if( cast("float", $m) );
+	                       \_ HERE
+==== 14: ERROR: `if(EXPR)': expected expression of the type boolean, but found a float value. Remember that 0.0 evaluates to FALSE and any other value evaluates to TRUE.
+15:	if( cast("string", $m) );
+
+	if( cast("string", $m) );
+	                        \_ HERE
+==== 15: ERROR: `if(EXPR)': expected expression of the type boolean, but found a string value. Remember that the empty string "", the string "0" and the NULL string all evaluate to FALSE and any other string evaluates to TRUE.
+16:	if( cast("resource", $m) );
+
+	if( cast("resource", $m) );
+	                          \_ HERE
+==== 16: ERROR: `if(EXPR)': expected expression of the type boolean, but found a resource. Remember that a resource evaluates always to TRUE, so that this expression is useless. Remember too that some functions, formally declared to return a resource, might return the boolean value FALSE on error; if this is the case, rewrite as (EXPR) !== FALSE.
+17:	if( cast("object", $m) );
+
+	if( cast("object", $m) );
+	                        \_ HERE
+==== 17: ERROR: `if(EXPR)': expected expression of the type boolean, but found object. Remember that an object evaluates to FALSE if it has no properties, and evaluates to TRUE if it has at least a property.
+18:	if( cast("MyClass", $m) );
+
+	if( cast("MyClass", $m) );
+	                         \_ HERE
+==== 18: ERROR: `if(EXPR)': expected expression of the type boolean, but found MyClass. Remember that an object evaluates to FALSE if it has no properties, and evaluates to TRUE if it has at least a property.
+19:	
+20:	if( cast("array", $m) );
+
+	if( cast("array", $m) );
+	                 \_ HERE
+==== 20: ERROR: missing `[' after array
+21:	
+22:	if( cast("array[]", $m) );
+
+	if( cast("array[]", $m) );
+	                   \_ HERE
+==== 22: ERROR: missing type
+23:	if( cast("array[int]", $m) );
+
+	if( cast("array[int]", $m) );
+	                      \_ HERE
+==== 23: ERROR: missing type
+24:	if( cast("array[string]", $m) );
+
+	if( cast("array[string]", $m) );
+	                         \_ HERE
+==== 24: ERROR: missing type
+25:	
+26:	if( cast("array[]MyClass", $m) );
+
+	if( cast("array[]MyClass", $m) );
+	                                \_ HERE
+==== 26: ERROR: `if(EXPR)': expected expression of the type boolean, but found MyClass[]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+27:	if( cast("array[int]MyClass", $m) );
+
+	if( cast("array[int]MyClass", $m) );
+	                                   \_ HERE
+==== 27: ERROR: `if(EXPR)': expected expression of the type boolean, but found MyClass[int]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+28:	if( cast("array[string]MyClass", $m) );
+
+	if( cast("array[string]MyClass", $m) );
+	                                      \_ HERE
+==== 28: ERROR: `if(EXPR)': expected expression of the type boolean, but found MyClass[string]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+29:	
+30:	if( cast("array[][]", $m) );
+
+	if( cast("array[][]", $m) );
+	                     \_ HERE
+==== 30: ERROR: missing type
+31:	if( cast("array[int][]", $m) );
+
+	if( cast("array[int][]", $m) );
+	                        \_ HERE
+==== 31: ERROR: missing type
+32:	if( cast("array[string][]", $m) );
+
+	if( cast("array[string][]", $m) );
+	                           \_ HERE
+==== 32: ERROR: missing type
+33:	
+34:	if( cast("array[][]int", $m) );
+
+	if( cast("array[][]int", $m) );
+	                              \_ HERE
+==== 34: ERROR: `if(EXPR)': expected expression of the type boolean, but found int[][]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+35:	if( cast("array[int][]int", $m) );
+
+	if( cast("array[int][]int", $m) );
+	                                 \_ HERE
+==== 35: ERROR: `if(EXPR)': expected expression of the type boolean, but found int[int][]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+36:	if( cast("array[string][]int", $m) );
+
+	if( cast("array[string][]int", $m) );
+	                                    \_ HERE
+==== 36: ERROR: `if(EXPR)': expected expression of the type boolean, but found int[string][]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+37:	
+38:	$ais = array("zero", "one");
+39:	if( cast("array[int]string", $ais) );
+
+	if( cast("array[int]string", $ais) );
+	                                    \_ HERE
+==== 39: ERROR: `if(EXPR)': expected expression of the type boolean, but found string[int]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+40:	if( cast("array[]string", $ais) );
+
+	if( cast("array[]string", $ais) );
+	                                 \_ HERE
+==== 40: ERROR: `if(EXPR)': expected expression of the type boolean, but found string[]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+41:	if( cast("array[int]int", $ais) );
+
+	if( cast("array[int]int", $ais) );
+	                               \_ HERE
+==== 41: ERROR: cast(int, string): invalid typecast
+
+	if( cast("array[int]int", $ais) );
+	                                 \_ HERE
+==== 41: ERROR: `if(EXPR)': expected expression of the type boolean, but found int[int]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+42:	if( cast("array[string]string", $ais) );
+
+	if( cast("array[string]string", $ais) );
+	                                     \_ HERE
+==== 42: ERROR: cast(string[string], string[int]): invalid typecast
+
+	if( cast("array[string]string", $ais) );
+	                                       \_ HERE
+==== 42: ERROR: `if(EXPR)': expected expression of the type boolean, but found string[string]. Remember that an array with zero elements evaluates to FALSE, and an array with one or more elements evaluates to TRUE.
+END parsing of 5-cast-magic-function.php
+==== 5-cast-magic-function.php:10: notice: variable `$obj' assigned but never used
+==== ?: notice: unused package `../../stdlib/AutoloadException.php'
+==== ?: notice: required package `../../stdlib/cast.php'
+==== ?: notice: required module `spl'
+==== ?: notice: required module `simplexml'
+==== ?: notice: required module `dom'
+==== ?: notice: required module `standard'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/Types.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ArrayBothType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/TypeInterface.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/containers/Printable.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ArrayIntType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ArrayStringType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/BooleanType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ClassType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/FloatType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/IntType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/NullType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ObjectType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/ResourceType.php'
+==== ?: notice: required package `../../stdlib/it/icosaedro/phplint/StringType.php'
+==== ?: notice: required package `../../stdlib/CastException.php'
+Overall test results: 25 errors, 0 warnings.

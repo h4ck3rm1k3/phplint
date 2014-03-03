@@ -1,0 +1,119 @@
+DEFINITION MODULE FileName
+(*
+	If not explicitly stated, process is based purely on strings, so actually
+	no access to the underlying file system is made.
+
+	WARNING. These functions do not drop leading or trailing spaces, nor
+	they check for possible NUL characters.
+*)
+
+FUNCTION SetTargetOS(windows: BOOLEAN)
+(*
+	Forces path interpretation according to the specified target OS. If
+	windows=TRUE, absolute paths need either the drive unit letter "X:" or the
+	UNC host name "//host". If windows=FALSE assumes Unix/Linux conventions,
+	that is absolute paths starts with slash "/". If this function is not
+	explicitly called, then the module assumes the OS detected at compile time.
+*)
+
+FUNCTION IsAbsolute(f: STRING): BOOLEAN
+(*
+	Tells if the path f is absolute. On Windows an absolute path begins either
+	with "X:\" or "X:/" with X letter, or "//" (UNC path). On Unix and Linux an
+	absolute path begins with "/".
+*)
+
+
+FUNCTION Normalize(f: STRING): STRING
+(*
+	Returns the normalized path
+
+	Drops multiple "//", resolves ".." that can be solved, skips useless
+	".".  Gives a fatal error if f is empty or NIL. Examples:
+
+	Normalize("/../a") ==> "/a"
+	Normalize("./") ==> "."
+	Normalize("/.") ==> "/"
+	Normalize("a/b/c/../../d") ==> "a/d"
+*)
+
+FUNCTION Dirname(f: STRING): STRING
+(*
+	Returns the part of the path to the left of the last "/"
+
+	If no "/" is present, returns f.
+*)
+
+FUNCTION Basename(f: STRING): STRING
+(*
+	Returns the part of the path to the right of the last "/".
+
+	If no "/" is present, returns f.
+*)
+
+FUNCTION Absolute(cwd: STRING, f: STRING): STRING
+(*
+	Returns the absolute path for file or directory f.
+
+	If f is already absolute (i.e. it begins with "/") Normalize(f)
+	is returned.
+
+	Otherwise cwd is the current working directory (or anyhow, a directory)
+	to be considered and Normalize(cwd+f) is returned.
+
+	If cwd=NIL, the CWD of the current process is used instead and
+	Normalize(CWD+f) is returned.
+*)
+
+FUNCTION Relative(a: STRING, b: STRING): STRING
+(*
+	Returns the relative path that brings from file 'a' to file 'b'
+
+	The typical application if this function is building the relative path
+	between the current HTML document and another HTML document, so that
+	the whole sub-tree of directories containing both the documents can be
+	moved elsewere without breaking the link.
+
+	Normally 'a' and 'b' are both absolute paths or both relative paths.
+	In the latter case the two files are supposed to belong to the same
+	subtree, i.e. both starts from the same node of the file system tree.
+	Completely unrelated relative path might give unexpected results.
+
+	If no suitable path can be build, 'b' is returned.	Note that 'a' can
+	also be a directory, but in this case dummy file must be added to get
+	the expected result. With this trick, the directory "/the/dir" becomes
+	"/the/dir/x":
+
+	Relative("/the/dir/*", "/the/file")
+	==> "../file"
+
+	is the relative path bringing to "/the/file" from any file of the
+	directory "/the/dir/*".
+
+	Examples:
+
+	RelativePath("a/b/c/file1", "a/b/c/file2")
+	==> "file2" (common path is "a/b/c/")
+
+	Note that relative paths may reside in different directory, for example
+	/here/a/b/c... and /there/a/b/c... This function has no way to detect
+	this problem.
+
+	RelativePath("a/b/c/file1", "a/b/file3")
+	==> "../file3" (common path is "a/b/")
+
+	RelativePath("a/b/file3", "a/b/c/file1")
+	==> "../file3" (common path is "a/b/")
+
+	RelativePath("a/b", "x/y")
+	==> "x/y"  (no common path)
+*)
+
+FUNCTION DropExtension(f: STRING): STRING
+(*
+	Returns the path f without the extension (anything that goes from the
+	last "." of the last node of the path up to the end of the string). If
+	no extension is present, returns f.
+*)
+
+END

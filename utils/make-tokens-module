@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# Generates automatically the module Tokens.imp
+# Strategy: parses Scanner.def and collect sym_xxx decls.
+
+src=Scanner.def
+
+echo "IMPLEMENTATION MODULE Tokens
+
+# This file was generated automatically by $0 -- do not edit
+
+IMPORT str
+
+VAR tokens: ARRAY OF STRING
+
+FUNCTION Init()
+BEGIN
+	IF tokens <> NIL THEN
+		RETURN
+	END
+	tokens = split("
+
+echo -n "\""
+
+grep '^[[:space:]]\+sym_' $src |
+sed -e 's/^[[:space:]]\+sym_//' -e 's/[, ].*//' |
+while read t; do
+	i=$((i+1))
+	if [ $i -ge 50 ]; then
+		echo -ne "\"\n+ \""
+		i=0
+	fi
+	echo -n "$t "
+done
+
+echo "\", \" \")
+END
+
+FUNCTION CodeToName(code: INTEGER): STRING
+BEGIN
+	Init()
+	IF (code >= 0) AND (code < count(tokens)-1) THEN
+		RETURN \"sym_\" + tokens[code]
+	ELSE
+		RETURN \"sym_\" + code
+	END
+END
+
+END
+"

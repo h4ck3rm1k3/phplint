@@ -1,0 +1,474 @@
+DEFINITION MODULE Types
+
+TYPE
+	PHP_VERSION = (php4=4, php5)
+
+	WHERE = RECORD
+		fn: STRING
+		line_n: INTEGER
+	END
+
+
+(*
+	PARSER
+*)
+
+TYPE
+	UseEntry = RECORD
+		(*
+			List of `use' clauses collected in the current namespace. This
+			data structure is saved in the curr_package[namespace_use]
+			field.
+		*)
+
+		target: STRING
+		(* Target namespace without leading \, as in `use TARGET as ALIAS'. *)
+		
+		alias: STRING
+		(* The alias identifier.  *)
+
+		used: INTEGER
+		(* How many times this entry has been used. *)
+
+		decl_in: WHERE
+	END
+
+	Package = RECORD
+		fn: STRING
+		(* absolute file name *)
+
+		module: BOOLEAN
+		(* is it a PHP extension module? *)
+
+		library: BOOLEAN
+		(* is it a library? *)
+
+		why_not_library: STRING
+		(* If not a library, here is the decription of the cause. *)
+
+		used: INTEGER
+		(* how many times one or more of the items exported has been
+		   used by other packages *)
+
+		descr: STRING
+
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+
+		namespace_current: STRING
+		(* NIL if no namespace *)
+
+		namespace_use: ARRAY OF UseEntry
+		(* List of `use' clauses. *)
+	END
+
+
+CONST
+	false_value = "FALSE"
+	true_value = "TRUE"
+
+TYPE
+	Class = FORWARD
+
+	BaseType = (null, void, boolean, int, float, string,
+	            array, mixed, resource, object)
+
+	Type = RECORD
+		basetype: BaseType
+
+		(*
+			If basetype=array these fields have meaning:
+		*)
+		index_type: BaseType
+		(* index type: void (still unknown), int, string, mixed (int
+		   and string allowed; for internal use only) *)
+		elem_type: Type
+		(* type of the elements; NIL=still unknown *)
+
+		(*
+			If basetype=object this field has meaning:
+		*)
+		class: Class # set if t=object; can be NIL (=unknown)
+	END
+
+
+TYPE
+	Result = RECORD
+		type: Type
+		value: STRING
+	END
+
+
+(*
+	SYMBOL TABLE OF CONSTANTS
+*)
+
+TYPE
+
+	CONSTANT = RECORD
+		name: STRING
+		(* Fully qualified name. *)
+
+		name_normalized: STRING
+		(* Normalized fully qualified name: path lowercase, name untouched. *)
+
+		private: BOOLEAN
+		(* is this const private to the package where it is defined? *)
+
+		decl_in: WHERE
+		(* if NIL, still not declared *)
+
+		used: INTEGER
+		(* no. of usages as RHS *)
+
+		last_rhs: WHERE
+		(* last seen here as RHS *)
+
+		value: Result
+		(* NIL if not defined or can't be determined *)
+
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+(*
+	SYMBOL TABLE OF VARIABLES
+*)
+
+TYPE
+	VARIABLE = RECORD
+		name: STRING
+		private: BOOLEAN (* private to the package? *)
+		decl_in: WHERE
+		scope: INTEGER  # -1 = superglobal, 0 = global, 1+ = local
+		global: BOOLEAN # declared in 'global' statement
+		last_lhs: WHERE # var. last assigned here
+		assigned: BOOLEAN # definitely assigned in current execution path
+		used: INTEGER
+		(* no. uf usages as RHS. if 0 => warning: never used; if 1 => warning:
+		never used, maybe misspelled *)
+		#last_rhs: WHERE
+		type: Type
+		value: STRING (* not used *)
+
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+(*
+	SYMBOL TABLE OF FUNCTIONS
+*)
+
+TYPE
+	TriggeredErrors = INTEGER
+	ThrownExceptions = ARRAY OF Class
+
+TYPE
+
+	FormalArg = RECORD
+		(*
+			Represents a single formal argument of a function or method.
+		*)
+
+		name: STRING
+		(*
+			Name of the formal argument, without leading "$".
+		*)
+
+		reference: BOOLEAN
+		(*
+			TRUE if the argument is passed by reference, for example
+			/*. [return] TYPE .*/ & $arg
+			The variable passed must be already assigned when the
+			function or method is called.
+		*)
+
+		reference_return: BOOLEAN
+		(*
+			TRUE if the argument is passed by reference and its
+			value is assigned by the function or method being
+			called, for example
+			/*. return TYPE .*/ & $arg
+			The variable passed may be unassinged when the function
+			or method is called, but it is garanteed it is assigned
+			when it returns. If the variable is not passed by
+			reference, this flag is set to FALSE but it has no
+			meaning.
+		*)
+
+		type: Type
+		(*
+			Type of the formal argument. If unknown or
+			undeterminate, it is set to `mixed', but chances are
+			that in future releases it will set to NIL instead.
+		*)
+
+		is_mandatory: BOOLEAN
+		(*
+			TRUE if this argument is mandatory.
+		*)
+
+		value: STRING
+		(*
+			NIL if the argument is mandatory, otherwise it is the
+			literal representation of the default value.
+		*)
+	END
+
+	SIGNATURE = RECORD
+		return: Type         # type of the returned value
+		reference: BOOLEAN   # function & f(...
+		mandatory: INTEGER   # no. of mandatory arguments
+		args: ARRAY OF FormalArg
+		more_args: BOOLEAN   # allow more arguments
+	END
+
+	ThrownExceptionDescr = RECORD
+		(* Holds descr for exception raised by func or method. *)
+
+		exception: Class
+		(* The exception. *)
+
+		descr: STRING
+		(* Descr of the thrown exception; non-empty, HTML text. *)
+
+	END
+
+	Function = RECORD
+
+		name: STRING
+		(* Name of the function. If in namespace, it is the absolute name. *)
+
+		name_lower: STRING
+		(* Name of the function in lowercase letters to speed-up search *)
+
+		forward: BOOLEAN
+		(* dummy forward declaration *)
+
+		private: BOOLEAN
+		(* is this func. private to the package where it is defined? *)
+
+		decl_in: WHERE
+		(* where it has been declared. May be NIL if still not declared
+		   and its signature was guessed from the usage. *)
+
+		guessed_sign_in: WHERE
+		(* where the signature was guessed if the function was used
+		before definition. Normally NIL, since functions should be
+		defined before being used. *)
+
+		used: INTEGER
+		(* no. uf usages. if 0 => warning: never used; if 1 => warning:
+		never used, maybe misspelled *)
+
+		last_rhs: WHERE
+		(* <> NIL only if used>0 *)
+
+		sign: SIGNATURE
+		(* signature of the function *)
+
+		errors: TriggeredErrors
+		(* uses "trigger_error();"; logical OR of Errors *)
+
+		exceptions: ThrownExceptions
+		(* list of the exceptions raised; a NIL element means that the
+		thrown exception class is unknown *)
+
+		thrown_exceptions_descr: ARRAY OF ThrownExceptionDescr
+		(* descriptions for thrown exceptions that have a description *)
+
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+(*
+	SYMBOL TABLE OF CLASSES
+*)
+
+TYPE
+
+	Visibility = (private, protected, public)
+
+	ClassConst = RECORD
+		name: STRING
+		value: Result
+		visibility: Visibility
+		(* implemented as meta-code *)
+		decl_in: WHERE
+		used: INTEGER # how many times has been used outside its class
+		used_inside: BOOLEAN  # used inside its class
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+		forward: BOOLEAN
+		(* dummy forward declaration *)
+	END
+
+	Property = RECORD
+		name: STRING
+		visibility: Visibility
+		static: BOOLEAN
+		type: Type
+		value: STRING
+		decl_in: WHERE
+		used: INTEGER # how many times has been used outside its class
+		used_inside: BOOLEAN  # used inside its class
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+	Method = RECORD
+		name: STRING
+		name_lower: STRING
+		forward: BOOLEAN
+		abstract: BOOLEAN
+		visibility: Visibility
+		static: BOOLEAN
+		final: BOOLEAN
+		sign: SIGNATURE
+		decl_in: WHERE
+		guessed_sign_in: WHERE
+		(* where the signature was guessed if the method was used before
+		definition. Normally NIL, since functions are defined before being
+		used. *)
+
+		used: INTEGER # how many times has been used outside its class
+		used_inside: BOOLEAN  # used inside its class
+
+		errors: TriggeredErrors
+		(* uses "trigger_error();"; OR of Errors *)
+
+		exceptions: ThrownExceptions
+		(* list of the exceptions raised; an element NIL means unknown *)
+
+		thrown_exceptions_descr: ARRAY OF ThrownExceptionDescr
+		(* Descriptions for thrown exceptions that have a description. *)
+
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+TYPE Class = RECORD
+
+		name: STRING
+		(* Name of the class. If in namespace, it is the FQN name. *)
+
+		name_lower: STRING
+		(* Name of the class in lowercase letters to speed-up search *)
+
+		unchecked: BOOLEAN
+		(* This class represents an unchecked exception. *)
+
+		forward: BOOLEAN
+		(* Dummy forward declaration encountered -- actual class
+		still to be parsed. *)
+
+		private: BOOLEAN
+		(* Is this class private to the package where it is defined? *)
+
+		final: BOOLEAN
+
+		abstract: BOOLEAN
+
+		interface: BOOLEAN
+
+		surrogates: ARRAY OF Class
+		(* List of surrogate classes, or NIL if this class is not a
+		template. Example:
+		class HashMap /*. <K implements Hashable; E> { }
+		the surrogate classes are named "K@HashMap" and "E@HashMap",
+		possibly with a namespace in front if HashMap belongs to a NS. *)
+
+		extends: Class
+
+		implements: ARRAY OF Class
+		(* list of the implemented classes (if regular or abstract class),
+		   or list of the extended classes (if interface class) *)
+
+		type: Type # = {object, void, NIL, <myself>}
+		# FIXME: currently the GC does not disposes circular links
+
+		consts: ARRAY OF ClassConst
+
+		properties: ARRAY OF Property
+
+		methods: ARRAY OF Method
+
+		construct: Method
+		constructor_last_used_here: WHERE
+		(*
+			Set when we encounter "new C(...)": in this case the constructor
+			invoked can be the default constructor, or the inherited
+			constructor or the proper constructor of this class. Then, if the
+			proper constructor gets parsed and this variable is already set, it
+			means we used the wrong constructor; the programmer needs to define
+			a forward declaration.
+		*)
+
+		destruct: Method
+
+		parent_constructor_called: BOOLEAN
+		(* does the overridding constructor of this class has called
+		the parent constructor? *)
+
+		parent_destructor_called: BOOLEAN
+		(* does the overridding destructor of this class has called
+		the parent destructor? *)
+
+		decl_in: WHERE
+
+		used: INTEGER
+		(* no. of usages outside itself *)
+
+		descr: STRING
+		(* description inside /*. DOC ... .*/ *)
+		deprecated: STRING
+		(* body of the <@deprecated> tag in [descr]; NIL=not present *)
+	END
+
+FUNCTION TypeToString(t: Type): STRING
+
+FUNCTION SameType(a: Type, b: Type): BOOLEAN
+(*
+	Returns TRUE if the arguments are noth not NIL and represent the same
+	type.
+*)
+
+FUNCTION FunctionSignatureToString(sign: SIGNATURE): STRING
+(*
+	Returns the signature of the function as a string:
+		type([&]type, [&]type, [type, type], ...)
+	For example,
+		/*. int .*/ function f(&$a, $b=4 /*., args.*/)
+	becomes
+		int(&mixed [,int], ...)
+*)
+
+FUNCTION MethodSignatureToString(m: Method): STRING
+(*
+	Return the signature of a method as a string:
+		[visibility] [final] [static] type([&]type, [type], ...)
+	where
+		visibility = public | protected | final
+	For example,
+		public function f($a)
+	becomes
+		public unknown(mixed)
+	Note that the abstract qualifier is omitted.
+*)
+
+END

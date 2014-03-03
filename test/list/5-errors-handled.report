@@ -1,0 +1,238 @@
+
+BEGIN parsing of 5-errors-handled.php
+1:	<?php
+2:	
+3:	/*. require_module 'standard'; .*/
+4:	require_once __DIR__ . "/../../stdlib/errors.php";
+5:	
+6:	
+7:	trigger_error("", 0);
+
+	trigger_error("", 0);
+	                    \_ HERE
+==== 7: ERROR: invalid error code: 0
+8:	
+9:	trigger_error("", E_ERROR);
+
+	trigger_error("", E_ERROR);
+	                          \_ HERE
+==== 9: ERROR: error code forbidden in user's program: E_ERROR
+
+	trigger_error("", E_ERROR);
+	                          \_ HERE
+==== 9: notice: here generating exception(s) ErrorException
+
+	trigger_error("", E_ERROR);
+	                          \_ HERE
+==== 9: Warning: uncaught exception(s): ErrorException
+10:	
+11:	trigger_error("", E_USER_ERROR);
+
+	trigger_error("", E_USER_ERROR);
+	                               \_ HERE
+==== 11: notice: here generating exception(s) ErrorException
+
+	trigger_error("", E_USER_ERROR);
+	                               \_ HERE
+==== 11: Warning: uncaught exception(s): ErrorException
+12:	
+13:	fopen("", "");
+
+	fopen("", "");
+	      \_ HERE
+==== 13: notice: here generating exception(s) ErrorException
+
+	fopen("", "");
+	      \_ HERE
+==== 13: Warning: uncaught exception(s): ErrorException
+14:	
+15:	
+16:	function f()
+17:	{
+18:		trigger_error("", 0);
+
+		trigger_error("", 0);
+	                        \_ HERE
+==== 18: ERROR: invalid error code: 0
+19:	
+20:		trigger_error("", E_ERROR);
+
+		trigger_error("", E_ERROR);
+	                              \_ HERE
+==== 20: ERROR: error code forbidden in user's program: E_ERROR
+
+		trigger_error("", E_ERROR);
+	                              \_ HERE
+==== 20: notice: here generating exception(s) ErrorException
+
+		trigger_error("", E_ERROR);
+	                              \_ HERE
+==== 20: ERROR: exception(s) must be caught or declared to be thrown: ErrorException
+21:	
+22:		trigger_error("", E_USER_WARNING);
+
+		trigger_error("", E_USER_WARNING);
+	                                     \_ HERE
+==== 22: notice: here generating exception(s) ErrorException
+23:	
+24:		trigger_error("", E_USER_ERROR);
+
+		trigger_error("", E_USER_ERROR);
+	                                   \_ HERE
+==== 24: notice: here generating exception(s) ErrorException
+25:	
+26:		fopen("", "");
+
+		fopen("", "");
+	          \_ HERE
+==== 26: notice: here generating exception(s) ErrorException
+27:	}
+28:	
+29:	
+30:	function g()
+==== 16: notice: guessed signature of the function `f()' as void()
+31:	{
+32:		f();
+
+		f();
+	      \_ HERE
+==== 32: notice: here generating exception(s) ErrorException
+
+		f();
+	      \_ HERE
+==== 32: ERROR: exception(s) must be caught or declared to be thrown: ErrorException
+33:	}
+34:	
+35:	
+36:	function h()
+==== 30: notice: guessed signature of the function `g()' as void()
+37:	/*. throws ErrorException .*/
+38:	{
+39:		g();
+
+		g();
+	      \_ HERE
+==== 39: notice: here generating exception(s) ErrorException
+40:	}
+41:	
+42:	
+43:	class MyClass {
+==== 36: notice: guessed signature of the function `h()' as void()
+44:		/*. void .*/ function m()
+45:		{
+46:			trigger_error("", 0);
+
+			trigger_error("", 0);
+	                            \_ HERE
+==== 46: ERROR: invalid error code: 0
+47:	
+48:			trigger_error("", E_ERROR);
+
+			trigger_error("", E_ERROR);
+	                                  \_ HERE
+==== 48: ERROR: error code forbidden in user's program: E_ERROR
+
+			trigger_error("", E_ERROR);
+	                                  \_ HERE
+==== 48: notice: here generating exception(s) ErrorException
+
+			trigger_error("", E_ERROR);
+	                                  \_ HERE
+==== 48: ERROR: exception(s) must be caught or declared to be thrown: ErrorException
+49:	
+50:			trigger_error("", E_USER_WARNING);
+
+			trigger_error("", E_USER_WARNING);
+	                                         \_ HERE
+==== 50: notice: here generating exception(s) ErrorException
+51:	
+52:			trigger_error("", E_USER_ERROR);
+
+			trigger_error("", E_USER_ERROR);
+	                                       \_ HERE
+==== 52: notice: here generating exception(s) ErrorException
+53:	
+54:			fopen("", "");
+
+			fopen("", "");
+	              \_ HERE
+==== 54: notice: here generating exception(s) ErrorException
+55:		}
+56:	}
+57:	
+58:	
+59:	class MySecondClass extends MyClass {
+60:		function m()
+61:		{ }
+62:	}
+==== 60: notice: guessed signature of the method `MySecondClass::m()' as public void()
+63:	
+64:	class MyThirdClass extends MyClass {
+65:		function m() /*. throws ErrorException .*/
+66:		{ }
+67:	}
+==== 65: notice: guessed signature of the method `MyThirdClass::m()' as public void()
+68:	
+69:	
+70:	f();
+
+	f();
+	  \_ HERE
+==== 70: notice: here generating exception(s) ErrorException
+
+	f();
+	  \_ HERE
+==== 70: Warning: uncaught exception(s): ErrorException
+71:	
+72:	$o = new MyClass();
+73:	$o->m();
+
+	$o->m();
+	      \_ HERE
+==== 73: notice: here generating exception(s) ErrorException
+
+	$o->m();
+	      \_ HERE
+==== 73: Warning: uncaught exception(s): ErrorException
+74:	
+75:	@f();
+
+	@f();
+	 \_ HERE
+==== 75: ERROR: errors mapping into exception is in effect, the silencer operator `@' cannot be used anymore
+
+	@f();
+	   \_ HERE
+==== 75: notice: here generating exception(s) ErrorException
+
+	@f();
+	   \_ HERE
+==== 75: Warning: uncaught exception(s): ErrorException
+76:	
+77:	@$o->m();
+
+	@$o->m();
+	 \_ HERE
+==== 77: ERROR: errors mapping into exception is in effect, the silencer operator `@' cannot be used anymore
+
+	@$o->m();
+	       \_ HERE
+==== 77: notice: here generating exception(s) ErrorException
+
+	@$o->m();
+	       \_ HERE
+==== 77: Warning: uncaught exception(s): ErrorException
+78:	
+79:	trigger_error("", 12345);
+
+	trigger_error("", 12345);
+	                        \_ HERE
+==== 79: ERROR: invalid error code: 12345
+80:	
+END parsing of 5-errors-handled.php
+==== 5-errors-handled.php:36: notice: unused function `h()'
+==== 5-errors-handled.php:59: notice: unused class `MySecondClass'
+==== 5-errors-handled.php:64: notice: unused class `MyThirdClass'
+==== ?: notice: unused package `../../stdlib/errors.php'
+==== ?: notice: required module `standard'
+Overall test results: 12 errors, 7 warnings.

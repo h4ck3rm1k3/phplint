@@ -1,0 +1,394 @@
+IMPLEMENTATION MODULE Search
+
+IMPORT str, Namespace, Scanner, Globals
+
+
+FUNCTION NormalizeConstName(name: STRING): STRING
+
+	FUNCTION index_last(q: STRING): INTEGER
+	VAR i: INTEGER
+	BEGIN
+		FOR i = length(q)-1 TO 0 BY -1 DO
+			IF q[i] = "\\" THEN
+				RETURN i
+			END
+		END
+		RETURN -1
+	END
+
+VAR
+	i: INTEGER
+BEGIN
+	IF isFullyQualified(name) THEN
+		name = name[1,length(name)]
+	END
+	(* Now name is qualified or a bare identifier. *)
+	IF isIdentifier(name) THEN
+		RETURN name
+	ELSE (* is qualified: set namespace part into lowercase: *)
+		i = index_last(name)
+		RETURN tolower(name[0,i]) + name[i,length(name)]
+	END
+END
+
+
+FUNCTION SearchConstByAbsName(name: STRING, warn: BOOLEAN): CONSTANT
+VAR
+	name_normalized: STRING
+	i: INTEGER
+	c: CONSTANT
+BEGIN
+	name_normalized = NormalizeConstName(name)
+	FOR i = 0 TO count(consts)-1 DO
+		IF consts[i][name_normalized] = name_normalized THEN
+			c = consts[i]
+			IF warn AND (c[name] <> name) THEN
+				Error("constant `" + name + "' was declared in "
+				+ reference(c[decl_in]) + " as `" + c[name]
+				+ "' that differ by upper/lower-case letters only")
+			END
+			RETURN c
+		END
+	END
+	RETURN NIL
+END
+
+
+FUNCTION SearchConst(name: STRING, warn: BOOLEAN): CONSTANT
+VAR
+	q: STRING
+	c: CONSTANT
+BEGIN
+	q = Namespace.ApplyUse(name, FALSE)
+	c = SearchConstByAbsName(q, warn)
+	IF (c = NIL) AND isIdentifier(name) THEN
+		c = SearchConstByAbsName(name, warn)
+	END
+	RETURN c
+END
+
+
+FUNCTION SearchVarInScope(name: STRING, scope: INTEGER): VARIABLE
+VAR
+	i: INTEGER
+BEGIN
+	i = vars_n - 1
+	LOOP
+		IF (i < 0) OR (vars[i][scope] < scope) THEN
+			RETURN NIL
+		END
+		IF (vars[i][scope] = scope) AND (vars[i][name] = name) THEN
+			RETURN vars[i]
+		END
+		i = i - 1
+	END
+END
+
+
+FUNCTION SearchVar(name: STRING): VARIABLE
+VAR
+	v: VARIABLE
+BEGIN
+	(* First, search in the given scope: *)
+	v = SearchVarInScope(name, scope)
+	IF v <> NIL THEN
+		RETURN v
+	END
+
+	(* Next, search between the superglobals: *)
+	RETURN SearchVarInScope(name, -1)
+END
+
+
+FUNCTION SearchFuncLower(name_lower: STRING): Function
+VAR
+	i: INTEGER
+BEGIN
+	FOR i = 0 TO count(funcs)-1 DO
+		IF funcs[i][name_lower] = name_lower THEN
+			RETURN funcs[i]
+		END
+	END
+	RETURN NIL
+END
+
+
+FUNCTION SearchFuncByAbsName(name: STRING, warn: BOOLEAN): Function
+VAR
+	f: Function
+BEGIN
+	f = SearchFuncLower( tolower(name) )
+	IF (f <> NIL) AND warn AND (f[name] <> name) THEN
+		IF f[decl_in] = NIL THEN
+			Error("function `" + name + "' already spelled as `"
+			+ f[name]
+			+ "' that differ by upper/lower-case letters only")
+		ELSE
+			Error("function `" + name + "' was declared in "
+			+ reference(f[decl_in]) + " as `" + f[name]
+			+ "' that differ by upper/lower-case letters only")
+		END
+	END
+	RETURN f
+END
+
+
+FUNCTION SearchFunc(name: STRING, warn: BOOLEAN): Function
+VAR
+	q: STRING
+	f: Function
+BEGIN
+	q = Namespace.ApplyUse(name, FALSE)
+	f = SearchFuncByAbsName(q, warn)
+	IF (f = NIL) AND isIdentifier(name) THEN
+		f = SearchFuncByAbsName(name, warn)
+	END
+	RETURN f
+END
+
+
+FUNCTION SearchClassByAbsName(name: STRING, warn: BOOLEAN): Class
+VAR
+	name_lower: STRING
+	i: INTEGER
+	class: Class
+BEGIN
+	name_lower = tolower(name)
+	FOR i=count(classes)-1 TO 0 BY -1 DO
+		IF classes[i][name_lower] = name_lower THEN
+			class = classes[i]
+			IF warn AND (class[name] <> name) THEN
+				IF class[decl_in] = NIL THEN
+					Error("class `" + name + "' already spelled as `"
+					+ class[name]
+					+ "' that differ by upper/lower-case letters only")
+				ELSE
+					Error("class `" + name + "' was declared in "
+					+ reference(class[decl_in]) + " as `" + class[name]
+					+ "' that differ by upper/lower-case letters only")
+				END
+			END
+			RETURN class
+		END
+	END
+	RETURN NIL
+END
+
+
+FUNCTION SearchClass(name: STRING): Class
+VAR
+	c: Class
+	fn: STRING
+	s: STRING
+	s_vars: ARRAY OF VARIABLE
+	s_vars_n, i: INTEGER
+BEGIN
+	name = Namespace.ApplyUse(name, TRUE)
+	c = SearchClassByAbsName(name, TRUE)
+	IF c <> NIL THEN
+		RETURN c
+	END
+
+	# Try autoloading:
+	IF autoload_prepend = NIL THEN
+		RETURN NIL
+	END
+
+	(*
+		Class unknown. Trick: we trigger a "require_once" statement, having
+		care to save the current parsing context. In fact, while regular
+		require_once statements can occur in PHPLint only at global scope,
+		autoloading events can be triggered in several other context: inside a
+		function, inside a class and inside a method.
+	*)
+
+	fn = autoload_prepend + substitute(name, "\\", autoload_separator)
+		+ autoload_append
+	Notice("autoloading package " + fn)
+	# FIXME: resolve circular dependency between Statements and Search
+
+	(*
+		FIXME: the included package MUST define only one class, not others
+		objects at global scope. How to check for this?
+	*)
+	
+	(* Save only global variables, not local ones:  *)
+	s_vars = vars
+	s_vars_n = vars_n
+	vars = NIL
+	vars_n = 0
+	FOR i = 0 TO s_vars_n - 1 DO
+		IF s_vars[i][scope] <= 0 THEN
+			vars[] = s_vars[i]
+		END
+	END
+	vars_n = count(vars)
+
+$   void Statements_RequirePackage(STRING *, int);
+$	Statements_RequirePackage(Search_fn, 0);
+
+	(*
+		Restore parsing context (the scanner context was already restored
+		by RequirePackage() itself):
+	*)
+
+	vars = s_vars
+	vars_n = s_vars_n
+
+	c = SearchClassByAbsName(name, TRUE)
+	IF c <> NIL THEN
+		(* Account __autoload() and the package in which it is defined: *)
+		s = "__autoload"
+$		RECORD * Accounting_AccountFuncCall(STRING *);
+$		/* ignore = */ Accounting_AccountFuncCall(Search_s);
+	END
+	RETURN c
+END
+
+
+FUNCTION SearchClassProperty(class: Class, id: STRING,
+	VAR P: Class, VAR p: Property)
+(*
+	Search the property ID inside the class CLASS.
+
+	Protected properties are always returned; it's responsability
+	of the caller to check this property be not overridden and be
+	accessed from its class or its child class. Note that a child
+	class can access the protected variable of the parent class
+	via $this->protectedVar, but the access to the same variable of
+	other objects is forbidden. For example:
+
+		class A { protected $v=0; }
+
+		class B extends A {
+			function f()
+			{
+				$this->v = 1;  # allowed
+				$a = new A();
+				$a->v = 1; # FORBIDDEN
+			}
+		}
+
+
+	PHP4: private properties are always returned.
+
+	PHP5: private properties are found only if we are currently
+	inside their class.
+*)
+VAR
+	properties: ARRAY OF Property
+	i: INTEGER
+BEGIN
+	properties = class[properties]
+	FOR i = 0 TO count(properties)-1 DO
+		IF (properties[i][name] = id)
+		AND ( (properties[i][visibility] = public)
+			OR (properties[i][visibility] = protected)
+			OR (properties[i][visibility] = private)
+				AND ((php_ver = php4) OR (curr_class = class))
+		) THEN
+			P = class
+			p = properties[i]
+			RETURN
+		END
+	END
+
+	# Search between the implemented interfaces:
+	FOR i=0 TO count(class[implements])-1 DO
+		SearchClassProperty(class[implements][i], id, P, p)
+		IF p <> NIL THEN
+			RETURN
+		END
+	END
+
+	# Search inside the extended class:
+	IF class[extends] <> NIL THEN
+		SearchClassProperty(class[extends], id, P, p)
+		IF p <> NIL THEN
+			RETURN
+		END
+	END
+
+	# Not found:
+	P = NIL
+	p = NIL
+	RETURN
+END
+
+
+FUNCTION SearchClassMethod(class: Class, name: STRING, warn: BOOLEAN): Method
+VAR
+	name_lower: STRING
+	methods: ARRAY OF Method
+	i: INTEGER
+	m: Method
+BEGIN
+	IF class = NIL THEN
+		RETURN NIL
+	END
+	name_lower = tolower(name)
+	methods = class[methods]
+	FOR i = 0 TO count(methods)-1 DO
+		IF methods[i][name_lower] = name_lower THEN
+			m = methods[i]
+			IF warn AND (m[name] <> name) THEN
+				IF m[decl_in] = NIL THEN
+					Error("method `" + name + "' already spelled as `"
+					+ m[name]
+					+ "' that differ by upper/lower-case letters only")
+				ELSE
+					Error("method `" + name + "' was declared in "
+					+ reference(m[decl_in]) + " as `" + m[name]
+					+ "' that differ by upper/lower-case letters only")
+				END
+			END
+			RETURN m
+		END
+	END
+	RETURN NIL
+END
+
+
+FUNCTION ResolveClassConst(class: Class, id: STRING,
+	VAR res_class: Class, VAR res_const: ClassConst)
+VAR i: INTEGER
+BEGIN
+	res_class = NIL
+	res_const = NIL
+
+	IF class = NIL THEN
+		RETURN
+	END
+
+	(*
+		Search inside class:
+	*)
+	FOR i=0 TO count(class[consts])-1 DO
+		IF class[consts][i][name] = id THEN
+			res_class = class
+			res_const = class[consts][i]
+			RETURN
+		END
+	END
+
+	(*
+		Search in the extended class:
+	*)
+	ResolveClassConst(class[extends], id,  res_class, res_const)
+	IF res_const <> NIL THEN
+		RETURN
+	END
+
+	(*
+		Search between implemented classes:
+	*)
+	FOR i=0 TO count(class[implements])-1 DO
+		ResolveClassConst( class[implements][i], id,  res_class, res_const)
+		IF res_const <> NIL THEN
+			RETURN
+		END
+	END
+END
+
+
+END

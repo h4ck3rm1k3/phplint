@@ -1,0 +1,20 @@
+
+BEGIN parsing of 5-spl-Traversable-1.php
+1:	<?php
+2:	
+3:		/*. require_module 'spl'; .*/
+4:	
+5:		class Test implements Traversable {
+
+		class Test implements Traversable {
+	                                      \_ HERE
+==== 5: ERROR: can't implement abstract interface `Traversable', use `Iterator' or `IteratorAggregate' instead
+6:		}
+7:	
+END parsing of 5-spl-Traversable-1.php
+==== 5-spl-Traversable-1.php:5: notice: unused class `Test'
+==== ?: notice: unused module `spl'
+==== ?: notice: required module `simplexml'
+==== ?: notice: required module `dom'
+==== ?: notice: required module `standard'
+Overall test results: 1 errors, 0 warnings.

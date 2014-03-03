@@ -1,0 +1,71 @@
+
+BEGIN parsing of 5-namespace-proto.php
+1:	<?php
+2:	
+3:	/*. require_module 'standard'; .*/
+4:	/*. require_module 'spl'; .*/
+5:	
+6:	namespace proto;
+7:	###############
+8:	
+9:	const MY_CONST = 123;
+10:	
+11:	/*. forward \Exception function MyFunc(\Exception $e); .*/
+12:	
+13:	/*. \Exception .*/ function MyFunc(/*. \Exception .*/ $e)
+
+	/*. \Exception .*/ function MyFunc(/*. \Exception .*/ $e)
+	                                  \_ HERE
+==== 13: notice: function `proto\MyFunc()' declared forward in line 11 but never used before implementation
+14:	{
+15:		return $e->getPrevious();
+16:	}
+17:	
+18:	
+19:	/*.
+20:		forward class MyClass extends \Exception {}
+21:	.*/
+22:	
+23:	class MyClass extends \Exception {}
+24:	
+25:	
+26:	/*.
+27:		forward interface MyInterface {}
+28:	.*/
+29:	
+30:	interface MyInterface {}
+31:	
+32:	
+33:	namespace proto\testing;
+34:	#######################
+35:	
+36:	$n = 1 + \proto\MY_CONST;
+37:	echo "n=$n\n";
+38:	
+39:	$e = \proto\MyFunc( new \Exception() );
+40:	
+41:	$c = new \proto\MyClass();
+42:	
+43:	$i = /*. (\proto\MyInterface) .*/ NULL;
+44:	
+45:	use proto as p;
+46:	
+47:	$n = 1 + p\MY_CONST;
+48:	echo "n=$n\n";
+49:	
+50:	#$e = MyFunc( new \Exception() );
+51:	
+52:	$c = new p\MyClass();
+53:	
+54:	$i = /*. (p\MyInterface) .*/ NULL;
+55:	
+56:	?>
+END parsing of 5-namespace-proto.php
+==== 5-namespace-proto.php:54: notice: variable `$i' assigned but never used
+==== 5-namespace-proto.php:52: notice: variable `$c' assigned but never used
+==== 5-namespace-proto.php:39: notice: variable `$e' assigned but never used
+==== ?: notice: unused module `spl'
+==== ?: notice: required module `standard'
+==== ?: notice: required module `simplexml'
+==== ?: notice: required module `dom'
+Overall test results: 0 errors, 0 warnings.

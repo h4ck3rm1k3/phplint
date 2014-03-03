@@ -1,0 +1,52 @@
+
+BEGIN parsing of 5-phpDoc-forward-references.php
+1:	<?php
+2:	/**
+3:	 *  Unqualified forward references NOT allowed in PHPLint/PHP 5:
+4:	 *  {@link MY_CONST},
+5:	 *  {@link MyFunc()},
+6:	 *  {@link MyClass},
+7:	 *  {@link MyClass::MyMethod()}.
+8:	 *
+9:	 *  Fully qualified forward references allowed in PHPLint/PHP 5:
+10:	 *  {@link \MY_CONST},
+11:	 *  {@link \MyFunc()},
+12:	 *  {@link \MyClass},
+13:	 *  {@link \MyClass::MyMethod()},
+14:	 *  {@link namespace\MY_CONST},
+15:	 *  {@link namespace\MyFunc()},
+16:	 *  {@link namespace\MyClass},
+17:	 *  {@link namespace\MyClass::MyMethod()}.
+18:	 *
+19:	 *  @package ForwardDeclsTest
+20:	 */
+==== 20: ERROR: {@link MY_CONST}: unknown item
+==== 20: ERROR: {@link MyFunc()}: unknown function
+==== 20: ERROR: {@link MyClass}: unknown item
+==== 20: ERROR: {@link MyClass::MyMethod()}: unknown class
+21:	
+22:	define("MY_CONST", 123);
+23:	
+24:	/**
+25:	 *  @return MyClass $wrongParam  Not resolvable.
+26:	 *  @return \MyClass $wrongParam  Not resolvable.
+27:	 *  @return namespace\MyClass $wrongParam  Not resolvable.
+28:	 */
+==== 28: ERROR: unknown type/class `MyClass'
+==== 28: ERROR: unknown type/class `\MyClass'
+==== 28: ERROR: unknown type/class `namespace\MyClass'
+29:	function MyFunc(){}
+
+	function MyFunc(){}
+	        \_ HERE
+==== 29: Warning: missing `@return TYPE' declaration in DocBlock above
+30:	
+31:	class MyClass {
+==== 29: notice: guessed signature of the function `MyFunc()' as void()
+32:		/*. void .*/ function MyMethod(){}
+33:	}
+END parsing of 5-phpDoc-forward-references.php
+==== 5-phpDoc-forward-references.php:22: notice: unused constant `MY_CONST'
+==== 5-phpDoc-forward-references.php:29: notice: unused function `MyFunc()'
+==== 5-phpDoc-forward-references.php:31: notice: unused class `MyClass'
+Overall test results: 7 errors, 1 warnings.

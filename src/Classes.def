@@ -1,0 +1,125 @@
+DEFINITION MODULE Classes
+
+IMPORT Types
+
+VAR
+	(* Preloaded classes from standard module: *)
+	ExceptionClass,
+
+	(* Preloaded classed from spl module: *)
+	TraversableClass,
+	IteratorClass,
+	IteratorAggregateClass,
+	CountableClass,
+	ArrayAccessClass: Class
+
+FUNCTION PreloadBuiltinSplClasses()
+(*
+	Called whenever the SPL module is included, this function sets the
+	exported variables XxxClass once for all for later faster access to
+	some basic classes that have a special meaning in PHP.
+*)
+
+FUNCTION IsSubclassOf(child: Class, parent: Class): BOOLEAN
+(*
+	Returns TRUE if CHILD is just the class PARENT or it is a extension of
+	this latter or an implementation. Returns FALSE if either child=NIL
+	or parent=NIL.
+*)
+
+FUNCTION IsSubclassOfSet(c: Class, set: ARRAY OF Class): BOOLEAN
+(* Return TRUE if c is a subclass of some class of the set. *)
+
+FUNCTION OrphanClasses(
+	parents: ARRAY OF Class, children: ARRAY OF Class): ARRAY OF Class
+(*
+	Returns the set of child classes for which there is not a parent in the
+	sense of IsSubclassOf(). Returns the empty set NIL if all the children
+	have at least a parent.
+*)
+
+FUNCTION IsExceptionClass(c: Class): BOOLEAN
+(*
+	Returns TRUE if c is the Exception class or an extension of the
+	Exception class, possibly NIL if `a' is empty or not checked exceptions
+	found.
+*)
+
+FUNCTION CheckedExceptionsSubset(a: ARRAY OF Class): ARRAY OF Class
+(*
+	Selects from the set only the checked exceptions.
+*)
+
+FUNCTION ClassesList(set: ARRAY OF Class): STRING
+(*
+	Returns a comma-spearated list of the classes, or NIL if empty set.
+	Unchecked exceptions have also their `unchecked' attribute.
+*)
+
+FUNCTION CloneSet(set: ARRAY OF Class): ARRAY OF Class
+(*
+	Returns a copy of the set of classes.
+*)
+
+FUNCTION Sort(set: ARRAY OF Class): ARRAY OF Class
+(*
+	Returns a sorted list of classes, children first and parents next;
+	unchecked exceptions go after the checked ones;
+	unrelated classes are ordered alphabetically.
+*)
+
+FUNCTION pc(c1: Class, c2: Class): STRING
+(*
+	Returns the chain of class names from the class c1 (extended or
+	implemented class) to the class c2 (parent or interface).
+*)
+
+FUNCTION CheckCollisionsBetweenExtendedAndImplementedClasses(cl: Class)
+(*
+	Check that there aren't collisions between const/propr./methods
+	inherited from the extended/implemented classes of the class.
+
+	Should be called just after the class name, extend ... and
+	implement ... list have been parsed and before any member
+	be parsed.
+*)
+
+FUNCTION CheckImplementedMethods(child: Class)
+(*
+	Check if the child class implements all the abstract methods of
+	the parent abstract class and of the implemented classes.
+*)
+
+FUNCTION CheckOverridesImplements(ac: Class, a: Method, bc: Class, b: Method)
+(*
+	Check attributes and signature of the overrider method b against
+	the overridden method a.
+*)
+
+FUNCTION CheckOverriddenMethod(c: Class, m: Method)
+(*
+	Check if the method match the signature of the overridden method,
+	or implemented abstract method or implemented interface method.
+*)
+
+FUNCTION ResolveClassMethod(class: Class, id: STRING,
+	VAR res_class: Class, VAR res_method: Method)
+(*
+	Resolve the method of name ID of the class CLASS searcing inside
+	the class CLASS itself and in all the extended and implemented
+	classes.
+	Returns the resolved class/method, or both NIL if not found.
+*)
+
+FUNCTION CheckTraversableUsage(class: Class)
+(*
+	Concrete classes that implement Traversable must implement either
+	Iterator or IteratorAggregate, not both.
+*)
+
+FUNCTION IsObjectConvertibleToString(t: Type): BOOLEAN
+(*
+	Returns TRUE if t is an object that implements __toString().
+*)
+
+END

@@ -1,0 +1,7 @@
+DEFINITION MODULE Typecast
+
+IMPORT Types
+
+FUNCTION EvaluateCastCall(): Type
+
+END

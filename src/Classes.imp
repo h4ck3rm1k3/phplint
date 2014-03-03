@@ -1,0 +1,1056 @@
+IMPLEMENTATION MODULE Classes
+
+IMPORT Globals
+IMPORT Scanner
+IMPORT Search
+IMPORT m2
+
+
+FUNCTION PreloadBuiltinSplClasses()
+
+	FUNCTION grab(name: STRING): Class
+	VAR c: Class
+	BEGIN
+		c = SearchClassByAbsName(name, FALSE)
+		IF c = NIL THEN
+			Warning2(here(), "missing expected class `" + name
+			+ "' in standard module spl")
+		END
+		RETURN c
+	END
+
+
+BEGIN
+	TraversableClass = grab("Traversable")
+	IteratorClass = grab("Iterator")
+	IteratorAggregateClass = grab("IteratorAggregate")
+	CountableClass = grab("Countable")
+	ArrayAccessClass = grab("ArrayAccess")
+END
+
+
+FUNCTION IsSubclassOf(child: Class, parent: Class): BOOLEAN
+VAR
+	i: INTEGER
+	c: ARRAY OF Class
+BEGIN
+	IF (child = NIL) OR (parent = NIL) THEN
+		RETURN FALSE
+	END
+	IF child = parent THEN
+		RETURN TRUE
+	END
+	IF IsSubclassOf(child[extends], parent) THEN
+		RETURN TRUE
+	END
+	c = child[implements]
+	FOR i=0 TO count(c)-1 DO
+		IF IsSubclassOf(c[i], parent) THEN
+			RETURN TRUE
+		END
+	END
+	RETURN FALSE
+END
+
+
+FUNCTION IsSubclassOfSet(c: Class, set: ARRAY OF Class): BOOLEAN
+VAR i: INTEGER
+BEGIN
+	FOR i = 0 TO count(set)-1 DO
+		IF IsSubclassOf(c, set[i]) THEN
+			RETURN TRUE
+		END
+	END
+	RETURN FALSE
+END
+
+
+FUNCTION OrphanClasses(
+	parents: ARRAY OF Class, children: ARRAY OF Class): ARRAY OF Class
+VAR
+	i: INTEGER
+	orphans: ARRAY OF Class
+BEGIN
+	FOR i = 0 TO count(children)-1 DO
+		IF NOT IsSubclassOfSet(children[i], parents) THEN
+			orphans[] = children[i]
+		END
+	END
+	RETURN orphans
+END
+
+
+FUNCTION IsExceptionClass(c: Class): BOOLEAN
+BEGIN
+	RETURN IsSubclassOf(c, ExceptionClass)
+END
+
+
+FUNCTION CheckedExceptionsSubset(a: ARRAY OF Class): ARRAY OF Class
+VAR
+	i: INTEGER
+	b: ARRAY OF Class
+BEGIN
+	FOR i = 0 TO count(a)-1 DO
+		IF NOT a[i][unchecked] THEN
+			b[] = a[i]
+		END
+	END
+	RETURN b
+END
+
+
+FUNCTION ClassesList(set: ARRAY OF Class): STRING
+VAR
+	s: STRING
+	i: INTEGER
+BEGIN
+	FOR i = 0 TO count(set)-1 DO
+		IF i > 0 THEN
+			s = s + ", "
+		END
+		IF set[i][unchecked] THEN
+			s = s + "unchecked "
+		END
+		s = s + set[i][name]
+	END
+	RETURN s
+END
+
+
+FUNCTION CloneSet(set: ARRAY OF Class): ARRAY OF Class
+VAR
+	copy: ARRAY OF Class
+	i: INTEGER
+BEGIN
+	FOR i = count(set)-1 TO 0 BY -1 DO
+		copy[i] = set[i]
+	END
+	RETURN copy
+END
+
+
+FUNCTION Sort(set: ARRAY OF Class): ARRAY OF Class
+
+	FUNCTION cmp(a: Class, b: Class): INTEGER
+	BEGIN
+		IF IsSubclassOf(a, b) THEN
+			RETURN -1
+		ELSIF IsSubclassOf(b, a) THEN
+			RETURN +1
+		ELSIF a[unchecked] AND NOT b[unchecked] THEN
+			RETURN +1
+		ELSIF NOT a[unchecked] AND b[unchecked] THEN
+			RETURN -1
+		ELSE
+			RETURN strcmp(a[name], b[name])
+		END
+	END
+
+VAR
+	i, j: INTEGER
+	t: Class
+	new: ARRAY OF Class
+BEGIN
+	new = CloneSet(set)
+	FOR i = 0 TO count(new)-2 DO
+		FOR j = i+1 TO count(new)-1 DO
+			IF cmp(new[j], new[i]) < 0 THEN
+				t = new[i]
+				new[i] = new[j]
+				new[j] = t
+			END
+		END
+	END
+	RETURN new
+END
+
+
+FUNCTION pc(c1: Class, c2: Class): STRING
+(*
+	Returns the chain of class names from the class c1 (extended or
+	implemented class) to the class c2 (parent or interface).
+	Returns NIL if no valid path exists, that is c1 is not subclass of c2.
+*)
+VAR s: STRING
+	i: INTEGER
+BEGIN
+	IF (c1 = NIL) OR (c2 = NIL) THEN
+		RETURN NIL
+	END
+	IF c1 = c2 THEN
+		RETURN c1[name]
+	END
+
+	(* Follows the "extends" branch: *)
+	s = pc(c1[extends], c2)
+	IF s <> NIL THEN
+		RETURN c1[name] + "::" + s
+	END
+
+	(* Follows the "implements" branch: *)
+	FOR i=0 TO count(c1[implements])-1 DO
+		s = pc(c1[implements][i], c2)
+		IF s <> NIL THEN
+			RETURN c1[name] + "::" + s
+		END
+	END
+
+	RETURN NIL
+END
+
+
+FUNCTION SearchMethod(
+	c: Class,
+	name: STRING,
+	name_lower: STRING,
+	warn: BOOLEAN): Method
+(*
+	Search inside the class c a method whose name is name.
+	If warn=TRUE generates warning on different upper/lower-case.
+
+	NOTE: differs from Search.SearchClassMethod() because the upper-case
+	version of the name does not need to be calculated (it is provided
+	by caller).
+*)
+VAR
+	methods: ARRAY OF Method
+	i: INTEGER
+	m: Method
+	action: STRING
+BEGIN
+	IF c = NIL THEN
+		RETURN NIL
+	END
+	methods = c[methods]
+	FOR i=0 TO count(methods)-1 DO
+		m = methods[i]
+		IF m[name_lower] = name_lower THEN
+			IF warn AND (m[name] <> name) THEN
+				IF m[abstract] THEN
+					action = "implemented"
+				ELSE
+					action = "overridden"
+				END
+				Notice("the name of the method `" + name
+				+ "()' differs from the name of the " + action + " method "
+				+ mn(c, m))
+			END
+			RETURN m
+		END
+	END
+	RETURN NIL
+END
+
+
+(*
+
+	Types and functions to collect inherited constants.
+
+*)
+
+TYPE
+	IConst = RECORD  cl: Class  c: ClassConst  END
+	(* An inherited constant *)
+
+
+FUNCTION MergeIConstArrays(a: ARRAY OF IConst, b: ARRAY OF IConst,
+	errorOnCollision: BOOLEAN): ARRAY OF IConst
+VAR
+	c: ARRAY OF IConst
+	i, j: INTEGER
+BEGIN
+	IF a = NIL THEN
+		RETURN b
+	END
+	IF b = NIL THEN
+		RETURN a
+	END
+
+	(* Copy a[] into c[]: *)
+	FOR i=count(a)-1 TO 0 BY -1 DO
+		c[] = a[i]
+	END
+
+	(* Add b[] to c[], checking for collisions with a[]: *)
+	FOR i=0 TO count(b)-1 DO
+		(* Search for collision between b[i] and a[]: *)
+		j = count(a)-1
+		LOOP
+			IF (j < 0) OR (a[j][cl] = b[i][cl]) THEN
+				(* No collision found. *)
+				c[] = b[i]
+				EXIT
+
+			ELSIF a[j][c][name] = b[i][c][name] THEN
+				(* Colliding constants. *)
+				IF a[j][cl][interface] OR b[i][cl][interface] THEN
+					(*
+						Cannot re-define const of interface.
+					*)
+					IF errorOnCollision THEN
+						Error("colliding inherited constants "
+						+ a[j][cl][name] + "::" + a[j][c][name]
+						+ " declared in " + reference(a[j][c][decl_in])
+						+ " and "
+						+ b[i][cl][name] + "::" + b[i][c][name]
+						+ " declared in " + reference(b[i][c][decl_in])
+						)
+					END
+				(*
+				ELSE
+					(* Constant b[i] was re-defined. *)
+				*)
+				END
+				EXIT
+
+			END
+			inc(j, -1)
+		END
+	END
+
+	RETURN c
+END
+
+
+FUNCTION CollectConsts(cl: Class,  errorOnCollision: BOOLEAN):
+	ARRAY OF IConst
+VAR
+	a, b: ARRAY OF IConst
+	c: IConst
+	i: INTEGER
+BEGIN
+	IF cl = NIL THEN
+		RETURN NIL
+	END
+
+	(*
+		Collect from extended class:
+	*)
+	a = CollectConsts( cl[extends], FALSE )
+
+	(*
+		Collect from implemented classes:
+	*)
+	FOR i=0 TO count( cl[implements] )-1 DO
+		b = CollectConsts( cl[implements][i], FALSE )
+		a = MergeIConstArrays( a, b, errorOnCollision )
+	END
+
+	(*
+		Collect from myself:
+	*)
+	b = NIL
+	FOR i=0 TO count( cl[consts] )-1 DO
+		c = NIL
+		c[cl] = cl
+		c[c] = cl[consts][i]
+		b[] = c
+	END
+	a = MergeIConstArrays( b, a, errorOnCollision )
+
+	RETURN a
+END
+
+
+(*
+
+	Types and functions to collect inherited properties.
+
+*)
+
+TYPE
+	IProp = RECORD  cl: Class  p: Property  END
+
+
+FUNCTION MergeIPropArrays(a: ARRAY OF IProp, b: ARRAY OF IProp,
+	errorOnCollision: BOOLEAN): ARRAY OF IProp
+VAR
+	c: ARRAY OF IProp
+	i, j: INTEGER
+	hint: STRING
+BEGIN
+	IF a = NIL THEN
+		RETURN b
+	END
+	IF b = NIL THEN
+		RETURN a
+	END
+
+	(* Copy a[] into c[]: *)
+	FOR i=count(a)-1 TO 0 BY -1 DO
+		c[] = a[i]
+	END
+
+	(* Add b[] to c[], checking for collisions with a[]: *)
+	FOR i=0 TO count(b)-1 DO
+		(* Search for collision between b[i] and a[]: *)
+		j = count(a)-1
+		LOOP
+			IF (j < 0) OR (a[j][cl] = b[i][cl]) THEN
+				(* No collision found. *)
+				c[] = b[i]
+				EXIT
+
+			ELSIF (a[j][p][name] = b[i][p][name])
+			AND (
+				(php_ver = php4)
+				OR (a[j][p][visibility] <> private)
+				OR (a[j][p][visibility] <> private)
+			)
+			THEN
+				IF errorOnCollision THEN
+					IF php_ver = php4 THEN
+						hint = ". Private properties cannot be re-defined nor public|protected properties can be overridden (PHPLint restriction)."
+					ELSE
+						hint = ". Public|protected properties cannot be overridden (PHPLint restriction)."
+					END
+					Error("colliding inherited properties "
+					+ a[j][cl][name] + "::$" + a[j][p][name]
+					+ " declared in " + reference(a[j][p][decl_in])
+					+ " and "
+					+ b[i][cl][name] + "::$" + b[i][p][name]
+					+ " declared in " + reference(b[i][p][decl_in])
+					+ hint
+					)
+				END
+				EXIT
+
+			END
+			inc(j, -1)
+		END
+	END
+
+	RETURN c
+END
+
+
+FUNCTION CollectProps(cl: Class, errorOnCollision: BOOLEAN):
+	ARRAY OF IProp
+VAR
+	a, b: ARRAY OF IProp
+	p: IProp
+	i: INTEGER
+BEGIN
+	IF cl = NIL THEN
+		RETURN NIL
+	END
+
+	(*
+		Collect from extended class:
+	*)
+	a = CollectProps( cl[extends], FALSE )
+
+	(**** Interfaces cannot define properties -- skip.
+
+	(*
+		Collect from implemented classes:
+	*)
+	FOR i=0 TO count( cl[implements] )-1 DO
+		b = CollectProps( cl[implements][i], FALSE )
+		a = MergeIPropArrays( a, b, errorOnCollision )
+	END
+
+	****)
+
+	(*
+		Collect from myself:
+	*)
+	b = NIL
+	FOR i=0 TO count( cl[properties] )-1 DO
+		p = NIL
+		p[cl] = cl
+		p[p] = cl[properties][i]
+		b[] = p
+	END
+	a = MergeIPropArrays( b, a, errorOnCollision )
+
+	RETURN a
+END
+
+
+
+(*
+
+	Types and functions to collect inherited methods.
+
+*)
+
+TYPE
+	IMethod = RECORD  cl: Class  m: Method  END
+
+
+FUNCTION MergeIMethodArrays(a: ARRAY OF IMethod, b: ARRAY OF IMethod,
+	errorOnCollision: BOOLEAN): ARRAY OF IMethod
+VAR
+	c: ARRAY OF IMethod
+	i, j: INTEGER
+	am, bm: IMethod
+BEGIN
+	IF a = NIL THEN
+		RETURN b
+	END
+	IF b = NIL THEN
+		RETURN a
+	END
+
+	(* Copy a[] into c[]: *)
+	FOR i=count(a)-1 TO 0 BY -1 DO
+		c[] = a[i]
+	END
+
+	(* Add b[] to c[], checking for collisions with a[]: *)
+	FOR i=0 TO count(b)-1 DO
+		(* Search for collision between b[i] and a[]: *)
+		j = count(a)-1
+		LOOP
+			IF (j < 0) OR (a[j][cl] = b[i][cl]) THEN
+				(* No collision found. *)
+				c[] = b[i]
+				EXIT
+			END
+
+			am = a[j]
+			bm = b[i]
+
+			IF (am[m][name_lower] = bm[m][name_lower])
+			AND (
+				(php_ver = php4)
+				OR (am[m][visibility] <> private)
+				OR (am[m][visibility] <> private)
+			)
+			THEN
+				IF errorOnCollision THEN
+					Error("colliding inherited methods "
+					+ mn(am[cl], am[m])
+					+ " declared in " + reference(am[m][decl_in])
+					+ " and "
+					+ mn(bm[cl], bm[m])
+					+ " declared in " + reference(bm[m][decl_in])
+					)
+				END
+				EXIT
+
+			END
+			inc(j, -1)
+		END
+	END
+
+	RETURN c
+END
+
+
+FUNCTION CollectMethods(cl: Class, errorOnCollision: BOOLEAN):
+	ARRAY OF IMethod
+VAR
+	a, b: ARRAY OF IMethod
+	m: IMethod
+	i: INTEGER
+BEGIN
+	IF cl = NIL THEN
+		RETURN NIL
+	END
+
+	(*
+		Collect from extended class:
+	*)
+	#####a = CollectMethods( cl[extends], FALSE )
+
+	(*
+		Collect from implemented classes:
+	*)
+	FOR i=0 TO count( cl[implements] )-1 DO
+		b = CollectMethods( cl[implements][i], FALSE )
+		a = MergeIMethodArrays( a, b, errorOnCollision )
+	END
+
+	(*
+		Collect from myself:
+	*)
+	b = NIL
+	FOR i=0 TO count( cl[methods] )-1 DO
+		m = NIL
+		m[cl] = cl
+		m[m] = cl[methods][i]
+		b[] = m
+	END
+	a = MergeIMethodArrays( b, a, errorOnCollision )
+
+	RETURN a
+END
+
+
+
+FUNCTION CheckCollisionsBetweenExtendedAndImplementedClasses(cl: Class)
+VAR
+	ic: ARRAY OF IConst
+	ip: ARRAY OF IProp
+	im: ARRAY OF IMethod
+BEGIN
+
+	(*
+		Check collisions between inherited constants.  The resulting array
+		is the list of the inherited constants: we don't keep this array.
+	*)
+	ic = CollectConsts(cl, TRUE)
+
+	(*
+		Check collisions between inherited properties. The resulting array
+		is the list of the inherited proprties: we don't keep this array.
+
+		FIXME: useless -- since this function is called before the props
+		of the current class get parsed, and since props can be inherited
+		only from the extended class (not from interfaces), we are actually
+		re-checking the props inherited from the extended class, but these
+		props were already checked parsing their definition in the parent
+		class.
+	*)
+	ip = CollectProps(cl, TRUE)
+
+	(*
+		Check collisions between inherited methods.
+	*)
+	im = CollectMethods(cl, TRUE)
+
+END
+
+
+FUNCTION IsOverridingType(a: Type, b: Type): BOOLEAN
+(*
+	Returns TRUE if b is a valid overriding type for a.
+
+	To be applied to return type from methods, and formal arguments passed
+	by value to method (arguments passes by referece must be exactly of the
+	same type).
+
+	For the return type, 'a' is the original type and 'b' the overriding one.
+	For argument passed by value the relation between types is reversed,
+	then 'a' is the overriding type and 'b' is the original one.
+
+	Assumes that string, array and resource be (final) sub-classes of object,
+	and assumes the mixed type be equivalent to object:
+
+	object (aka mixed)
+	      `-- final class string
+		  `-- final class array
+		  `-- final class resource
+		  `-- [abstract | final] class USER_DEFINED_CLASS_NAME
+		  `-- interface USER_DEFINED_CLASS_NAME
+	
+	If any of the types is unknown (that is, NIL), return TRUE to avoid
+	to signal too many errors. If only one type is unknown, return FALSE.
+*)
+BEGIN
+	IF (a = NIL) AND (b = NIL) THEN
+		RETURN TRUE
+	END
+
+	IF (a = NIL) OR (b = NIL) THEN
+		RETURN FALSE
+	END
+
+	IF SameType(a, b) THEN
+		RETURN TRUE
+	END
+
+	SWITCH a[basetype] DO
+
+	CASE mixed:
+		RETURN
+			(b[basetype] = string)
+			OR (b[basetype] = array)
+			OR (b[basetype] = mixed)
+			OR (b[basetype] = resource)
+			OR (b[basetype] = object)
+
+	CASE object:
+		IF a[class] = NIL THEN
+			RETURN
+				(b[basetype] = string)
+				OR (b[basetype] = array)
+				OR (b[basetype] = mixed)
+				OR (b[basetype] = resource)
+				OR (b[basetype] = object)
+
+		ELSE
+			IF b[basetype] = object THEN
+				RETURN IsSubclassOf(b[class], a[class])
+			ELSE
+				RETURN FALSE
+			END
+
+		END
+	
+	ELSE
+		RETURN FALSE
+
+	END
+END
+
+
+FUNCTION CheckOverridesImplements(ac: Class, a: Method, bc: Class, b: Method)
+(*
+	Check attributes and signature of the overriding or implementing method
+	b against the overridden method a. Also checks that the overriding
+	method does not raise more exceptions than the overridden method.
+*)
+
+	FUNCTION CheckSign(a: SIGNATURE, b: SIGNATURE): STRING
+	(*
+		Check the signature 'b' of the overriding method against the
+		signature 'a' of the overridden method. Returns NIL if ok, or a
+		description of the problem on error.
+	*)
+
+		FUNCTION eqbool(a: BOOLEAN, b: BOOLEAN): BOOLEAN
+		BEGIN
+			RETURN a AND b OR NOT a AND NOT b
+		END
+
+	VAR
+		i, a_m, a_n, b_m, b_n: INTEGER
+		a_arg, b_arg: FormalArg
+	BEGIN
+
+		(*
+			Checks return types.
+		*)
+		IF NOT IsOverridingType(a[return], b[return]) THEN
+			RETURN "incompatible return types"
+		END
+
+		(*
+			Checks passing method and types of mandatory e default args.
+		*)
+		a_m = a[mandatory]   a_n = count(a[args]) - a_m
+		b_m = b[mandatory]   b_n = count(b[args]) - b_m
+
+		IF a_m <> b_m THEN
+			RETURN "different number of mandatory arguments"
+		END
+
+		IF b_n < a_n THEN
+			RETURN "too few default arguments"
+		END
+
+		FOR i=0 TO count(a[args])-1 DO
+
+			a_arg = a[args][i]
+			b_arg = b[args][i]
+
+			(*
+				Checks passing method by value/by reference.
+			*)
+			IF NOT eqbool(a_arg[reference], b_arg[reference])
+			OR NOT eqbool(a_arg[reference_return], b_arg[reference_return])
+			THEN
+				RETURN "invalid passing method in argument no. " + (i+1)
+			END
+
+			(*
+				Checks argument types and passing methods.
+			*)
+			IF NOT (
+
+				# return by reference: subclass allowed
+				a_arg[reference] AND a_arg[reference_return]
+				AND IsOverridingType(a_arg[type], b_arg[type])
+
+				OR
+
+				# pass by reference: same type
+				a_arg[reference] AND NOT a_arg[reference_return]
+				AND SameType(b_arg[type], a_arg[type])
+
+				OR
+
+				# pass by value: derived class allowed
+				NOT a_arg[reference]
+				AND IsOverridingType(b_arg[type], a_arg[type])
+
+			) THEN
+				RETURN "incompatible type in overriding argument no. " + (i+1)
+			END
+		END
+
+		(*
+			Checks optional arguments.
+		*)
+		IF a[more_args] AND NOT b[more_args] THEN
+			RETURN "required variable number of arguments /*.args.*/"
+		END
+
+		RETURN NIL
+	END
+
+VAR
+	t: STRING
+	err: STRING
+BEGIN
+
+	(*
+		Abstract method cannot "implement" another abs. method
+		(this is a PHP restriction or limitation or bug).
+	*)
+	IF a[abstract] AND b[abstract] THEN
+		Error2(b[decl_in], "abstract method "
+		+ mn(bc, b) + " redeclares inherited abstract method " + mn(ac, a)
+		+ " (PHP restriction)")
+	END
+
+	IF a[abstract] THEN
+		t = "implemented"
+	ELSE
+		t = "overridden"
+	END
+
+	# Check abstract:
+	IF NOT a[abstract] AND b[abstract] THEN
+		Error2(b[decl_in], mn(bc, b) + ": cannot make abstract the "
+		+ t + " non-abstract method " + mn(ac, a) + " declared in "
+		+ reference(a[decl_in]))
+	END
+
+	# Check static:
+	IF b[static] AND NOT a[static] THEN
+		Error2(b[decl_in], mn(bc, b) + ": cannot make static the "
+		+ t + " non-static method " + mn(ac, a) + " declared in "
+		+ reference(a[decl_in]))
+	ELSIF NOT b[static] AND a[static] THEN
+		Error2(b[decl_in], mn(bc, b) + ": cannot make non-static the "
+		+ t + " static method " + mn(ac, a) + " declared in "
+		+ reference(a[decl_in]))
+	END
+
+	# Check final:
+	IF a[final] THEN
+		Error2(b[decl_in], mn(bc, b) + ": cannot override final method "
+		+ mn(ac, a) + " declared in " + reference(a[decl_in]))
+	END
+
+	# Check visibility:
+	IF b[visibility] < a[visibility] THEN
+		Error2(b[decl_in], mn(bc, b) + ": cannot lower the visibility of the "
+		+ t + " method " + mn(ac, a) + " declared in " + reference(a[decl_in]))
+	END
+
+	# Check signature:
+	err = CheckSign(a[sign], b[sign])
+	IF err <> NIL THEN
+		Error2(b[decl_in], mn(bc, b) + ": the signature `"
+		+ FunctionSignatureToString(b[sign]) + "' does not match the "
+		+ t + " method " + mn(ac, a) + " declared in " + reference(a[decl_in])
+		+ " with signature `" + FunctionSignatureToString(a[sign]) + "': "
+		+ err)
+	END
+
+	# Check exceptions thrown by the overriding method:
+	err = ClassesList(
+		Sort(
+			OrphanClasses(
+				CheckedExceptionsSubset(a[exceptions]),
+				CheckedExceptionsSubset(b[exceptions])
+			)
+		)
+	)
+	IF err <> NIL THEN
+		Error2(b[decl_in], mn(bc, b)
+		+ ": more exceptions thrown than declared in " + t + " method "
+		+ mn(ac, a) + " declared in " + reference(a[decl_in]) + ": " + err)
+	END
+END
+
+
+FUNCTION ResolveClassMethod(class: Class, id: STRING,
+	VAR res_class: Class, VAR res_method: Method)
+VAR i: INTEGER
+	m: Method
+BEGIN
+	IF class = NIL THEN
+		res_class = NIL
+		res_method = NIL
+		RETURN
+	END
+
+	(* Search inside the class: *)
+	m = SearchClassMethod(class, id, TRUE)
+	IF m <> NIL THEN
+		###AccountClassMethod(class, m)
+		res_class = class
+		res_method = m
+		RETURN
+	END
+
+	(* Search between the extended classes: *)
+	ResolveClassMethod(class[extends], id,   res_class, res_method)
+	IF res_method <> NIL THEN
+		RETURN
+	END
+
+	(* Search between the implemented classes: *)
+	FOR i=0 TO count(class[implements])-1 DO
+		ResolveClassMethod(class[implements][i], id,   res_class, res_method)
+		IF res_method <> NIL THEN
+			RETURN
+		END
+	END
+
+	(* Not found: *)
+	res_class = NIL
+	res_method = NIL
+END
+
+
+FUNCTION CheckImplementedMethodsRecurse(child: Class, ancestor: Class)
+(* Check recursively if all the inherithed abstract methods were implemented
+   in child class. *)
+VAR
+	ancestor_methods: ARRAY OF Method
+	i: INTEGER
+	a_m: Method
+	r_c: Class
+	r_m: Method
+BEGIN
+	IF ancestor = NIL THEN
+		RETURN
+	END
+	IF ancestor[abstract] OR ancestor[interface] THEN
+		ancestor_methods = ancestor[methods]
+		FOR i=0 TO count(ancestor_methods)-1 DO
+			a_m = ancestor_methods[i]
+			IF a_m[abstract] THEN
+				ResolveClassMethod(child, a_m[name],  r_c, r_m)
+				IF (r_m = NIL) OR r_m[abstract] THEN
+					Error2(child[decl_in], "in class `" + child[name]
+					+ "': missing implementation of the abstract method "
+					+ mn(ancestor, a_m))
+				END
+			END
+		END
+	END
+
+	CheckImplementedMethodsRecurse(child, ancestor[extends])
+
+	FOR i=0 TO count(ancestor[implements])-1 DO
+		CheckImplementedMethodsRecurse(child, ancestor[implements][i])
+	END
+END
+
+
+FUNCTION CheckImplementedMethods(child: Class)
+VAR
+	i: INTEGER
+BEGIN
+	CheckImplementedMethodsRecurse(child, child[extends])
+
+	FOR i=0 TO count(child[implements])-1 DO
+		CheckImplementedMethodsRecurse(child, child[implements][i])
+	END
+END
+
+
+FUNCTION CheckOverriddenMethod(c: Class, m: Method)
+(*
+	Check if the method matches the signature of the overridden method,
+	or implemented abstract method or implemented interface method.
+*)
+VAR
+	o_c: Class
+	o_m: Method
+	i: INTEGER
+
+
+	FUNCTION CheckImplementation(c: Class, m: Method, if: Class)
+	(*
+		Check implemented method of the interface class 'if'.
+	*)
+	VAR
+		i_m: Method
+		i: INTEGER
+	BEGIN
+		IF if = NIL THEN
+			RETURN
+		END
+		i_m = SearchMethod(if, m[name], m[name_lower], TRUE)
+		IF i_m <> NIL THEN
+			CheckOverridesImplements(if, i_m, c, m)
+		END
+		FOR i=0 TO count(if[implements])-1 DO
+			CheckImplementation(c, m, if[implements][i])
+		END
+	END
+
+BEGIN
+
+	(*
+		Check overridden/implemented methods of the extended class.
+	*)
+	IF c[extends] <> NIL THEN
+		ResolveClassMethod(c[extends], m[name],   o_c, o_m)
+		IF o_m = NIL THEN
+			# no overriding/implemented method
+		ELSIF (o_m = o_c[construct]) AND NOT o_m[abstract] THEN
+			# ignore overridden non-abstract constructor
+		ELSIF o_m[final] THEN
+			Error("the method " + mn(c, m)
+			+ " cannot override the final method " + mn(o_c, o_m))
+		ELSIF (o_m[visibility] = private) AND (php_ver = php4) THEN
+			Error("the method " + mn(c, m)
+			+ " cannot redefine the private method " + mn(o_c, o_m))
+		ELSE
+			CheckOverridesImplements(o_c, o_m, c, m)
+		END
+	END
+
+	FOR i=0 TO count(c[implements])-1 DO
+		CheckImplementation(c, m, c[implements][i])
+	END
+END
+
+
+FUNCTION CheckTraversableUsage(class: Class)
+(*
+	Check implementation of iterators
+*)
+VAR
+	b1, b2: BOOLEAN
+BEGIN
+	IF php_ver = php4 THEN
+		RETURN
+	END
+
+	IF NOT IsSubclassOf(class, TraversableClass) THEN
+		RETURN
+	END
+	# now, class is using Traversable somehow
+
+	b1 = IsSubclassOf(class, IteratorClass)
+	b2 = IsSubclassOf(class, IteratorAggregateClass)
+
+	IF b1 AND b2 THEN
+		Error("can't implement both `Iterator' and `IteratorAggregate'")
+	END
+
+	IF b1 OR b2 THEN
+		# OK: Traversable with one of real implementations
+		RETURN
+	END
+
+	Error("classes that implements `Traversable' must also either implement `Iterator' or `IteratorAggregate'")
+END
+
+
+FUNCTION IsObjectConvertibleToString(t: Type): BOOLEAN
+VAR
+	found_class: Class
+	found_method: Method
+BEGIN
+	IF (t = NIL) OR (t[basetype] <> object) OR (t[class] = NIL) THEN
+		RETURN FALSE
+	END
+	ResolveClassMethod(t[class], "__toString",  found_class, found_method)
+	RETURN found_method <> NIL
+END
+
+
+END

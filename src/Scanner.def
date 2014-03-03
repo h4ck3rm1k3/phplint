@@ -1,0 +1,334 @@
+DEFINITION MODULE Scanner
+
+IMPORT Types
+
+TYPE
+
+	SYMBOL = (
+
+	sym_eof, # end of the file
+	sym_unknown,
+	sym_unimplemented_keyword,
+
+	sym_text, # raw text
+	sym_open_tag, # <? or <?php
+	sym_open_tag_with_echo, # <?=
+	sym_close_tag, # ?>
+
+	sym_define, # define
+	sym_function, # function
+	sym_declare, # declare
+	sym_lbrace, # {
+	sym_rbrace, # }
+	sym_lround, # (
+	sym_rround, # )
+	sym_lsquare, # [
+	sym_rsquare, # ]
+	sym_comma, # ,
+
+	sym_semicolon, # ;
+	sym_colon, # :
+	sym_double_colon, # ::
+	sym_variable, # a variable "$name"; s="name"
+	sym_for, # for
+	sym_foreach, # foreach
+	sym_as, # as
+	sym_while, # while
+	sym_if, # if
+	sym_else, # else
+	sym_elseif, # elseif
+	sym_return, # return
+	sym_identifier, # s="theid"
+	sym_question, # ?
+
+	sym_assign, # =  =&
+	sym_rarrow, # =>
+	sym_single_quoted_string, # s="xyz" or here-doc <<<
+
+	(*
+		DOUBLE QUOTED STRINGS can produce a sequence of symbols if they
+		contain embedded variables: the string to the left of the var.
+		is returned as sym_double_quoted_string, the variable is returned
+		as sym_embedded_variable, then the rest of the string to the right
+		of the variable is returned as sym_continuing_double_quoted_string.
+	*)
+	sym_double_quoted_string, # s="xyz"
+	sym_embedded_variable, # a variable embedded inside a string
+	sym_continuing_double_quoted_string,
+	sym_here_doc, # here-doc <<< ID
+
+	sym_lit_int, # literal integer number, s="1234"
+	sym_lit_float, # literal float number, s="3.14"
+	sym_plus, # +
+	sym_minus, # -
+	sym_times, # *
+	sym_div, # /
+
+	sym_eq, # ==
+	sym_eeq, # ===
+	sym_ne, # !=
+	sym_nee, # !==
+	sym_gt, # >
+	sym_ge, # >=
+	sym_lt, # <
+	sym_le, # <=
+	sym_incr, # ++
+	sym_decr, # --
+	sym_not, # !
+	sym_or, # ||
+	sym_or2, # or
+
+	sym_and, # &&
+	sym_and2, # and
+	sym_at, # @
+	sym_period, # . (string concat. op.)
+	sym_arrow, # ->
+	sym_global, # global
+	sym_null, # null NULL
+	sym_boolean, # boolean or bool
+	sym_false, # false
+	sym_true, # true
+	sym_int, # int or integer
+	sym_float, # float or double or real
+	sym_string, # string
+	sym_array, # array
+	sym_object, # object
+	sym_bit_or, # |
+	sym_bit_and, # & (binary bitwise operator and unary reference operator)
+	sym_mod, # %
+	sym_period_assign, # .=
+	sym_plus_assign, # +=
+	sym_minus_assign, # -=
+	sym_times_assign, # *=
+	sym_div_assign, # /=
+	sym_mod_assign, # %=
+	sym_bit_and_assign, # &=
+	sym_bit_or_assign, # |=
+	sym_bit_xor_assign, # ^=
+	sym_lshift_assign, # <<=
+	sym_rshift_assign, # >>=
+	sym_lshift, # <<
+	sym_rshift, # >>
+	sym_bit_xor, # ^
+	sym_xor, # xor
+
+	sym_bit_not, # ~
+	sym_abstract, # abstract
+	sym_interface, # interface
+	sym_class, # class
+	sym_extends, # extends
+	sym_implements, # implements
+	sym_const, # const
+	sym_var, # var
+	sym_public, # public
+	sym_private, # private
+	sym_protected, # protected
+	sym_static, # static
+	sym_final, # final
+	sym_self, # self
+	sym_parent, # parent
+	sym_new, # new
+	sym_clone, # clone
+	sym_instanceof, # instanceof
+	sym_list, # list
+	sym_switch, # switch
+	sym_case,
+
+	sym_break, # break
+	sym_default, # default
+	sym_exit, # exit or die
+	sym_echo, # echo
+	sym_print, # print
+	sym_trigger_error, # trigger_error
+	sym_do, # do
+	sym_try, # try
+	sym_catch, # catch
+	sym_throw, # throw
+
+	sym_continue,
+	sym_isset,
+	sym_include,
+	sym_include_once,
+	sym_require,
+	sym_require_once,
+
+	sym_namespace, # namespace
+	sym_use, # use
+	sym_goto, # use
+
+	(* PHPLint extended syntax symbols, aka "meta-code".
+	   These symbols MUST appear inside /*. .*/ : *)
+	sym_x_require_module, # require_module
+	sym_x_single_quoted_string, # 'abcd'
+	sym_x_semicolon, # ;
+	sym_x_colon, # :
+	sym_x_comma, # ,
+	sym_x_assign, # =
+
+	(* Forward declarations of functions and classes: *)
+	sym_x_forward, # forward
+	sym_x_function, # function
+	sym_x_class, # class
+	sym_x_extends, # extends
+	sym_x_implements, # implements
+	sym_x_const, # const
+	sym_x_interface, # interface
+	sym_x_unchecked, # unchecked
+
+	(* x-Types: *)
+	sym_x_void, # void
+	sym_x_boolean, # "boolean" or "bool"
+	sym_x_int, # int
+	sym_x_float, # float
+	sym_x_string, # string
+	sym_x_array, # array
+	sym_x_mixed, # mixed
+	sym_x_resource, # resource
+	sym_x_object, # object
+	
+	sym_x_identifier, # s="theID"
+	sym_x_variable, # a variable "$name"; s="name"
+	sym_x_bit_and, # "&" pass by reference symbol in func. proto.
+	sym_x_args, # args
+	sym_x_lround, # (
+	sym_x_rround, # )
+	sym_x_lsquare, # [
+	sym_x_rsquare, # ]
+	sym_x_lbrace, # {
+	sym_x_rbrace, # }
+	sym_x_pragma, # pragma
+	sym_x_if_php_ver_4, # if_php_ver_4
+	sym_x_if_php_ver_5, # if_php_ver_5
+	sym_x_else, # else
+	sym_x_end_if_php_ver, # end_if_php_ver
+	sym_x_missing_break, # missing_break
+	sym_x_missing_default, # missing_default
+
+	sym_x_public, # public (PHP4)
+	sym_x_protected, # protected (PHP4)
+	sym_x_private, # private (PHP4)
+	sym_x_abstract, # abstract (PHP4)
+	sym_x_static, # static (PHP4)
+	sym_x_final, # final (PHP4)
+	sym_x_self, # self
+	sym_x_parent, # parent
+	sym_x_throws, # throws
+	sym_x_return, # return
+	sym_x_namespace, # namespace
+
+	(* Templating: <K implements Hashable, E> *)
+	sym_x_lt, # <
+	sym_x_gt, # >
+
+	sym_x_doc, # s is the string between "/*. DOC" and ".*/"
+	sym_x_docBlock # s is the string between "/**" and "*/"
+	)
+
+	Status = FORWARD
+
+(*
+	Options:
+*)
+
+VAR
+
+	cwd: STRING
+	(* relative paths are calculated against this directory, normally set to
+	   the CWD of the program *)
+
+	print_file_name: BOOLEAN
+	(* suppress file name in error and warning msgs when the file
+	   interested is just the file being reported *)
+
+	print_path_fmt: (absolute_path, relative_path, shortest_path)
+	(*
+		The path-names of files can be formatted as:
+
+		- absolute path
+		- relative to the file being reported
+		- shortest string between the absolute and the relative paths
+	*)
+	
+	ctrl_check: BOOLEAN
+	(* suppress check for control chars in strings *)
+
+	ascii_ext_check: BOOLEAN
+	(* suppress check for ASCII extended chars in strings and identifiers *)
+
+	tab_size: INTEGER
+	(* preferred length of the HT *)
+
+	print_notices: BOOLEAN
+	print_warnings: BOOLEAN
+	print_errors: BOOLEAN
+	print_context: BOOLEAN
+	print_source: BOOLEAN
+	print_line_numbers: BOOLEAN
+
+
+VAR
+	fn: STRING
+	(* abs path of the file we are scanning right now *)
+
+	sym: SYMBOL
+	(* symbol code *)
+
+	s: STRING
+	(* last string, ID, or number read *)
+
+
+FUNCTION Suspend(): Status
+FUNCTION Resume(status: Status)
+
+(*
+	ERROR REPORTING AND ACCOUNTING
+*)
+
+VAR error_counter, warning_counter: INTEGER
+
+FUNCTION fmt_fn(abs_path: STRING): STRING
+(*
+	Properly format the given absolute path file according to
+	the option --print-path-fmt.
+*)
+
+FUNCTION here(): WHERE
+
+FUNCTION reference(w: WHERE): STRING
+
+FUNCTION mn(c: Class, m: Method): STRING
+(* Returns the canonical method name "CLASS::m()" *)
+
+FUNCTION Fatal(s: STRING)
+
+FUNCTION UnexpectedSymbol()
+
+FUNCTION Error(s: STRING)
+
+FUNCTION Error2(w: WHERE, s: STRING)
+
+FUNCTION Warning(s: STRING)
+
+FUNCTION Warning2(w: WHERE, s: STRING)
+
+FUNCTION Notice(s: STRING)
+
+FUNCTION Notice2(w: WHERE, s: STRING)
+
+FUNCTION Expect(es: SYMBOL, err: STRING)
+
+FUNCTION PrintLineSource()
+
+FUNCTION SearchPhpKeyword(k: STRING): SYMBOL
+
+FUNCTION InitScanner()
+
+FUNCTION Open(abs_fn: STRING): BOOLEAN
+
+FUNCTION ReadSym()
+
+FUNCTION Close()
+
+FUNCTION SymToName(code: INTEGER): STRING
+
+END

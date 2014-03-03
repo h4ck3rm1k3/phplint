@@ -1,0 +1,11 @@
+IMPLEMENTATION MODULE Globals
+
+FUNCTION CurrPackageNotLibrary(descr: STRING)
+BEGIN
+	curr_package[library] = FALSE
+	IF curr_package[why_not_library] = NIL THEN
+		curr_package[why_not_library] = descr
+	END
+END
+
+END

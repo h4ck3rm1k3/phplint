@@ -1,0 +1,451 @@
+
+BEGIN parsing of 5-arguments-by-reference.php
+1:	<?php  # Test: arguments passed by reference.
+2:	
+3:	function f1(
+4:		/*. int        .*/ & $a,
+5:		/*. return int .*/ & $b,
+6:		/*. int        .*/ & $c = 1,
+7:		/*. return int .*/ & $d = 1
+8:	)
+9:	{
+10:		$b = 1;
+11:		$d = 1;
+12:	}
+13:	
+14:	function test1()
+==== 6: notice: variable `$c' assigned but never used
+==== 4: notice: variable `$a' assigned but never used
+==== 3: notice: guessed signature of the function `f1()' as void(int &, return int & [, int &, return int &])
+15:	{
+16:		# Actual args all assigned, use default:
+17:		$x = 1;
+18:		$y = 1;
+19:		f1($x, $y);
+20:		echo $x, $y;
+21:	}
+22:	
+23:	
+24:	function test2()
+==== 14: notice: guessed signature of the function `test1()' as void()
+25:	{
+26:		# Actual args all assigned:
+27:		$x = 1;
+28:		$y = 1;
+29:		$z = 1;
+30:		$t = 1;
+31:		f1($x, $y, $z, $t);
+32:		echo $x, $y, $z, $t;
+33:	}
+34:	
+35:	
+36:	function test3()
+==== 24: notice: guessed signature of the function `test2()' as void()
+37:	{
+38:		# Actual args not assigned, use default:
+39:		f1($x, $y);
+
+		f1($x, $y);
+	         \_ HERE
+==== 39: ERROR: invalid actual argument $x passed by reference: the variable might not have been assigned
+40:		echo $x, $y;
+41:	}
+42:	
+43:	
+44:	function test4()
+==== 36: notice: guessed signature of the function `test3()' as void()
+45:	{
+46:		# Actual args not assigned:
+47:		f1($x, $y, $z, $t);
+
+		f1($x, $y, $z, $t);
+	         \_ HERE
+==== 47: ERROR: invalid actual argument $x passed by reference: the variable might not have been assigned
+
+		f1($x, $y, $z, $t);
+	                 \_ HERE
+==== 47: ERROR: invalid actual argument $z passed by reference: the variable might not have been assigned
+48:		echo $x, $y, $z, $t;
+49:	}
+50:	
+51:	
+52:	function f2(
+==== 44: notice: guessed signature of the function `test4()' as void()
+53:		/*. int        .*/ & $a,
+54:		/*. return int .*/ & $b,
+55:		/*. int        .*/ & $c = 1,
+56:		/*. return int .*/ & $d = 1
+57:	)
+58:	{
+59:		# No arg used.
+60:	}
+61:	
+62:	
+63:	function f3(
+==== 63: ERROR: returning from function f2(): the formal argument that returns by reference $b might not have been assigned
+==== 63: ERROR: returning from function f2(): the formal argument that returns by reference $d might not have been assigned
+==== 55: notice: variable `$c' assigned but never used
+==== 53: notice: variable `$a' assigned but never used
+==== 52: notice: guessed signature of the function `f2()' as void(int &, return int & [, int &, return int &])
+64:		/*. int        .*/ & $a,
+65:		/*. return int .*/ & $b,
+66:		/*. int        .*/ & $c = 1,
+67:		/*. return int .*/ & $d = 1
+68:	)
+69:	{
+70:		# All args as RHS:
+71:		echo $a, $b, $c, $d;
+
+		echo $a, $b, $c, $d;
+	                \_ HERE
+==== 71: ERROR: variable $b might not have been assigned
+
+		echo $a, $b, $c, $d;
+	                        \_ HERE
+==== 71: ERROR: variable $d might not have been assigned
+72:	}
+73:	
+74:	
+75:	function f4(
+==== 63: notice: guessed signature of the function `f3()' as void(int &, return int & [, int &, return int &])
+76:		/*. int        .*/ & $a,
+77:		/*. return int .*/ & $b,
+78:		/*. int        .*/ & $c = 1,
+79:		/*. return int .*/ & $d = 1
+80:	)
+81:	{
+82:		# All args as LHS:
+83:		$a = 1;
+84:		$b = 1;
+85:		$c = 1;
+86:		$d = 1;
+87:	}
+88:	
+89:	
+90:	function f5(
+==== 85: notice: variable `$c' assigned but never used
+==== 83: notice: variable `$a' assigned but never used
+==== 75: notice: guessed signature of the function `f4()' as void(int &, return int & [, int &, return int &])
+91:		/*. int        .*/ & $a,
+92:		/*. return int .*/ & $b)
+93:	{
+94:		if($a > 1)
+95:			$b = 1;
+96:		else
+97:			return;
+
+			return;
+	               \_ HERE
+==== 97: notice: from this `return;' we guess the function `f5()' is of type void
+
+			return;
+	               \_ HERE
+==== 97: ERROR: returning from function f5(): the formal argument that returns by reference $b might not have been assigned
+98:	}
+99:	
+100:	
+101:	/*. forward void function f6(
+==== 90: notice: guessed signature of the function `f5()' as void(int &, return int &)
+102:		int        & $a,
+103:		return int & $b,
+104:		int        & $c =,
+105:		return int & $d =); .*/
+106:	
+107:	/*. void .*/ function f6(
+
+	/*. void .*/ function f6(
+	                        \_ HERE
+==== 107: notice: function `f6()' declared forward in line 101 but never used before implementation
+108:		/*. int        .*/ & $a,
+109:		/*. return int .*/ & $b,
+110:		/*. int        .*/ & $c = 1,
+111:		/*. return int .*/ & $d = 1
+112:	)
+113:	{
+114:		$b = 1;
+115:		$d = 1;
+116:	}
+117:	
+118:	
+119:	# Invalid implementation of proto:
+120:	/*. forward void function f7(
+==== 110: notice: variable `$c' assigned but never used
+==== 108: notice: variable `$a' assigned but never used
+121:		int        & $a,
+122:		return int & $b,
+123:		int        & $c =,
+124:		return int & $d =); .*/
+125:	
+126:	/*. void .*/ function f7(
+
+	/*. void .*/ function f7(
+	                        \_ HERE
+==== 126: notice: function `f7()' declared forward in line 120 but never used before implementation
+127:		/*. int        .*/ & $a,
+128:		/*. return int .*/ & $b,
+129:		/*. int        .*/   $c = 1,
+130:		/*. return int .*/ & $d = 1
+131:	)
+132:	{
+133:		$b = 1;
+134:		$d = 1;
+135:	}
+136:	
+137:	
+138:	# The same tests as before, but inside a class:
+139:	class aClass {
+==== 129: notice: variable `$c' assigned but never used
+==== 127: notice: variable `$a' assigned but never used
+==== 126: ERROR: function `f7()': the actual signature void(int &, return int & [, int, return int &]) does not match the prototype void(int &, return int & [, int &, return int &]) as declared in line 120
+140:	
+141:		function f1(
+142:			/*. int        .*/ & $a,
+143:			/*. return int .*/ & $b,
+144:			/*. int        .*/ & $c = 1,
+145:			/*. return int .*/ & $d = 1
+146:		)
+147:		{
+148:			$b = 1;
+149:			$d = 1;
+150:		}
+151:	
+152:		function test1()
+==== 141: notice: guessed signature of the method `aClass::f1()' as public void(int &, return int & [, int &, return int &])
+==== 144: notice: variable `$c' assigned but never used
+==== 142: notice: variable `$a' assigned but never used
+153:		{
+154:			# Actual args all assigned, use default:
+155:			$x = 1;
+156:			$y = 1;
+157:			$this->f1($x, $y);
+158:			echo $x, $y;
+159:		}
+160:	
+161:	
+162:		function test2()
+==== 152: notice: guessed signature of the method `aClass::test1()' as public void()
+163:		{
+164:			# Actual args all assigned:
+165:			$x = 1;
+166:			$y = 1;
+167:			$z = 1;
+168:			$t = 1;
+169:			$this->f1($x, $y, $z, $t);
+170:			echo $x, $y, $z, $t;
+171:		}
+172:	
+173:	
+174:		function test3()
+==== 162: notice: guessed signature of the method `aClass::test2()' as public void()
+175:		{
+176:			# Actual args not assigned, use default:
+177:			$this->f1($x, $y);
+
+			$this->f1($x, $y);
+	                    \_ HERE
+==== 177: ERROR: invalid actual argument $x passed by reference: the variable might not have been assigned
+178:			echo $x, $y;
+179:		}
+180:	
+181:	
+182:		function test4()
+==== 174: notice: guessed signature of the method `aClass::test3()' as public void()
+183:		{
+184:			# Actual args not assigned:
+185:			$this->f1($x, $y, $z, $t);
+
+			$this->f1($x, $y, $z, $t);
+	                    \_ HERE
+==== 185: ERROR: invalid actual argument $x passed by reference: the variable might not have been assigned
+
+			$this->f1($x, $y, $z, $t);
+	                            \_ HERE
+==== 185: ERROR: invalid actual argument $z passed by reference: the variable might not have been assigned
+186:			echo $x, $y, $z, $t;
+187:		}
+188:	
+189:	
+190:		function f2(
+==== 182: notice: guessed signature of the method `aClass::test4()' as public void()
+191:			/*. int        .*/ & $a,
+192:			/*. return int .*/ & $b,
+193:			/*. int        .*/ & $c = 1,
+194:			/*. return int .*/ & $d = 1
+195:		)
+196:		{
+197:			# No arg used.
+198:		}
+199:	
+200:	
+201:		function f3(
+==== 190: notice: guessed signature of the method `aClass::f2()' as public void(int &, return int & [, int &, return int &])
+==== 201: ERROR: returning from method f2(): the formal argument that returns by reference $b might not have been assigned
+==== 201: ERROR: returning from method f2(): the formal argument that returns by reference $d might not have been assigned
+==== 193: notice: variable `$c' assigned but never used
+==== 191: notice: variable `$a' assigned but never used
+202:			/*. int        .*/ & $a,
+203:			/*. return int .*/ & $b,
+204:			/*. int        .*/ & $c = 1,
+205:			/*. return int .*/ & $d = 1
+206:		)
+207:		{
+208:			# All args as RHS:
+209:			echo $a, $b, $c, $d;
+
+			echo $a, $b, $c, $d;
+	                    \_ HERE
+==== 209: ERROR: variable $b might not have been assigned
+
+			echo $a, $b, $c, $d;
+	                            \_ HERE
+==== 209: ERROR: variable $d might not have been assigned
+210:		}
+211:	
+212:	
+213:		function f4(
+==== 201: notice: guessed signature of the method `aClass::f3()' as public void(int &, return int & [, int &, return int &])
+214:			/*. int        .*/ & $a,
+215:			/*. return int .*/ & $b,
+216:			/*. int        .*/ & $c = 1,
+217:			/*. return int .*/ & $d = 1
+218:		)
+219:		{
+220:			# All args as LHS:
+221:			$a = 1;
+222:			$b = 1;
+223:			$c = 1;
+224:			$d = 1;
+225:		}
+226:	
+227:	
+228:		function f5(
+==== 213: notice: guessed signature of the method `aClass::f4()' as public void(int &, return int & [, int &, return int &])
+==== 223: notice: variable `$c' assigned but never used
+==== 221: notice: variable `$a' assigned but never used
+229:			/*. int        .*/ & $a,
+230:			/*. return int .*/ & $b)
+231:		{
+232:			if($a > 1)
+233:				$b = 1;
+234:			else
+235:				return;
+
+				return;
+	                   \_ HERE
+==== 235: notice: from this `return;' we guess the method `aClass::f5()' is of type void
+
+				return;
+	                   \_ HERE
+==== 235: ERROR: returning from method f5(): the formal argument that returns by reference $b might not have been assigned
+236:		}
+237:	
+238:	
+239:		/*. forward void function f6(
+==== 228: notice: guessed signature of the method `aClass::f5()' as public void(int &, return int &)
+240:			int        & $a,
+241:			return int & $b,
+242:			int        & $c =,
+243:			return int & $d =); .*/
+244:	
+245:		/*. void .*/ function f6(
+246:			/*. int        .*/ & $a,
+247:			/*. return int .*/ & $b,
+248:			/*. int        .*/ & $c = 1,
+249:			/*. return int .*/ & $d = 1
+250:		)
+251:		{
+252:			$b = 1;
+253:			$d = 1;
+254:		}
+255:	
+256:	
+257:		# Invalid implementation of proto:
+258:		/*. forward void function f7(
+==== 248: notice: variable `$c' assigned but never used
+==== 246: notice: variable `$a' assigned but never used
+259:			int        & $a,
+260:			return int & $b,
+261:			int        & $c =,
+262:			return int & $d =); .*/
+263:	
+264:		/*. void .*/ function f7(
+265:			/*. int        .*/ & $a,
+266:			/*. return int .*/ & $b,
+267:			/*. int        .*/   $c = 1,
+268:			/*. return int .*/ & $d = 1
+269:		)
+270:		{
+271:			$b = 1;
+272:			$d = 1;
+273:		}
+274:	
+275:	}
+==== 267: notice: variable `$c' assigned but never used
+==== 265: notice: variable `$a' assigned but never used
+==== 264: ERROR: method `aClass::f7()' with signature `public void(int &, return int & [, int, return int &])' does not match forward signature `public void(int &, return int & [, int &, return int &])' as declared in line 258
+276:	
+277:	
+278:	interface Interface1 {
+279:		/*. void .*/ function m1(/*. int .*/ &$a, /*. return int .*/ &$b);
+280:		/*. void .*/ function m2(/*. int .*/ &$a, /*. return int .*/ &$b);
+281:	}
+282:	
+283:	class Concrete1 implements Interface1 {
+284:	
+285:		/*. void .*/ function m1(/*. int .*/ &$a, /*. return int .*/ &$b)
+286:		{
+287:			if( $a < 0 )
+288:				$b = 0;
+289:			else
+290:				$b = $a;
+291:		}
+292:	
+293:		/*. void .*/ function m2(/*. int .*/ &$a, /*. int .*/ &$b)
+294:		{
+295:		}
+296:	
+297:	}
+==== 293: ERROR: `Concrete1::m2()': the signature `void(int &, int &)' does not match the implemented method `Interface1::m2()' declared in line 280 with signature `void(int &, return int &)': invalid passing method in argument no. 2
+==== 293: notice: variable `$b' assigned but never used
+==== 293: notice: variable `$a' assigned but never used
+298:	
+299:	
+300:	abstract class AbsClass1 {
+301:		abstract /*. void .*/ function m1(/*. int .*/ &$a, /*. return int .*/ &$b);
+302:		abstract /*. void .*/ function m2(/*. int .*/ &$a, /*. return int .*/ &$b);
+303:	}
+304:	
+305:	class Concrete2 extends AbsClass1 {
+306:	
+307:		/*. void .*/ function m1(/*. int .*/ &$a, /*. return int .*/ &$b)
+308:		{
+309:			if( $a < 0 )
+310:				$b = 0;
+311:			else
+312:				$b = $a;
+313:		}
+314:	
+315:		/*. void .*/ function m2(/*. int .*/ &$a, /*. int .*/ &$b)
+316:		{
+317:		}
+318:	
+319:	}
+==== 315: ERROR: `Concrete2::m2()': the signature `void(int &, int &)' does not match the implemented method `AbsClass1::m2()' declared in line 302 with signature `void(int &, return int &)': invalid passing method in argument no. 2
+==== 315: notice: variable `$b' assigned but never used
+==== 315: notice: variable `$a' assigned but never used
+320:	
+END parsing of 5-arguments-by-reference.php
+==== 5-arguments-by-reference.php:14: notice: unused function `test1()'
+==== 5-arguments-by-reference.php:24: notice: unused function `test2()'
+==== 5-arguments-by-reference.php:36: notice: unused function `test3()'
+==== 5-arguments-by-reference.php:44: notice: unused function `test4()'
+==== 5-arguments-by-reference.php:52: notice: unused function `f2()'
+==== 5-arguments-by-reference.php:63: notice: unused function `f3()'
+==== 5-arguments-by-reference.php:75: notice: unused function `f4()'
+==== 5-arguments-by-reference.php:90: notice: unused function `f5()'
+==== 5-arguments-by-reference.php:107: notice: unused function `f6()'
+==== 5-arguments-by-reference.php:126: notice: unused function `f7()'
+==== 5-arguments-by-reference.php:139: notice: unused class `aClass'
+==== 5-arguments-by-reference.php:283: notice: unused class `Concrete1'
+==== 5-arguments-by-reference.php:305: notice: unused class `Concrete2'
+Overall test results: 20 errors, 0 warnings.

@@ -1,0 +1,968 @@
+IMPLEMENTATION MODULE Operators
+
+(*
+	OPERATORS EVALUATION
+
+	Every evaluator returns a result={TYPE,VALUE}.
+
+	If the arguments of the operator are unknown (i.e. NIL) or of the
+	wrong type, return the TYPE that we can expect from that operator
+	or NIL. For example, the "." operator always returns a string.
+
+	If the resulting type cannot be determined, return result=NIL.
+
+	If the type has been determined, try to evaluate the VALUE. If the
+	value cannot be determined, return VALUE=NIL.
+
+	The possible returned results are, then,
+
+	NIL
+	{TYPE, NIL}
+	{TYPE, VALUE}
+*)
+
+
+IMPORT m2
+IMPORT Types, Globals
+IMPORT Scanner # For Error() and Warning()
+IMPORT Classes
+IMPORT Accounting
+
+
+FUNCTION EvalValueConversion(from_r: Result, to: Type): Result
+
+	FUNCTION invalid(s: STRING)
+	BEGIN
+		Error("value conversion operator from " + TypeToString(from_r[type])
+			+ " to " + TypeToString(to) + ": " + s)
+	END
+
+VAR
+	from: Type
+	C: Class
+	m: Method
+
+BEGIN
+	IF from_r = NIL THEN
+		Warning("value conversion operator applied to an unknow data type")
+		RETURN {to, NIL}
+	END
+
+	from = from_r[type]
+	IF from = NIL THEN
+		RETURN {to, NIL}
+	END
+
+	SWITCH from[basetype] DO
+
+	CASE boolean:
+		IF to[basetype] = int THEN
+			IF from_r[value] = false_value THEN
+				RETURN {int_type, "0"}
+			ELSIF from_r[value] = true_value THEN
+				RETURN {int_type, "1"}
+			ELSE
+				RETURN {int_type, NIL}
+			END
+		ELSE
+			invalid("undefined")
+		END
+
+	CASE int:
+		SWITCH to[basetype] DO
+		CASE boolean, float, string:
+			# use default
+		ELSE invalid("undefined")
+		END
+
+	CASE float:
+		SWITCH to[basetype] DO
+		CASE int, string:
+		ELSE invalid("undefined")
+		END
+
+	CASE string:
+		SWITCH to[basetype] DO
+		CASE int, float:
+		ELSE invalid("undefined")
+		END
+
+	CASE mixed:
+		SWITCH to[basetype] DO
+		CASE boolean, int, float, string:
+		ELSE invalid("undefined")
+		END
+
+	CASE object:
+		IF (to[basetype] = string) AND (php_ver = php5)
+		AND (from[class] <> NIL) THEN
+			ResolveClassMethod(from[class], "__toString",  C, m)
+			IF m = NIL THEN
+				invalid("undefined")
+			ELSE
+				# Account for usage of method __toString():
+				AccountClassMethod(C, m)
+			END
+		ELSE
+			invalid("undefined")
+		END
+
+	CASE null:
+		SWITCH to[basetype] DO
+		CASE string, array, resource, object:
+			RETURN {to, "NULL"}
+		ELSE invalid("undefined")
+		END
+
+	ELSE
+		invalid("undefined")
+
+	END
+
+	RETURN {to, NIL}
+END
+
+
+FUNCTION EvalTypeConversion(from_r: Result, to: Type): Result
+
+	FUNCTION invalid(s: STRING)
+	BEGIN
+		Error("type conversion operator from " + TypeToString(from_r[type])
+			+ " to " + TypeToString(to) + ": " + s)
+	END
+
+
+	FUNCTION EvalFormalTypecastArray(fi: BaseType, fe: Type, ti: BaseType, te: Type)
+	VAR r: Result
+	BEGIN
+		SWITCH fi DO
+		CASE void:
+		CASE int:
+			IF ti <> int THEN
+				invalid("incompatible index type")
+			END
+		CASE string:
+			IF ti <> string THEN
+				invalid("incompatible index type")
+			END
+		CASE mixed:
+		END
+		r = EvalTypeConversion({fe, NIL}, te)
+	END
+
+VAR from: Type
+
+BEGIN
+	IF from_r = NIL THEN
+		Warning("type conversion operator applied to an unknow data type")
+		RETURN {to, NIL}
+	END
+
+	from = from_r[type]
+	IF from = NIL THEN
+		RETURN {to, NIL}
+	END
+
+	IF to = NIL THEN
+		RETURN NIL
+	END
+
+	SWITCH from[basetype] DO
+
+	CASE null:
+		SWITCH to[basetype] DO
+		CASE string, array, resource, object:
+			RETURN {to, "NULL"}
+		ELSE invalid("undefined")
+		END
+
+	CASE mixed:
+		SWITCH to[basetype] DO
+		CASE boolean, int, float, string, array, resource, object:
+		ELSE invalid("undefined")
+		END
+
+	CASE array:
+		IF to[basetype] <> array THEN
+			invalid("undefined")
+		ELSIF from_r[value] = "array()" THEN
+			# Formal typecast applied to empty array - always allowed.
+			RETURN {to, "array(...)"}
+		ELSE
+			EvalFormalTypecastArray(from[index_type], from[elem_type],
+				to[index_type], to[elem_type])
+		END
+
+	CASE object:
+		IF to[basetype] = object THEN
+			(****
+			IF to[class] = NIL THEN
+				invalid("cannot convert to a generic object -- use a class name")
+			END
+			****)
+		ELSE
+			invalid("undefined")
+		END
+		IF from[class] <> NIL THEN
+			invalid("the term must be a generic `object'")
+		END
+
+	ELSE
+		invalid("undefined")
+
+	END
+
+	(* Default/invalid/undefined type conversion: *)
+	IF from_r[value] = NIL THEN
+		RETURN {to, NIL}
+	ELSE
+		RETURN {to, "/*.(" + TypeToString(to) + ").*/ " + from_r[value]}
+	END
+END
+
+
+FUNCTION eval_res_type(a: Result, b: Result, op_name: STRING,
+	VAR res_type: Type, VAR res_as: STRING, VAR res_bs: STRING)
+(*
+	Basic evaluation of + - * %.
+	Parameters:
+	a: first arg.
+	b: second arg.
+	op_name: operator "+", "-", "*" or "/".
+	res_type: type of the result (NIL = unknown or invalid).
+	res_as: literal value of a (NIL = unknown)
+	res_bs: literal value of b (NIL = unknown)
+*)
+VAR at, bt, t: Type   as, bs: STRING
+BEGIN
+
+	# Analyze first arg:
+	IF a = NIL THEN
+		# Continue anyway performing basic check over 2nd arg.
+	ELSE
+		#Notice("eval_res_type: " + a[value] +  op_name + b[value])
+		at = a[type]
+		IF at = int_type THEN
+			as = a[value]
+		ELSIF at = float_type THEN
+			as = a[value]
+		ELSIF at[basetype] = array THEN
+			# ok, check 2nd arg.
+		ELSE
+			Error("`EXPR " + op_name + " ...'"
+			+ ": expected number or array but found "
+			+ TypeToString(a[type]))
+		END
+	END
+
+	# Analyze second arg:
+	IF b = NIL THEN
+		# Continue anyway performing basic check over 2nd arg.
+	ELSE
+		bt = b[type]
+		IF bt = int_type THEN
+			bs = b[value]
+		ELSIF bt = float_type THEN
+			bs = b[value]
+		ELSIF bt[basetype] = array THEN
+			# ok
+		ELSE
+			Error("`... " + op_name + " EXPR'"
+			+ ": expected number or array but found "
+			+ TypeToString(b[type]))
+		END
+	END
+
+	# Resulting type:
+	IF at = int_type THEN
+		IF bt = int_type THEN
+			t = int_type
+		ELSIF bt = float_type THEN
+			t = float_type
+		END
+	ELSIF at = float_type THEN
+		IF bt = int_type THEN
+			t = float_type
+		ELSIF bt = float_type THEN
+			t = float_type
+		END
+	ELSIF (at <> NIL) AND (at[basetype] = array)
+	AND (bt <> NIL) AND (bt[basetype] = array) THEN
+		IF op_name <> "+" THEN
+			Error("undefined operator between arrays: " + op_name)
+		ELSIF SameType(at, bt) THEN
+			t = at
+			as = NIL
+			bs = NIL
+		ELSE
+			Error("cannot add arrays of different types")
+		END
+	END
+
+	res_type = t
+	res_as = as
+	res_bs = bs
+
+END
+
+
+FUNCTION EvalPlus(a: Result, b: Result): Result
+VAR t: Type  as, bs, v: STRING
+BEGIN
+	eval_res_type(a, b, "+",   t, as, bs)
+
+	IF (as <> NIL) AND (bs <> NIL) THEN
+		IF t = int_type THEN
+			v = itos( stoi(as) + stoi(bs) )
+			# FIXME: check overflow
+		ELSIF t = float_type THEN
+			v = rtos( stor(as) + stor(bs) )
+		END
+	END
+
+	IF t = NIL THEN
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION EvalMinus(a: Result, b: Result): Result
+VAR t: Type  as, bs, v: STRING
+BEGIN
+	eval_res_type(a, b, "-",   t, as, bs)
+
+	IF (as <> NIL) AND (bs <> NIL) THEN
+		IF t = int_type THEN
+			v = itos( stoi(as) - stoi(bs) )
+			# FIXME: check overflow
+		ELSIF t = float_type THEN
+			v = rtos( stor(as) - stor(bs) )
+		END
+	END
+
+	IF t = NIL THEN
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION EvalMult(a: Result, b: Result): Result
+VAR t: Type  as, bs, v: STRING
+BEGIN
+	eval_res_type(a, b, "*",   t, as, bs)
+
+	IF (as <> NIL) AND (bs <> NIL) THEN
+		IF t = int_type THEN
+			v = itos( stoi(as) * stoi(bs) )
+			# FIXME: check overflow
+		ELSIF t = float_type THEN
+			v = rtos( stor(as) * stor(bs) )
+		END
+	END
+
+	IF t = NIL THEN
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION EvalDiv(a: Result, b: Result): Result
+VAR t: Type  as, bs, v: STRING
+BEGIN
+	eval_res_type(a, b, "/",   t, as, bs)
+
+	IF t = int_type THEN
+		t = float_type
+	END
+
+	# Division always return a float (see manual).
+	IF (t = float_type) AND (as <> NIL) AND (bs <> NIL) THEN
+		v = rtos( stor(as) / stor(bs) )
+	END
+
+	IF t = NIL THEN
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION EvalMod(a: Result, b: Result): Result
+VAR t: Type  as, bs, v: STRING
+BEGIN
+	eval_res_type(a, b, "%",   t, as, bs)
+
+	IF t = float_type THEN
+		Error("operator `%' applied to non-integer numbers might give"
+		+ " unpredictable results")
+	END
+
+	IF (t = int_type) AND (as <> NIL) AND (bs <> NIL) THEN
+		v = itos( stoi(as) MOD stoi(bs) )
+	END
+
+	IF t = NIL THEN
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION EvalPeriod(a: Result, b: Result): Result
+VAR
+	as, bs: STRING
+	t: Type
+BEGIN
+	IF a <> NIL THEN
+		t = a[type]
+	END
+	IF a = NIL THEN
+		#
+	ELSIF t = boolean_type THEN
+		Notice("found boolean value in string concatenation: remember that FALSE gets rendered as empty string \"\" while TRUE gets rendered as \"1\"")
+	ELSIF t = int_type THEN
+		as = a[value]
+	ELSIF t = float_type THEN
+		as = a[value]
+	ELSIF t = string_type THEN
+		as = a[value]
+	ELSIF IsObjectConvertibleToString(t) THEN
+		as = NIL
+	ELSE
+		Error("`EXPR . ...': invalid value EXPR of type "
+		+ TypeToString(t) + ", expected a string")
+	END
+
+	IF b <> NIL THEN
+		t = b[type]
+	END
+	IF b = NIL THEN
+		#
+	ELSIF t = boolean_type THEN
+		Notice("found boolean value in string concatenation: remember that FALSE gets rendered as empty string \"\" while TRUE gets rendered as \"1\"")
+	ELSIF t = int_type THEN
+		bs = b[value]
+	ELSIF t = float_type THEN
+		bs = b[value]
+	ELSIF t = string_type THEN
+		bs = b[value]
+	ELSIF IsObjectConvertibleToString(t) THEN
+		bs = NIL
+	ELSE
+		Error("`... . EXPR': found EXPR of type " + TypeToString(t)
+		+ ", expected a string")
+	END
+
+	IF (as = NIL) OR (bs = NIL) THEN
+		RETURN {string_type, NIL}
+	ELSE
+		RETURN {string_type, as + bs}
+	END
+END
+
+
+FUNCTION EvalNot(x: Result): Result
+VAR r: Result
+BEGIN
+	r = {boolean_type, NIL}
+	IF x = NIL THEN
+		RETURN r
+	ELSIF x[type] <> boolean_type THEN
+		Error("invalid argument of type " + TypeToString(x[type])
+		+ " for the boolean operator `!'. Expected boolean value.")
+		RETURN r
+	ELSIF x[value] = NIL THEN
+		RETURN r
+	END
+	IF x[value] = true_value THEN
+		r[value] = false_value
+	ELSE
+		r[value] = true_value
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalUnaryPlusMinus(is_minus: BOOLEAN, r: Result): Result
+VAR t: Type  v: STRING
+BEGIN
+	IF r = NIL THEN
+		RETURN NIL
+	ELSIF r[type] = int_type THEN
+		t = int_type
+		v = r[value]
+		IF is_minus AND (v <> NIL) THEN
+			v = itos( - stoi(r[value]) )
+		END
+	ELSIF r[type] = float_type THEN
+		t = float_type
+		v = r[value]
+		IF is_minus AND (v <> NIL) THEN
+			v = rtos( - stor(r[value]) )
+		END
+	ELSE
+		Error("invalid value of type " + TypeToString(r[type])
+		+ " for the unary operator +/-")
+		RETURN NIL
+	END
+	RETURN {t, v}
+END
+
+
+FUNCTION check_args_bit_binary_op(n: STRING, a: Result, b: Result): BOOLEAN
+(*
+	Return TRUE if a,b are both integers and the value is known.
+	Raise an error if they are of wrong type.
+*)
+VAR good: BOOLEAN
+BEGIN
+	IF (a = NIL) OR (b = NIL) THEN
+		RETURN FALSE
+	END
+
+	# Check types: they must be int:
+	good = TRUE
+	IF a[type] <> int_type THEN
+		Error("`EXPR " + n + " ...': found EXPR of type " + TypeToString(a[type])
+		+ ", expected int")
+		good = FALSE
+	END
+	IF b[type] <> int_type THEN
+		Error("`... " + n + " EXPR': found EXPR of type " + TypeToString(b[type])
+		+ ", expected int")
+		good = FALSE
+	END
+	IF NOT good THEN
+		RETURN FALSE
+	END
+
+	# Check if the values are known:
+	IF (a[value] = NIL) OR (b[value] = NIL) THEN
+		RETURN FALSE
+	END
+
+	RETURN TRUE
+END
+
+
+FUNCTION EvalLShift(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {int_type, NIL}
+	IF check_args_bit_binary_op("<<", a, b) THEN
+		r[value] = itos( stoi(a[value]) << stoi(b[value]) )
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalRShift(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {int_type, NIL}
+	IF check_args_bit_binary_op("<<", a, b) THEN
+		r[value] = itos( stoi(a[value]) >> stoi(b[value]) )
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalBitNot(r: Result): Result
+VAR v: STRING
+BEGIN
+	IF r = NIL THEN
+		#
+	ELSIF r[type][basetype] = int THEN
+		IF r[value] <> NIL THEN
+			v = itos( ~ stoi(r[value]) )
+		END
+	ELSE
+		Error("invalid value of type " + TypeToString(r[type])
+		+ " for the bitwise not operator `~'")
+	END
+	RETURN {int_type, v}
+END
+
+
+FUNCTION EvalBitAnd(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {int_type, NIL}
+	IF check_args_bit_binary_op("&", a, b) THEN
+		r[value] = itos( stoi(a[value]) & stoi(b[value]) )
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalBitXor(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {int_type, NIL}
+	IF check_args_bit_binary_op("^", a, b) THEN
+		r[value] = itos( stoi(a[value]) ^ stoi(b[value]) )
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalBitOr(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {int_type, NIL}
+	IF check_args_bit_binary_op("|", a, b) THEN
+		r[value] = itos( stoi(a[value]) | stoi(b[value]) )
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalCmp(n: STRING, a: Result, b: Result): Result
+(*
+	Evaluate the weak-comparison operators < <= == != >= >
+*)
+VAR r: Result  at, bt: Type  av, bv, rv: STRING  x: BOOLEAN
+
+	FUNCTION W(s: STRING)
+	BEGIN
+		Warning("comparing (" + TypeToString(at) + ") " + n + " ("
+		+ TypeToString(bt) + ")" + s)
+	END
+
+	FUNCTION E(s: STRING)
+	BEGIN
+		Error("comparing (" + TypeToString(at) + ") " + n + " ("
+		+ TypeToString(bt) + ")" + s)
+	END
+
+BEGIN
+	r = {boolean_type, NIL}
+
+	# w() requires at,bt be defined:
+	IF a <> NIL THEN
+		at = a[type]   av = a[value]
+	END
+	IF b <> NIL THEN
+		bt = b[type]   bv = b[value]
+	END
+
+	IF (a = NIL) OR (b = NIL) THEN
+		#W(": cannot check the comparison between unknown types")
+		RETURN r
+	END
+
+	IF (at = void_type) OR (bt = void_type) THEN
+		E(": `void' type cannot be compared")
+
+	ELSIF (at = mixed_type) OR (bt = mixed_type) THEN
+		W(": `mixed' type cannot be compared. Hint: check and convert mixed values to the appropriate type, or consider to use strict comparison operators === or !== if it is the case.")
+
+	ELSIF at = boolean_type THEN
+		IF bt = boolean_type THEN
+			IF (n <> "==") AND (n <> "!=") THEN
+				E(": invalid operator")
+			END
+		ELSE
+			E(NIL)
+		END
+	ELSIF at = int_type THEN
+		IF bt = int_type THEN
+		ELSIF bt = float_type THEN
+			E(" - Hint: you might use a typecast to (int) or to (float).")
+		ELSE
+			E(NIL)
+		END
+
+	ELSIF at = float_type THEN
+		IF bt = int_type THEN
+			E(" - Hint: you might use a typecast to (int) or to (float).")
+		ELSIF bt = float_type THEN
+			IF (n = "==") OR (n = "!=") THEN
+				Notice("comparison by equality/inequality between float numbers. "
+				+ "Remember that float numbers have limited precision, and that "
+				+ "expressions algebrically equivalent might give different "
+				+ "results. For example, 0.57-0.56==0.1 would give FALSE.")
+			END
+		ELSE
+			E(NIL)
+		END
+
+	ELSIF at = null_type THEN
+		IF bt = null_type THEN
+			E(": useless")
+		ELSIF bt = string_type THEN
+			IF n = "==" THEN
+				E(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "!=" THEN
+				E(" - Hint: use strict comparison operator `!==' instead.")
+			ELSE
+				E(NIL)
+			END
+		ELSIF bt[basetype] = array THEN
+			IF n = "==" THEN
+				E(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "!=" THEN
+				E(" - Hint: use strict comparison operator `!==' instead.")
+			ELSE
+				E(NIL)
+			END
+		ELSIF bt = resource_type THEN
+			IF (n <> "==") AND (n <> "!=") THEN
+				E(NIL)
+			END
+		ELSE
+			RETURN EvalCmp(n, b, a)
+		END
+
+	ELSIF at = string_type THEN
+		IF bt = null_type THEN
+			IF n = "==" THEN
+				E(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "!=" THEN
+				E(" - Hint: use strict comparison operator `!==' instead.")
+			ELSE
+				E(NIL)
+			END
+		ELSIF bt = string_type THEN
+			IF n = "==" THEN
+				E(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "===" THEN
+				E(" - Hint: use strict comparison operator `!==' instead.")
+			ELSIF (n = "<") OR (n = "<=") OR (n = ">=") OR (n = ">") THEN
+				E(" - Hint: use safer comparison function strcmp(...) "
+				+ n + " 0 instead.")
+			END
+		ELSE
+			E(NIL)
+		END
+
+	ELSIF at[basetype] = array THEN
+		IF bt = null_type THEN
+			IF n = "==" THEN
+				E(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "!=" THEN
+				E(" - Hint: use strict comparison operator `!==' instead.")
+			ELSE
+				E(NIL)
+			END
+		ELSE
+			E(NIL)
+		END
+
+	ELSIF at = resource_type THEN
+		IF bt = null_type THEN
+			IF (n <> "==") AND (n <> "!=") THEN
+				E(NIL)
+			END
+		ELSIF bt = resource_type THEN
+			IF (n <> "==") AND (n <> "!=") THEN
+				E(NIL)
+			END
+		ELSE
+			E(NIL)
+		END
+
+	ELSIF at[basetype] = object THEN
+		IF bt = null_type THEN
+			IF (n <> "==") AND (n <> "!=") THEN
+				E(NIL)
+			END
+		ELSIF bt[basetype] = object THEN
+			IF n = "==" THEN
+				W(" - Hint: use strict comparison operator `===' instead.")
+			ELSIF n = "!=" THEN
+				W(" - Hint: use strict comparison operator `!==' instead.")
+			ELSE
+				E(NIL)
+			END
+		ELSE
+			E(NIL)
+		END
+
+	ELSE
+		HALT("unexpected types")
+
+	END
+
+
+	# Effectively compute the result:
+	IF (av = NIL) OR (bv = NIL) THEN
+		RETURN r
+	END
+	IF (at = int_type) AND (bt = int_type) THEN
+		IF n = "<" THEN
+			x = stoi(av) < stoi(bv)
+		ELSIF n = "<=" THEN
+			x = stoi(av) <= stoi(bv)
+		ELSIF n = "==" THEN
+			x = stoi(av) = stoi(bv)
+		ELSIF n = "!=" THEN
+			x = stoi(av) <> stoi(bv)
+		ELSIF n = ">" THEN
+			x = stoi(av) > stoi(bv)
+		ELSIF n = ">=" THEN
+			x = stoi(av) >= stoi(bv)
+		END
+		IF x THEN
+			rv = true_value
+		ELSE
+			rv = false_value
+		END
+	ELSIF (at = int_type) AND (bt = float_type)
+	OR    (at = float_type)  AND (bt = int_type) THEN
+		IF n = "<" THEN
+			x = stor(av) < stor(bv)
+		ELSIF n = "<=" THEN
+			x = stor(av) <= stor(bv)
+		ELSIF n = "==" THEN
+			RETURN r
+		ELSIF n = "!=" THEN
+			RETURN r
+		ELSIF n = ">" THEN
+			x = stor(av) > stor(bv)
+		ELSIF n = ">=" THEN
+			x = stor(av) >= stor(bv)
+		END
+		IF x THEN
+			rv = true_value
+		ELSE
+			rv = false_value
+		END
+	ELSIF (at = float_type)  AND (bt = float_type) THEN
+		IF n = "<" THEN
+			x = stor(av) < stor(bv)
+		ELSIF n = "<=" THEN
+			x = stor(av) <= stor(bv)
+		ELSIF n = "==" THEN
+			RETURN r
+		ELSIF n = "!=" THEN
+			RETURN r
+		ELSIF n = ">" THEN
+			x = stor(av) > stor(bv)
+		ELSIF n = ">=" THEN
+			x = stor(av) >= stor(bv)
+		END
+		IF x THEN
+			rv = true_value
+		ELSE
+			rv = false_value
+		END
+	ELSIF (at = string_type) AND (bt = string_type) THEN
+		IF n = "===" THEN
+			IF av = bv THEN
+				rv = true_value
+			ELSE
+				rv = false_value
+			END
+		ELSIF n = "!==" THEN
+			IF av <> bv THEN
+				rv = true_value
+			ELSE
+				rv = false_value
+			END
+		END
+	END
+
+	r[value] = rv
+	RETURN r
+END
+
+
+FUNCTION EvalEq(n: STRING, a: Result, b: Result): Result
+BEGIN
+	RETURN EvalCmp(n, a, b)
+END
+
+
+FUNCTION RequireBoolean(where: STRING, r: Result)
+BEGIN
+	IF r = NIL THEN
+		Warning(where + ": undefined type of the expression"
+			+ " - expected a boolean value")
+	ELSIF r[type] = mixed_type THEN
+		Warning(where + ": found a value of type " + TypeToString(r[type])
+			+ " - expected a boolean value")
+	ELSIF r[type] <> boolean_type THEN
+		Error(where + ": found a value of type " + TypeToString(r[type])
+			+ " - expected a boolean value")
+	END
+END
+
+
+FUNCTION EvalAnd(n: STRING, a: Result, b: Result): Result
+(* Handle n='&&' and n='and' *)
+VAR r: Result
+BEGIN
+	r = {boolean_type, NIL}
+	IF (a = NIL) OR (b = NIL) THEN
+		RETURN r
+	END
+	RequireBoolean("`EXPR " + n + " ...'", a)
+	RequireBoolean("`... " + n + " EXPR'", b)
+	IF (a[type] <> boolean_type) OR (b[type] <> boolean_type) THEN
+		RETURN r
+	END
+	IF (a[value] = NIL) OR (b[value] = NIL) THEN
+		RETURN r
+	END
+	IF (a[value] = true_value) AND (b[value] = true_value) THEN
+		r[value] = true_value
+	ELSE
+		r[value] = false_value
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalOr(n: STRING, a: Result, b: Result): Result
+(* Handle n='||' and n='or' *)
+VAR r: Result
+BEGIN
+	r = {boolean_type, NIL}
+	IF (a = NIL) OR (b = NIL) THEN
+		RETURN r
+	END
+	RequireBoolean("`EXPR " + n + " ...'", a)
+	RequireBoolean("`... " + n + " EXPR' operator", b)
+	IF (a[type] <> boolean_type) OR (b[type] <> boolean_type) THEN
+		RETURN r
+	END
+	IF (a[value] = NIL) OR (b[value] = NIL) THEN
+		RETURN r
+	END
+	IF (a[value] = true_value) OR (b[value] = true_value) THEN
+		r[value] = true_value
+	ELSE
+		r[value] = false_value
+	END
+	RETURN r
+END
+
+
+FUNCTION EvalXor(a: Result, b: Result): Result
+VAR r: Result
+BEGIN
+	r = {boolean_type, NIL}
+	IF (a = NIL) OR (b = NIL) THEN
+		RETURN r
+	END
+	RequireBoolean("`EXPR xor ...'", a)
+	RequireBoolean("`... xor EXPR'", b)
+	IF (a[type] <> boolean_type) OR (b[type] <> boolean_type) THEN
+		RETURN r
+	END
+	IF (a[value] = NIL) OR (b[value] = NIL) THEN
+		RETURN r
+	END
+	IF (a[value] = true_value) AND (b[value] = false_value) THEN
+		r[value] = true_value
+	ELSE
+		r[value] = false_value
+	END
+	RETURN r
+END
+
+END

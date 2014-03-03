@@ -1,0 +1,60 @@
+DEFINITION MODULE Operators
+
+(*
+	Used by Expressions to check/evaluate expressions.
+*)
+
+IMPORT Types
+
+FUNCTION CheckBoolean(where: STRING, r: Result)
+(*
+	Detect improper non-boolean result in a control statement
+	if(EXPR), while(EXPR), (EXPR)? a:b, etc.
+*)
+
+FUNCTION EvalValueConversion(from: Result, to: Type): Result
+(*
+	Evaluates a PHP value conversion operator of the form
+
+		(to) from
+*)
+
+FUNCTION EvalTypeConversion(from: Result, to: Type): Result
+(*
+	Evaluates a PHPLint type conversion operator of the form
+
+		/*.(to).*/ from
+
+	A "formal typecast" is a meta-code formal operator that relaxes
+	strict type checking of PHPLint in a limited, controlled way.
+*)
+
+(*
+	The following functions evaluate binary operators of the form
+
+		a OP b
+*)
+FUNCTION EvalPlus  (a: Result, b: Result): Result
+FUNCTION EvalMinus (a: Result, b: Result): Result
+FUNCTION EvalMult  (a: Result, b: Result): Result
+FUNCTION EvalDiv   (a: Result, b: Result): Result
+FUNCTION EvalMod   (a: Result, b: Result): Result
+FUNCTION EvalLShift(a: Result, b: Result): Result
+FUNCTION EvalRShift(a: Result, b: Result): Result
+FUNCTION EvalPeriod(a: Result, b: Result): Result
+FUNCTION EvalBitAnd(a: Result, b: Result): Result
+FUNCTION EvalBitXor(a: Result, b: Result): Result
+FUNCTION EvalBitOr (a: Result, b: Result): Result
+FUNCTION EvalXor   (a: Result, b: Result): Result
+FUNCTION EvalCmp(n: STRING, a: Result, b: Result): Result
+FUNCTION EvalEq(n: STRING, a: Result, b: Result): Result
+FUNCTION EvalAnd(n: STRING, a: Result, b: Result): Result
+FUNCTION EvalOr(n: STRING, a: Result, b: Result): Result
+
+(* Unary operators  OP EXPR *)
+FUNCTION EvalNot(r: Result): Result
+FUNCTION EvalUnaryPlusMinus(is_minus: BOOLEAN, r: Result): Result
+FUNCTION EvalBitNot(r: Result): Result
+
+
+END

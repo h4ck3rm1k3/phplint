@@ -1,0 +1,5297 @@
+IMPLEMENTATION MODULE Statements
+
+IMPORT Accounting
+IMPORT Classes
+IMPORT Documentator
+IMPORT Errors
+IMPORT Exceptions
+IMPORT Expressions
+IMPORT FileName
+IMPORT Globals
+IMPORT Namespace
+IMPORT Proto
+IMPORT Scanner
+IMPORT Search
+IMPORT Template
+IMPORT Types
+IMPORT m2, io, str
+
+TYPE
+
+	ExecutionPath = (
+		next = 1,      # continue with the next statement
+		break = 2,     # interrupted by `break'
+		continue = 4,  # interrupted by `continue'
+		return = 8     # interrupted by `return', `exit', `die', `throw'
+	)
+	(****
+
+		EXECUTION PATHS FLOW ANALYSIS
+		-----------------------------
+
+		For every statement it parses, PHPLint keeps track of every
+		possible execution path, so that invalid source structures can
+		be detected. The picture below illustrates the execution paths
+		of which PHPLint takes care:
+
+
+		                      :            ^
+		                      :            | continue
+		                      v            |
+                        +-----------+      /
+		     return     |           |-----/ 
+		<---------------| statement |
+		     or exit    |           |-----\ 
+             or throw   +-----------+      \
+		                      |            | break
+		                      | next       |
+		                      v            v
+		
+		where:
+
+			`next' means that the statement that follows may be
+			executed at least in some cases. If this path is
+			missing, the statement that follows is unreachable.
+
+			`return' means that the statement may cause a return to
+			the caller or a return elsewere (exit, die, throw).
+
+			`continue' means a jump to the beginning or the current
+			loop.
+
+			`break' means a jump outside the loop or switch()
+			statement.
+
+		Every statement sets one or more execution paths that define
+		which statement will be executed next. The simplest statements,
+		like the assignment $i=123; implies that the statement executed
+		next will be the next that follows in the source, so the
+		execution path is `next'. A structured statement like
+
+		if( expression )
+			break;
+		else
+			return;
+
+		sets the execution path to `break|return'. Note that the lack of
+		the `next' path also means that the following statement, if it
+		exists, is unreachable and must be signaled as error.
+
+		The algebraic rules of composition of the execution paths
+		inside the strctured statements for(), while(), etc. are
+		detailed in the code.
+
+		The body of a function or method returning void must have the
+		execution path `next' or `return'. If the function or method return
+		a non-void value then the body must be `return', as `next'
+		would indicate an execution path in which the function or
+		method terminates without returning the promised value, while
+		`break' and `continue' should never be set by the internal
+		logic of PHPLint (they may be set only *inside* a loop or switch()).
+
+	****)
+
+VAR
+	pdb: ParsedDocBlock
+	(* Last phpDocumentor DocBlock found *)
+
+VAR
+	recursion_level: INTEGER
+	(* Recursion level of file parsing. Evaluates to the default 0 value when
+	ParsePackage() gets called from the first require*() or autoloading, so if
+	the deep is zero we are parsing one of the files passed from the command
+	line and then require_once() is forbidden. This serves to implement an
+	obvious security feature for the phplint-on-line WEB page. *)
+
+FUNCTION ParseEcho()
+VAR
+	r: Result
+	t: Type
+BEGIN
+	ReadSym()
+	LOOP
+		r = ParseExpr()
+		IF r = NIL THEN
+			#Warning("can't determine type of the argument of `echo'")
+		ELSE
+			t = r[type]
+			IF (t = int_type) OR (t = float_type)
+			OR (t = string_type) THEN
+				# simple type -- OK
+			ELSIF t = boolean_type THEN
+				Notice("found boolean value: remember that FALSE gets rendered as empty string \"\" while TRUE gets rendered as \"1\"")
+			ELSIF IsObjectConvertibleToString(t) THEN
+				# Ok.
+			ELSE
+				Error("found argument of the type " + TypeToString(t)
+				+ ". The arguments of the `echo' statement must be of"
+				+ " type int, float, string.")
+			END
+		END
+		IF sym <> sym_comma THEN
+			EXIT
+		END
+		ReadSym()
+	END
+END
+
+
+FUNCTION CheckFormalArgsByReference(on_return: BOOLEAN)
+(*
+	Check that all the formal arguments passed by reference and with the
+	`return' attribute be actually assigned. This check should be performed
+	after every `return' statement and at the end of the function body or
+	method body.
+	Parameters:
+	on_return: TRUE if the check occurs on a `return' statement, FALSE if
+	the check occurs at the end of the body of the function or method.
+*)
+VAR
+	args: ARRAY OF FormalArg
+	i: INTEGER
+	v: VARIABLE
+	where: STRING
+	msg: STRING
+BEGIN
+	IF curr_package[module] THEN
+		RETURN
+	END
+	IF curr_func <> NIL THEN
+		args = curr_func[sign][args]
+		where = "function " + curr_func[name]
+	ELSIF curr_method <> NIL THEN
+		args = curr_method[sign][args]
+		where = "method " + curr_method[name]
+	ELSE
+		# Not inside function or method, probably a `return' statement
+		# at an invalid scope; recover gently:
+		IF scope = 0 THEN
+			HALT("invalid scope")
+		END
+		RETURN
+	END
+	FOR i = 0 TO count(args) - 1 DO
+		v = SearchVarInScope(args[i][name], scope)
+		IF NOT v[assigned] THEN
+			msg = "returning from " + where
+			+ "(): the formal argument that returns by reference $"
+			+ v[name] + " might not have been assigned"
+			IF on_return THEN
+				Error(msg)
+			ELSE
+				Error2(here(), msg)
+			END
+		END
+	END
+END
+
+
+FUNCTION ParseReturn()
+VAR
+	r: Result
+	expected, found: Type
+	n: STRING
+	sign: SIGNATURE
+	no_expr: BOOLEAN
+BEGIN
+	ReadSym()
+	IF curr_func <> NIL THEN
+		sign = curr_func[sign]
+		expected = sign[return]
+		n = "function `" + curr_func[name] + "()'"
+	ELSIF curr_method <> NIL THEN
+		sign = curr_method[sign]
+		expected = sign[return]
+		n = "method " + mn(curr_class, curr_method)
+	ELSE
+		Error("`return' in global scope")
+		CurrPackageNotLibrary("Contains `return' statement in global scope in "
+		+ reference(here()) + ".")
+		IF sym <> sym_semicolon THEN
+			r = ParseExpr()
+		END
+		RETURN
+	END
+
+	IF sym = sym_semicolon THEN  # found "return;"
+		found = NIL
+		no_expr = TRUE
+	ELSE  # found "return <expr>;"
+		r = ParseExpr()
+		IF r = NIL THEN
+			found = NIL
+		ELSIF r[type] = void_type THEN
+			Error("the expression does not return a value")
+			found = NIL
+		ELSE
+			found = r[type]
+		END
+		no_expr = FALSE
+	END
+
+	IF expected = NIL THEN
+		IF no_expr THEN
+			Notice("from this `return;' we guess the " + n
+			+ " is of type void")
+			sign[return] = void_type
+		ELSIF found = NIL THEN
+			Notice("cannot determine the type of the returned "
+			+ "expression. Assuming `mixed' and trying to continue anyway.")
+			sign[return] = mixed_type
+		ELSE
+			Notice("from this `return' we guess the " + n
+			+ " returns a value of type " + TypeToString(found))
+			sign[return] = found
+		END
+	ELSE
+		IF no_expr THEN
+			IF expected <> void_type THEN
+				Error("missing returned value for " + n
+				+ " declared of type " + TypeToString(expected))
+			END
+		ELSIF found = NIL THEN
+			Warning("cannot determine the type of the returned "
+			+ "expression. The type of the value returned by the "
+			+ n + " should be " + TypeToString(expected))
+		ELSE
+			SWITCH LhsMatchRhs(expected, found) DO
+			CASE match_good:
+			CASE match_warn:
+				Warning(n + ": expected return type "
+				+ TypeToString(expected)
+				+ ", found expression of type "
+				+ TypeToString(found))
+			CASE match_err:
+				Error(n + ": expected return type "
+				+ TypeToString(expected)
+				+ ", found expression of type "
+				+ TypeToString(found))
+			END
+		END
+	END
+
+	CheckFormalArgsByReference(TRUE)
+END
+
+
+FUNCTION ParseTriggerError()
+CONST
+	E_USER_NOTICE = 1024
+VAR
+	r: Result
+	err: INTEGER
+	err_name: STRING
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected `('")
+	ReadSym()
+
+	(*
+		trigger_error(string [, code]);
+	*)
+
+	r = ParseExprOfType(string_type)
+
+	# Optional error code, default E_USER_NOTICE:
+	IF sym = sym_comma THEN
+		ReadSym()
+		r = ParseExprOfType(int_type)
+		IF r = NIL THEN
+			# bad expr
+			err = 0
+		ELSIF r[value] = NIL THEN
+			# can't evaluate runtime value
+			err = 0
+		ELSE
+			err = stoi(r[value])
+			err_name = Errors.CodeToName(err)
+			IF err_name = NIL THEN
+				Error("invalid error code: " + err)
+				err = 0
+			ELSIF NOT curr_package[module] AND NOT Errors.IsUserError(err) THEN
+				Error("error code forbidden in user's program: " + err_name)
+			END
+		END
+
+	ELSE
+		err = E_USER_NOTICE
+	END
+
+	Errors.RaiseErrors(err)
+
+	Expect(sym_rround, "expected `)'")
+	ReadSym()
+END
+
+
+TYPE
+	DocBlockLineTag = (
+		PACKAGE_TAG=1,
+		VAR_TAG=2,
+		PARAM_TAG=4,
+		RETURN_TAG=8,
+		ABSTRACT_TAG=16,
+		STATIC_TAG=32,
+		FINAL_TAG=64,
+		ACCESS_PRIVATE_TAG=128,
+		ACCESS_PROTECTED_TAG=256,
+		ACCESS_PUBLIC_TAG=512,
+		GLOBAL_TAG=1024,
+		THROWS_TAG=2048
+	)
+
+FUNCTION DocBlockCheckAllowedLineTags(allow: DocBlockLineTag,
+	documenting_what: STRING)
+
+	FUNCTION err(tag: STRING)
+	BEGIN
+		Error("invalid DocBlock line tag `" + tag
+		+ "': not allowed for " + documenting_what)
+	END
+
+BEGIN
+	IF pdb = NIL THEN
+		RETURN
+	END
+
+	IF (pdb[var_type] <> NIL) AND (allow & VAR_TAG = 0) THEN
+		err("@var")
+	END
+	IF (pdb[params] <> NIL) AND (allow & PARAM_TAG = 0) THEN
+		err("@param")
+	END
+	IF (pdb[return] <> NIL) AND (allow & RETURN_TAG = 0) THEN
+		err("@return")
+	END
+	IF pdb[abstract] AND (allow & ABSTRACT_TAG = 0) THEN
+		err("@abstract")
+	END
+	IF pdb[static] AND (allow & STATIC_TAG = 0) THEN
+		err("@static")
+	END
+	IF pdb[final] AND (allow & FINAL_TAG = 0) THEN
+		err("@final")
+	END
+	IF pdb[private] AND (allow & ACCESS_PRIVATE_TAG = 0) THEN
+		err("@access private")
+	END
+	IF pdb[protected] AND (allow & ACCESS_PROTECTED_TAG = 0) THEN
+		err("@access protected")
+	END
+	IF pdb[public] AND (allow & ACCESS_PUBLIC_TAG = 0) THEN
+		err("@access public")
+	END
+	IF pdb[package_tag_found] AND (allow & PACKAGE_TAG = 0) THEN
+		err("@package")
+	END
+	IF (pdb[global_name] <> NIL) AND (allow & GLOBAL_TAG = 0) THEN
+		err("@global")
+	END
+	IF (count(pdb[exceptions])>0) AND (allow & THROWS_TAG = 0) THEN
+		err("@throws")
+	END
+END
+
+
+FUNCTION FatalUnsupportedOldStyleSyntax()
+BEGIN
+	Fatal("unsupported old-style syntax. Please use {...} instead.")
+END
+
+
+# FIXME: little trick to resolve M2 missing FOWWARD decl.:
+$	static int Statements_ForwardParseStatement(void);
+$	static RECORD * Statements_ParsePackage(STRING *s, int module);
+
+FUNCTION ParseStatement(): ExecutionPath
+BEGIN
+$	return Statements_ForwardParseStatement();
+END
+
+
+FUNCTION ParseNamespace()
+VAR
+	res: ExecutionPath
+BEGIN
+	IF php_ver = php4 THEN
+		Fatal("namespace not available (PHP 5)")
+	END
+	ReadSym()
+
+	IF sym = sym_identifier THEN
+		# Detect namespace\x\y operator that starts an expression:
+		# if so, resolves the name, set the current symbol with this
+		# name, and return.
+		IF Namespace.isFullyQualified(s) THEN
+			IF curr_package[namespace_current] <> NIL THEN
+				s = "\\" + curr_package[namespace_current] + s
+			END
+			RETURN
+		END
+
+		Namespace.CheckSpelling(s)
+		curr_package[namespace_current] = s
+		curr_package[namespace_use] = NIL
+		ReadSym()
+	
+	ELSIF sym = sym_lbrace THEN
+		# Global namespace.
+		curr_package[namespace_current] = NIL
+		curr_package[namespace_use] = NIL
+
+	ELSE
+		Fatal("expected namespace name")
+	END
+
+	IF sym = sym_semicolon THEN
+		ReadSym()
+		RETURN
+	ELSIF sym = sym_lbrace THEN
+		res = ParseStatement()
+		Namespace.ReportUnusedUseClauses()
+		curr_package[namespace_current] = NIL
+		curr_package[namespace_use] = NIL
+	ELSE
+		UnexpectedSymbol()
+	END
+END
+
+
+FUNCTION ParseUse()
+(*
+	Parse
+
+		use PATH [ as TARGET];
+*)
+VAR
+	path: STRING
+BEGIN
+	IF php_ver = php4 THEN
+		Fatal("`use' not available (PHP 5)")
+	END
+	ReadSym()
+	LOOP
+		(* Parse path NS: *)
+		Expect(sym_identifier, "expected namespace name")
+		path = s
+		IF Namespace.isFullyQualified(path) THEN
+			Notice("useless leading `\\' in path namespace: path namespaces are always absolute")
+			path = path[1,length(path)]
+		END
+		ReadSym()
+
+		(* Parse alias ID: *)
+		IF sym = sym_as THEN
+			ReadSym()
+			Expect(sym_identifier, "expected identifier")
+			s = Namespace.CheckBareID(s)
+			Namespace.AddUse(path, s)
+			ReadSym()
+		ELSE
+			Namespace.AddUse(path, NIL)
+		END
+
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+	Expect(sym_semicolon, "expected `;'")
+	ReadSym()
+END
+
+
+FUNCTION ParseBlock(): ExecutionPath
+(*
+	Basically, this is just like ParseStatement() with the only difference
+	that it is called in structured statements where the old syntax with
+	sym_semicolon may appear. This old syntax is not supported by PHPLint,
+	so if this case is detected, simply raises a fatal error.
+*)
+BEGIN
+	IF sym = sym_colon THEN
+		FatalUnsupportedOldStyleSyntax()
+	ELSE
+		RETURN ParseStatement()
+	END
+END
+
+
+FUNCTION ParseArg(opt_arg: BOOLEAN): FormalArg
+(*
+	Parse a formal argument.
+	Parameters:
+	opt_arg: if this argument is optional.
+	Return: the formal argument.
+*)
+VAR
+	a: FormalArg
+	v: VARIABLE
+	p: ParseDocBlock.Parameter
+	r: Result
+BEGIN
+	(*
+		Check `return' attribute:
+	*)
+	IF sym = sym_x_return THEN
+		a[reference_return] = TRUE
+		ReadSym()
+	END
+
+	(*
+		Parse type of the formal arg:
+	*)
+	a[type] = ParseType(TRUE)
+	IF a[type] = void_type THEN
+		Error("argument of type `void' not allowed")
+	END
+
+	(*
+		Parse passing method by value or by reference:
+	*)
+	IF sym = sym_bit_and THEN
+		a[reference] = TRUE
+		ReadSym()
+	ELSE
+		IF a[reference_return] THEN
+			Error("invalid `return' attribute for argument passed by value")
+			a[reference_return] = FALSE
+		END
+	END
+
+	(*
+		Parse name of the formal arg:
+	*)
+	Expect(sym_variable, "expected name of the formal argument in function declaration")
+	a[name] = s
+
+	IF pdb <> NIL THEN
+
+		p = ParseDocBlock.SearchParam(pdb, s)
+		IF p = NIL THEN
+			Warning("missing `@param TYPE $" + s + "' in DocBlock above")
+
+		ELSIF a[type] = NIL THEN
+			# Type defined only in DocBlock.
+			a[type] = p[type]
+
+		ELSE
+			# Type defined both in DocBlock and PHPLint's meta-code.
+
+			# Both types must be equal:
+			IF NOT SameType(a[type], p[type]) THEN
+				Error("conflicting types between DocBlock @param"
+				+ " and actual PHP code for parameter `$" + s + "'")
+			END
+
+			# Passing methods must match:
+			IF NOT eq(p[reference], a[reference]) THEN
+				Error("conflicting passing method between DocBlock @param"
+				+ " and actual PHP code for parameter `$" + s
+				+ "': must be both by value or both by reference")
+			END
+
+		END
+
+		IF p <> NIL THEN
+			p[used] = TRUE
+		END
+
+	END
+
+	(*
+		Accounting: formal arguments are accounted as local variables.
+	*)
+	v = SearchVar(s)
+	IF v <> NIL THEN
+		Error("duplicated formal argument $" + s)
+	END
+	AccountVarLHS(s, FALSE)
+	v = SearchVar(s)
+	IF curr_package[module]
+	OR (curr_method <> NIL) AND curr_method[abstract]
+	OR a[reference_return]
+	THEN
+		v[used] = 100
+	END
+	IF a[reference_return] THEN
+		v[assigned] = FALSE
+	END
+	ReadSym()
+
+	(*
+		Parse default value:
+	*)
+	a[is_mandatory] = TRUE
+	IF sym = sym_assign THEN
+		a[is_mandatory] = FALSE
+		IF (php_ver = php4) AND a[reference] THEN
+			Error("can't assign default value to formal argument passed by reference (PHP 5)")
+		END
+		ReadSym()
+		r = ParseStaticExpr()
+		IF r = NIL THEN
+			#Warning("can't determine the type of the expression")
+		ELSIF a[type] = NIL THEN
+			a[type] = r[type]
+			a[value] = r[value]
+		ELSE
+			SWITCH LhsMatchRhs(a[type], r[type]) DO
+			CASE match_warn:
+				Warning("type mismatch: formal argument of type "
+				+ TypeToString(a[type]) + ", default expression of type "
+				+ TypeToString(r[type]))
+			CASE match_err:
+				Error("type mismatch: formal argument of type "
+				+ TypeToString(a[type]) + ", default expression of type "
+				+ TypeToString(r[type]))
+			ELSE
+			END
+			a[value] = r[value]
+		END
+	ELSIF opt_arg THEN
+		Error("missing default value for argument `$" + a[name]
+		+ "'. Hint: mandatory arguments can't follow the default ones.")
+	END
+
+	IF a[type] = NIL THEN
+		Error("undefined type for argument `$" + a[name]
+		+ "'. Hint: you may"
+		+ " indicate an explicit type (example: `/*.int.*/ $" + a[name] + "')"
+		+ " or assign a default value (example: `$" + a[name] + "=123')"
+		+ " or add a DocBlock line tag (example: `@param int $"
+		+ a[name] + "').")
+	END
+	v[type] = a[type]
+	v[value] = a[value]
+	(*
+		Assignament status: formal args that return by
+		reference are never assigned, also when a default value
+		is indicated:
+	*)
+	v[assigned] = NOT a[reference_return]
+	RETURN a
+END
+
+
+FUNCTION ParseArgsListDecl(sign: SIGNATURE)
+(*
+	Parse list of formal args of a function or method.
+	Formal arguments are accounted and added to the local scope, so the
+	`scope' global variable must be properly initialized.
+	Formal arguments passed by value are marked as assigned.
+	Formal arguments passed by return+reference are marked as unassigned.
+	Formal arguments passed by reference are marked as assigned.
+	function_or_module: "function" or "method".
+*)
+VAR
+	a: FormalArg
+	opt_arg: BOOLEAN
+BEGIN
+	Expect(sym_lround, "expected '(' in function declaration")
+	ReadSym()
+
+	IF sym = sym_rround THEN
+		# f().
+	
+	ELSIF sym = sym_x_args THEN
+		# f(args):
+		sign[more_args] = TRUE
+		ReadSym()
+	
+	ELSE
+		# f(one or more args):
+		LOOP
+
+			IF sym = sym_x_args THEN
+				Fatal("there must be a meta-code comma `,' separating the special symbol args from the other arguments")
+			END
+
+			a = ParseArg(opt_arg)
+			sign[args][] = a
+			IF a[is_mandatory] THEN
+				inc(sign[mandatory], 1)
+			ELSE
+				opt_arg = TRUE
+			END
+
+			IF sym = sym_comma THEN
+				ReadSym()
+
+			ELSIF sym = sym_x_comma THEN
+				ReadSym()
+				Expect(sym_x_args, "expected `args'")
+				sign[more_args] = TRUE
+				ReadSym()
+				EXIT
+
+			ELSE
+				EXIT
+
+			END
+		END
+	
+	END
+
+	Expect(sym_rround, "expected ')' or ',' in function declaration")
+	ParseDocBlock.ReportUnusedParams(pdb)
+	ReadSym()
+END
+
+
+FUNCTION SameSign(a: SIGNATURE, b: SIGNATURE): BOOLEAN
+VAR i: INTEGER
+BEGIN
+	IF NOT SameType(a[return], b[return])
+	OR NOT eq(a[reference], b[reference])
+	THEN
+		RETURN FALSE
+	END
+	IF a[mandatory] <> b[mandatory] THEN
+		RETURN FALSE
+	END
+	IF count(a[args]) <> count(b[args]) THEN
+		RETURN FALSE
+	END
+	FOR i=0 TO count(a[args])-1 DO
+		IF NOT SameType(a[args][i][type], b[args][i][type])
+		OR NOT eq(a[args][i][reference], b[args][i][reference])
+		OR NOT eq(a[args][i][reference_return], b[args][i][reference_return])
+		THEN
+			RETURN FALSE
+		END
+	END
+	RETURN TRUE
+END
+
+
+FUNCTION ParseFuncDecl(private: BOOLEAN, t: Type)
+(*
+	Status: sym = sym_function
+*)
+
+
+	FUNCTION CheckSpecialFunc(f: Function)
+	BEGIN
+		IF f[name_lower] = "cast" THEN
+			IF php_ver = php4 THEN
+				Warning("function name `" + f[name]
+				+ "' is reserved for special use by PHPLint under PHP 5")
+			END
+		ELSIF (length(f[name]) >= 2) AND (f[name][0,2] = "__") THEN
+			IF f[name_lower] = "__autoload" THEN
+				IF php_ver = php4 THEN
+					Warning("function name `" + f[name]
+					+ "' is reserved for special use in PHP 5")
+				ELSE
+					autoload_function = f
+				END
+			ELSE
+				Warning("function `" + f[name]
+				+ "': names beginning with two underscores are reserved for future extensions of the language, do not use")
+			END
+		END
+	END
+
+
+	FUNCTION CheckAutoloadSignature(f: Function)
+	CONST sign_expected = "void(string)"
+	VAR sign_actual: STRING
+	BEGIN
+		IF f[name_lower] <> "__autoload" THEN
+			RETURN
+		END
+		sign_actual = FunctionSignatureToString(f[sign])
+		IF sign_actual <> sign_expected THEN
+			Error2(f[decl_in], "invalid signature " + sign_actual
+			+ " for special function __autoload(), expected signature is "
+			+ sign_expected)
+		END
+	END
+
+
+	FUNCTION CheckCastSignature(f: Function)
+	CONST sign_expected = "mixed(string, mixed)"
+	VAR sign_actual: STRING
+	BEGIN
+		IF f[name_lower] <> "cast" THEN
+			RETURN
+		END
+		sign_actual = FunctionSignatureToString(f[sign])
+		IF sign_actual <> sign_expected THEN
+			Error2(f[decl_in], "invalid signature " + sign_actual
+			+ " for special function cast(), expected signature is "
+			+ sign_expected)
+		END
+	END
+
+
+VAR
+	f: Function
+	parent_func: Function
+	sign, old_sign: SIGNATURE
+	guess: BOOLEAN
+	proto_in: WHERE
+	proto_exceptions: ThrownExceptions
+	err: STRING
+	res: ExecutionPath
+BEGIN
+
+	DocBlockCheckAllowedLineTags(PARAM_TAG|RETURN_TAG|ACCESS_PRIVATE_TAG|THROWS_TAG,
+		"function")
+
+	IF NOT private AND (pdb <> NIL) AND pdb[private] THEN
+		private = TRUE
+	END
+
+	IF (t = NIL) AND (pdb <> NIL) THEN
+		IF pdb[return] = NIL THEN
+			Warning("missing `@return TYPE' declaration in DocBlock above")
+		ELSE
+			t = pdb[return]
+		END
+	END
+	IF t = NIL THEN
+		guess = TRUE
+	END
+	sign[return] = t
+
+	ReadSym()
+
+	IF sym = sym_bit_and THEN
+		sign[reference] = TRUE
+		IF php_ver = php5 THEN
+			Warning("obsolete syntax `function &func()', don't use in PHP 5")
+		END
+		ReadSym()
+	END
+
+	(*
+		Parse name:
+	*)
+
+	Expect(sym_identifier, "expected function name after `function'")
+
+	IF scope > 0 THEN
+		Error("function `" + s + "' nested inside another function."
+		+ " The scope of this function is global but it will exist only if"
+		+ " the parent function will be called. If the parent function is"
+		+ " called once more, this will give a fatal error.")
+	END
+
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	f = SearchFuncByAbsName(s, TRUE)
+	IF f = NIL THEN
+		(* Brand new func. decl. *)
+		f[name] = s
+		f[name_lower] = tolower(s)
+		f[private] = private
+		f[decl_in] = here()
+		IF NOT report_unused THEN
+			f[used] = 100
+		END
+		f[last_rhs] = NIL
+		f[sign] = NIL
+		funcs[] = f
+		CheckSpecialFunc(f)
+
+	ELSIF f[forward] THEN
+		(* Found implementation of the prototype. *)
+		old_sign = f[sign]
+		proto_in = f[decl_in]
+		proto_exceptions = f[exceptions]
+		f[exceptions] = NIL
+		# Check `private' attribute:
+		IF f[private] AND NOT private
+		OR NOT f[private] AND private THEN
+			Error("mismatch on the `private' attribute, check prototype in "
+			+ reference(proto_in))
+		END
+		IF f[used] = 0 THEN
+			Notice("function `" + f[name] + "()' declared forward in "
+			+ reference(proto_in) + " but never used before implementation")
+		END
+
+	ELSIF f[decl_in] = NIL THEN
+		(* Signature was guessed from usage before declaration. *)
+		# Check `private' attribute:
+		IF private AND (fn <> f[guessed_sign_in][fn]) THEN
+			Error("function `" + s
+			+ "' declared private after being used in external package "
+			+ reference(f[last_rhs]))
+		END
+		# If the names differ by upper/lower-case letters, the name
+		# in the declaration prevails:
+		f[name] = s
+		old_sign = f[sign]
+		f[private] = private
+
+	ELSE
+		Fatal("function `" + s + "' already declared in "
+		+ reference(f[decl_in]) )
+
+	END
+
+	f[sign] = sign
+	f[decl_in] = here()
+	parent_func = curr_func
+	curr_func = f
+	inc(scope, 1)
+	ReadSym()
+
+	(*
+		Parse formal args:
+	*)
+	ParseArgsListDecl(sign)
+
+	(*
+		Parse list of thrown exceptions:
+	*)
+	IF sym = sym_x_throws THEN
+		ParseThrows()
+	END
+
+	(*
+		Collect thrown exceptions from @throws line tags:
+	*)
+
+	IF pdb <> NIL THEN
+		AddExceptions(pdb[exceptions])
+	END
+
+	(*
+		Collect descriptions of thrown exceptions from @throws line tags:
+	*)
+
+	IF pdb <> NIL THEN
+		f[thrown_exceptions_descr] = pdb[thrown_exceptions_descr]
+	END
+
+	IF f[forward] THEN
+		(*
+			Compare declared thrown set vs. proto:
+		*)
+		err = ClassesList(
+			Sort(
+				OrphanClasses(
+					CheckedExceptionsSubset(proto_exceptions),
+					CheckedExceptionsSubset(f[exceptions])
+				)
+			)
+		)
+		IF err > NIL THEN
+			Error2(f[decl_in], "function `" + f[name]
+			+ "()' throws more exceptions than those listed in the prototype declared in "
+			+ reference(proto_in) + ": " + err)
+		END
+	ELSIF f[guessed_sign_in] <> NIL THEN
+		(*
+			Guessed functions cannot throw exceptions:
+		*)
+		IF CheckedExceptionsSubset(f[exceptions]) <> NIL THEN
+			Error2(f[decl_in], "function `" + f[name] + "()' already guessed in "
+			+ reference(f[guessed_sign_in])
+			+ " cannot throw unexpected exception(s): "
+			+ Classes.ClassesList( CheckedExceptionsSubset(f[exceptions]) ))
+		END
+	END
+
+	(*
+		Description:
+	*)
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		f[descr] = s
+		f[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		f[descr] = pdb[descr]
+		f[deprecated] = ExtractDeprecated(pdb[descr])
+		pdb = NIL
+	END
+
+	(*
+		Parse function body:
+	*)
+	Expect(sym_lbrace, "expected '{' in function body declaration")
+	res = ParseBlock()
+	IF sign[return] = NIL THEN
+		# No `return' statement found in body - guess `void':
+		guess = TRUE
+		sign[return] = void_type
+	ELSIF (sign[return] <> void_type)
+		AND (res & next <> 0)
+		# Avoid to lauch error on module packages, since they use dummy
+		# code and no proper `return EXPR' statements:
+		AND NOT curr_package[module]
+	THEN
+		Error2(f[decl_in], "missing `return' in at least one execution path in non-void function " + f[name])
+	END
+	CheckFormalArgsByReference(FALSE)
+
+	CleanCurrentScope()
+	inc(scope, -1)
+	curr_func = parent_func
+
+	IF guess THEN
+		Notice2(f[decl_in], "guessed signature of the function `" + f[name]
+		+ "()' as " + FunctionSignatureToString(sign))
+	END
+
+	IF f[forward] THEN
+		(*
+			Compare signature with proto:
+		*)
+		f[forward] = FALSE
+		IF NOT SameSign(old_sign, sign) THEN
+			Error2(f[decl_in], "function `" + f[name]
+			+ "()': the actual signature "
+			+ FunctionSignatureToString(sign) + " does not match the prototype "
+			+ FunctionSignatureToString(old_sign)
+			+ " as declared in " + reference(proto_in))
+		END
+	ELSIF f[guessed_sign_in] <> NIL THEN
+		(*
+			Compare signature with guessed:
+		*)
+		IF NOT SameSign(old_sign, sign) THEN
+			Error2(f[decl_in], "function `" + f[name]
+			+ "()': declared signature "
+			+ FunctionSignatureToString(sign) + " differs from signature "
+			+ FunctionSignatureToString(old_sign)
+			+ " as guessed in " + reference(f[guessed_sign_in]))
+		END
+	END
+
+	CheckAutoloadSignature(f)
+	CheckCastSignature(f)
+END
+
+
+FUNCTION ParseBreak()
+VAR r: Result
+BEGIN
+	IF loop_level = 0 THEN
+		Error("`break' MUST be inside a loop or a switch")
+	END
+	ReadSym()
+	IF sym <> sym_semicolon THEN
+		r = ParseExprOfType(int_type)
+		Warning("`break EXPR'" + ": unadvised programming practice; can't check")
+		# FIXME: check if r<>NIL AND r[value] > 0 and <= loop_level
+	END
+END
+
+
+FUNCTION ParseContinue()
+VAR r: Result
+BEGIN
+	IF loop_level = 0 THEN
+		Error("`continue' MUST be inside a loop or a switch")
+	END
+	ReadSym()
+	IF sym <> sym_semicolon THEN
+		r = ParseExprOfType(int_type)
+		Notice("'continue EXPR'" + ": unadvised programming practice")
+		# FIXME: check if r<>NIL AND r[value] > 0 and <= loop_level
+	END
+END
+
+
+
+TYPE
+	(*
+		DEFINITELY ASSIGNED VARIABLES ANALYSIS
+		--------------------------------------
+
+		AssignedSet represents a set of variables that are assigned,
+		the others being not assigned. Since usually most of the
+		variables are assigned, and only few are unassigned typically
+		near the end of the vars[0,vars_n-1] array, we save memory and
+		time compacting the data in the way described below.
+		The subset vars[0,first-1] are considered assigned, while
+		vars[first+count(set),vars_n] are considered unassigned.
+		The array of flags represents the assignment status of the
+		variables whose index ranges in vars[first,count(set)-1]. The
+		set can be NIL, in which case vars[0,first-1] are assigned and
+		all the others are unassigned.
+	*)
+	AssignedSet = RECORD
+		first: INTEGER
+		set: ARRAY OF BOOLEAN
+	END
+
+
+FUNCTION inSet(i: INTEGER, s: AssignedSet): BOOLEAN
+(*
+	Returns TRUE if vars[i] results to be assigned according to the set s.
+*)
+BEGIN
+	RETURN (i < s[first])
+	OR ((i < s[first] + count(s[set])) AND s[set][i - s[first]])
+END
+
+
+(*** FIXME: remove
+FUNCTION print_set(prompt: STRING, s: AssignedSet)
+# Only for debug. Print the latest max 5 assigned vars.
+VAR
+	t: STRING
+	i: INTEGER
+BEGIN
+	FOR i = s[first] - 5 TO s[first] + count(s[set])-1 DO
+		IF inSet(i, s) THEN
+			t = t + " $" + vars[i][name]
+		END
+	END
+	Notice2(here(), prompt + t)
+END
+***)
+
+
+FUNCTION GrabAssignedVars(): AssignedSet
+(*
+	Returns the set of the variables vars[0,vars_n-1] that are currently
+	assigned.
+	
+	Note that definitely assigned variables have meaning only within the
+	current scope, that can be either global or local to a function or
+	method. Then, in the context of validity of the set, the array
+	vars[0,vars_n-1] can expands with new variables that may be either
+	assigned or unassigned, but these new variables are excluded from the
+	set and then considered unassigned. In other words this function
+	returns the set of variables that are assigned at the time in which
+	this function was called.
+
+	WARNING. If we are in local scope (that is, inside a function or
+	method) only variables in the current scope are checked, variables in
+	global (and superglobal) scope are always considered assigned. This is
+	because I don't know any effective way to check if a global variable is
+	or is not definitely assigned before the function or method is
+	executed. It is responsability of the account module to protect from
+	assignements to unassigned global variables from inside a function,
+	then global variables MUST be all definitely assigned in global scope.
+*)
+VAR
+	first, i: INTEGER
+	s: AssignedSet
+BEGIN
+	# Search first unassigned var in current scope. Note that if there
+	# are not unassinged vars, then first=vars_n.
+	first = vars_n
+	i = vars_n - 1
+	LOOP
+		IF (i < 0) OR (vars[i][scope] <> scope) THEN
+			EXIT
+		END
+		IF NOT vars[i][assigned] THEN
+			first = i
+		END
+		i = i - 1
+	END
+	s[first] = first
+
+	# Creates the set of assigned vars starting from the first unassinged
+	# var. If there are not unassigned vars, then s[set] is not initialized
+	# and remains NIL.
+	FOR i = first TO vars_n - 1 DO
+		s[set][] = vars[i][assigned]
+	END
+
+	RETURN s
+END
+
+
+FUNCTION SetAssignedVars(s: AssignedSet)
+(*
+	Set the assignment status of all the variables
+	vars[0,vars_n-1][assigned] according to the given set.
+*)
+VAR
+	first, last, i: INTEGER
+BEGIN
+	first = s[first]
+	last = first + count(s[set])
+
+	# Vars before vars[first] are assigned:
+	i = first - 1
+	LOOP
+		IF (i < 0) OR (vars[i][scope] <> scope) THEN
+			EXIT
+		END
+		vars[i][assigned] = TRUE
+		i = i - 1
+	END
+
+	# Vars vars[first,last-1] are assigned according to s[set]:
+	FOR i = first TO last - 1 DO
+		vars[i][assigned] = s[set][i - first]
+	END
+
+	# Vars vars[last,vars_n-1] are unassigned:
+	FOR i = last TO vars_n - 1 DO
+		vars[i][assigned] = FALSE
+	END
+END
+
+
+FUNCTION IntersectAssignedVars(a: AssignedSet, b: AssignedSet): AssignedSet
+(*
+	Returns the intersection between the two sets, that is the set of
+	variables that are assigned both in a and b.
+*)
+VAR
+	i1, i2, i: INTEGER
+	c: AssignedSet
+BEGIN
+	# Conservative extimation of the range vars[i1,i2-1] of variables
+	# to consider. Before i1 are certainly all assigned, above i2-1
+	# are certainly all unassinged.
+	i1 = min(a[first], b[first])
+	i2 = max(a[first] + count(a[set]), b[first] + count(b[set]))
+
+	# Save space: move i1 upward to the first var which is actually unassinged:
+	WHILE (i1 < i2) AND inSet(i1, a) AND inSet(i1, b) DO
+		i1 = i1 + 1
+	END
+
+	# Save space: move i2 downward skipping all the trailing unassigned vars:
+	WHILE (i2 > i1) AND (NOT inSet(i2-1, a) OR NOT inSet(i2-1, b)) DO
+		i2 = i2 - 1
+	END
+
+	# Populate the set that represents the assignment status of the
+	# variables vars[i1,i2-1]:
+	c[first] = i1
+	FOR i = i1 TO i2 - 1 DO
+		c[set][] = inSet(i, a) AND inSet(i, b)
+	END
+
+	RETURN c
+END
+
+
+FUNCTION ParseCompound(): ExecutionPath
+(*
+	Parse "{...}" statement.
+*)
+VAR
+	res, p: ExecutionPath
+BEGIN
+	ReadSym()
+	res = next
+	WHILE sym <> sym_rbrace DO
+		IF res & next = 0 THEN
+			Error("unreachable statement")
+		END
+		p = ParseStatement()
+		res = (res & ~next) | p
+	END
+	ReadSym()
+	RETURN res
+END
+
+
+FUNCTION isTrue(r: Result): BOOLEAN
+BEGIN
+	RETURN (r <> NIL) AND (r[type] = boolean_type) AND (r[value] = "TRUE")
+END
+
+
+FUNCTION isFalse(r: Result): BOOLEAN
+BEGIN
+	RETURN (r <> NIL) AND (r[type] = boolean_type) AND (r[value] = "FALSE")
+END
+
+
+FUNCTION ParseWhile(): ExecutionPath
+VAR
+	r: Result
+	res, p: ExecutionPath
+	s: AssignedSet
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected '('")
+	ReadSym()
+	r = ParseExpr()
+	Expect(sym_rround, "expected closing ')' of the 'while' statement")
+	CheckBoolean("`while(EXPR)'", r)
+	ReadSym()
+
+	(*
+		while(expr)
+			P;
+		
+		is equivalent to 3 sequential statements:
+		
+		do{
+			if(!EXPR) break;
+			P;
+			continue;
+		}
+
+		We start evaluating the execution path res for the first statement:
+
+			if(!EXPR) break;
+	*)
+	IF isTrue(r) THEN
+		res = next
+	ELSIF isFalse(r) THEN
+		res = break
+	ELSE
+		res = next | break
+	END
+
+	# Add execution path for the P statement:
+	IF res & next = 0 THEN
+		Error("unreachable statement")
+	END
+	inc(loop_level, 1)
+	s = GrabAssignedVars()
+	p = ParseBlock()
+	SetAssignedVars(s)
+	inc(loop_level, -1)
+	res = res | p
+
+	# Add execution path for the "continue" statement:
+	IF res & next <> 0 THEN
+		res = (res & ~next) | continue
+	END
+
+	# Final result: translate "break" into "next":
+	IF res & break <> 0 THEN
+		res = res | next
+	END
+	res = res & (return | next)
+	# FIXME: if res=0 it is an infinite loop.
+	RETURN res
+END
+
+
+FUNCTION ParseDo(): ExecutionPath
+VAR
+	r: Result
+	res: ExecutionPath
+BEGIN
+	(*
+		do{
+			P;
+		}while(EXPR);
+
+		is equivalent to two statements inside a loop:
+
+		do{
+			P;
+			if( EXPR )
+				continue;
+			else
+				break;
+		}while(TRUE);
+
+		We start evaluating the first statement P:
+	*)
+	ReadSym()
+	inc(loop_level, 1)
+	res = ParseBlock()
+	inc(loop_level, -1)
+	Expect(sym_while, "expected 'while' in do...while() statement")
+	ReadSym()
+	Expect(sym_lround, "expected '('")
+	ReadSym()
+	r = ParseExpr()
+	Expect(sym_rround, "expected closing ')' of while(...)")
+	CheckBoolean("`do ... while(EXPR)'", r)
+	ReadSym()
+	# Add execution path for the hidden if() statement.
+	# If P has no `next' path, if() is never executed:
+	IF res & next = 0 THEN
+		#
+	ELSIF isTrue(r) THEN
+		# If EXPR=TRUE the if() statement reduces to `continue':
+		res = res & ~next | continue
+	ELSIF isFalse(r) THEN
+		# If EXPR=FALSE the if() statement reduces to `break':
+		res = res & ~next | break
+	ELSE
+		# General case continue or break:
+		res = res | (continue | break)
+	END
+
+	# Compute resultant execution path:
+	res = res & ~(next | continue)
+	IF res & break <> 0 THEN
+		res = res & ~break | next
+	END
+	RETURN res
+END
+
+
+FUNCTION ParseFor(): ExecutionPath
+(*
+	Parse for(EXPR1; EXPR2; EXPR3) statement.
+*)
+VAR
+	r, expr2: Result
+	res, p: ExecutionPath
+	before: AssignedSet
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected '('")
+	ReadSym()
+
+	# Parse EXPR1:
+	IF sym <> sym_semicolon THEN
+		r = ParseExprList()
+	END
+	Expect(sym_semicolon, "expected `;'")
+	ReadSym()
+
+	# Parse EXPR2:
+	IF sym <> sym_semicolon THEN
+		expr2 = ParseExprList()
+		CheckBoolean("`for(...; EXPR; ...)'", expr2)
+	END
+	Expect(sym_semicolon, "expected `;'")
+	ReadSym()
+
+	before = GrabAssignedVars()
+
+	# Parse EXPR3:
+	IF sym <> sym_rround THEN
+		r = ParseExprList()
+	END
+	Expect(sym_rround, "expected closing `)' of the `for' statement")
+	ReadSym()
+
+	inc(loop_level, 1)
+	p = ParseBlock()
+	inc(loop_level, -1)
+
+	IF (expr2 = NIL) # missing (or unparsable) EXPR2
+	OR isTrue(expr2)
+	THEN
+		# Translate `break' in `next':
+		IF p & break <> 0 THEN
+			res = next
+		END
+		# Copy `return':
+		res = res | (p & return)
+		# keep current set of assigned vars
+	ELSE
+		res = next
+		# Copy `return':
+		res = res | (p & return)
+		SetAssignedVars(before)
+	END
+
+	RETURN res
+END
+
+
+FUNCTION ParseForeach(): ExecutionPath
+(*
+	Parse:
+		foreach(arrayORobject as $v) {}
+		foreach(arrayORobject as $k => [&]$v) {}
+*)
+VAR
+	r: Result
+	index_type, elem_type: Type
+	k, v: VARIABLE
+	by_addr: BOOLEAN
+	res, p: ExecutionPath
+	before: AssignedSet
+	iterator: Class
+	c: Class
+	m: Method
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "required `(' after `foreach'")
+	ReadSym()
+
+	# foreach(EXPR...
+	r = ParseExpr()
+	index_type = mixed_type
+	elem_type = mixed_type
+	IF r = NIL THEN
+		#Warning("`foreach': expected array, found unknown type")
+
+	ELSIF r[type][basetype] = array THEN
+		SWITCH r[type][index_type] DO
+		CASE void:   index_type = mixed_type
+		CASE int:    index_type = int_type
+		CASE string: index_type = string_type
+		CASE mixed:  index_type = mixed_type
+		END
+		IF r[type][elem_type] <> NIL THEN
+			elem_type = r[type][elem_type]
+		END
+
+	ELSIF (php_ver = php5) AND (r[type][basetype] = object) THEN
+
+		IF IsSubclassOf(r[type][class], IteratorClass) THEN
+			# Index type is the return type of the key() method:
+			Classes.ResolveClassMethod(r[type][class], "key", c, m)
+			index_type = m[sign][return]
+			# Element type is the return type of the current() method:
+			Classes.ResolveClassMethod(r[type][class], "current", c, m)
+			elem_type = m[sign][return]
+
+		ELSIF IsSubclassOf(r[type][class], IteratorAggregateClass) THEN
+			Classes.ResolveClassMethod(r[type][class], "getIterator", c, m)
+			iterator = m[sign][return][class]
+			IF IsSubclassOf(iterator, IteratorClass) THEN
+				# Index type is the return type of the key() method:
+				Classes.ResolveClassMethod(iterator, "key", c, m)
+				index_type = m[sign][return]
+				# Element type is the return type of the current() method:
+				Classes.ResolveClassMethod(iterator, "current", c, m)
+				elem_type = m[sign][return]
+			ELSE
+				# getIterator() does not properly implements return type.
+				# Leave index and value type mixed.
+			END
+
+		ELSE
+			# Leave index and value type mixed.
+		END
+
+	ELSE
+		Error("`foreach(EXPR' requires an array or an object, found "
+		+ TypeToString(r[type]))
+	END
+
+	before = GrabAssignedVars()
+
+	# foreach(* as...
+	Expect(sym_as, "expected `as'. Hint: check `foreach( ARRAY_EXPRESSION as ...'")
+	ReadSym()
+
+	# foreach(* as [&]...
+	IF sym = sym_bit_and THEN
+		IF php_ver = php4 THEN
+			Error("can't use `&' in `foreach' (PHP 5)")
+		END
+		by_addr = TRUE
+		ReadSym()
+	END
+
+	# foreach(* as VARNAME
+	Expect(sym_variable, "`foreach': expected variable name")
+	AccountVarLHS(s, FALSE)
+	v = SearchVar(s)
+	ReadSym()
+
+	# foreach(* as VARNAME [=>]
+	IF sym = sym_rarrow THEN
+		IF by_addr THEN
+			Error("the key cannot be passed by reference")
+			by_addr = FALSE
+		END
+		k = v
+		ReadSym()
+		IF sym = sym_bit_and THEN
+			by_addr = TRUE
+			ReadSym()
+		END
+		Expect(sym_variable, "`foreach': expected variable name after `=>'")
+		AccountVarLHS(s, FALSE)
+		v = SearchVar(s)
+		ReadSym()
+	END
+
+	Expect(sym_rround, "expected closing `)' of the `foreach' statement")
+	ReadSym()
+
+	(*
+		Check type of the index:
+	*)
+	IF k = NIL THEN
+		# no key
+	ELSIF k[type] = NIL THEN
+		# the key is a new var of unknown type - set this type
+		k[type] = index_type
+	ELSE
+		# the key is a var of known type - check compatibility
+		SWITCH LhsMatchRhs(k[type], index_type) DO
+		CASE match_good:
+		CASE match_warn:
+			Warning("foreach(): the type of the variable `$" + k[name] + "' "
+			+ TypeToString(k[type]) + " does not match the index of "
+			+ TypeToString(index_type))
+		CASE match_err:
+			Error("foreach(): the type of the variable `$" + k[name] + "' "
+			+ TypeToString(k[type]) + " does not match the index of "
+			+ TypeToString(index_type))
+		END
+	END
+
+	(*
+		Check type of the value:
+	*)
+	(**** FIXME
+	IF NOT by_addr THEN
+		Notice("optimization suggestion: consider to pass the value by reference: `foreach($a as $k => &$v)...'")
+		raise this msg only if the type of $v is a complex data struct:
+		array, string(?), ...(?)
+	END
+	****)
+	IF v[type] = NIL THEN
+		v[type] = elem_type
+	ELSE
+		SWITCH LhsMatchRhs(v[type], elem_type) DO
+		CASE match_good:
+		CASE match_warn:
+			Warning("foreach(): the type of the variable `$" + v[name] + "' "
+			+ TypeToString(v[type])
+			+ " does not match the elements of the array "
+			+ TypeToString(elem_type))
+		CASE match_err:
+			Error("foreach(): the type of the variable `$" + v[name] + "' "
+			+ TypeToString(v[type])
+			+ " does not match the elements of the array "
+			+ TypeToString(elem_type))
+		END
+	END
+
+	inc(loop_level, 1)
+	p = ParseBlock()
+	inc(loop_level, -1)
+
+	SetAssignedVars(before)
+
+	res = next | p & return
+	RETURN res
+END
+
+
+FUNCTION ParseSwitch(): ExecutionPath
+	
+	FUNCTION CheckAndDiscardUnreachableStatements()
+	VAR
+		res: ExecutionPath
+	BEGIN
+		IF (sym = sym_case)
+		OR (sym = sym_default)
+		OR (sym = sym_x_missing_default)
+		OR (sym = sym_rbrace)
+		THEN
+			# `switch' branch is properly terminated.
+			RETURN
+		END
+
+		Error("unreachable statement")
+		# Skip unreachable statements:
+		REPEAT
+			res = ParseStatement()
+		UNTIL (sym = sym_case)
+			OR (sym = sym_default) 
+			OR (sym = sym_x_missing_default)
+			OR (sym = sym_rbrace)
+	END
+
+
+	VAR  labels: ARRAY OF Result
+
+	FUNCTION checkLabel(l: Result)
+	(*
+		Check if the value of this label was already listed
+		in previous `case' branch.
+	*)
+	VAR i: INTEGER
+	BEGIN
+		IF (l = NIL) OR (l[type] = NIL) OR (l[value] = NIL) THEN
+			RETURN
+		END
+		# Search:
+		FOR i = 0 TO count(labels)-1 DO
+			IF (l[type] = labels[i][type]) AND (l[value] = labels[i][value]) THEN
+				Error("duplicate `case' value: " + l[value])
+			END
+		END
+		labels[] = l
+	END
+
+VAR
+	r: Result
+	t: Type
+	found_default, found_statements: BOOLEAN
+	res: ExecutionPath  # `switch()' execution path
+	b: ExecutionPath # execution path of a single branch
+	p: ExecutionPath # execution path of a statement of the branch
+	before_set, branch_set, result_set: AssignedSet
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected `('")
+	ReadSym()
+	r = ParseExpr()
+	Expect(sym_rround, "expected `)'")
+	IF r = NIL THEN
+		#Warning("switch(EXPR): cannot determine the type of the expression")
+	ELSE
+		t = r[type]
+		IF (t <> int_type) AND (t <> string_type) THEN
+			Error("switch(EXPR): invalid expression of type "
+			+ TypeToString(t) + ". Expected int or string.")
+			t = NIL
+		END
+	END
+	ReadSym()
+	IF sym = sym_colon THEN
+		FatalUnsupportedOldStyleSyntax()
+	END
+	Expect(sym_lbrace, "expected `{'")
+	ReadSym()
+	inc(loop_level, 1)
+	before_set = GrabAssignedVars()
+	LOOP
+		IF (sym = sym_case) OR (sym = sym_default) THEN
+
+			IF sym = sym_case THEN
+				REPEAT
+					ReadSym()
+					r = ParseStaticExpr()
+					IF t <> NIL THEN
+						IF r = NIL THEN
+							#Error("cannot determine the type of the expression "
+							#+ "of the `case' branch")
+						ELSIF r[type] <> t THEN
+							Error("invalid type " + TypeToString(r[type])
+							+ " for the `case' branch. Expected "
+							+ TypeToString(t))
+						END
+					END
+					checkLabel(r)
+					Expect(sym_colon, "expected `:' after `case' expression")
+					ReadSym()
+				UNTIL sym <> sym_case
+
+			ELSE (* `default' branch *)
+				IF found_default THEN
+					Error("multiple default branches")
+				END
+				found_default = TRUE
+				ReadSym()
+				Expect(sym_colon, "expected `:' after `default'")
+				ReadSym()
+
+			END
+
+			(*
+				Missing `break' in branch (i.e. branch
+				fall-through) is allowed only if the branch is
+				empty. Instead, if the branch contains at least
+				a statement, fall-through requires
+				`missing_break'.
+			*)
+			found_statements = FALSE
+
+			b = next
+			WHILE (b & next <> 0)
+			AND (sym <> sym_case)
+			AND (sym <> sym_default)
+			AND (sym <> sym_x_missing_break)
+			AND (sym <> sym_x_missing_default)
+			AND (sym <> sym_rbrace)
+			DO
+				found_statements = TRUE
+				p = ParseStatement()
+				b = (b & ~next) | p
+			END
+
+			IF b & next = 0 THEN
+				CheckAndDiscardUnreachableStatements()
+
+			ELSIF (sym = sym_case) OR (sym = sym_default) THEN
+				IF found_statements THEN
+					Warning("improperly terminated non-empty `switch' branch"
+					+ " -- missing `break;'?")
+				END
+
+			ELSIF sym = sym_x_missing_break THEN
+				ReadSym()
+				Expect(sym_x_semicolon, "expected `;'")
+				ReadSym()
+				CheckAndDiscardUnreachableStatements()
+
+			ELSIF (sym = sym_rbrace) OR (sym = sym_x_missing_default) THEN
+				b = b | break
+
+			END
+
+			res = res | b & (return | continue)
+			# Translate branch `break' into `switch()' `next' execution path:
+			IF b & break <> 0 THEN
+				res = res | next
+			END
+
+			IF b & break <> 0 THEN
+				branch_set = GrabAssignedVars()
+				IF result_set = NIL THEN
+					result_set = branch_set
+				ELSE
+					result_set = IntersectAssignedVars(result_set, branch_set)
+				END
+			END
+			SetAssignedVars(before_set)
+
+		ELSIF sym = sym_x_missing_default THEN
+			IF found_default THEN
+				Error("multiple default branches")
+			END
+			found_default = TRUE
+			ReadSym()
+			Expect(sym_x_colon, "expected `:' in meta-code")
+			ReadSym()
+			res = res | next
+			result_set = before_set
+
+		ELSIF sym = sym_rbrace THEN
+			IF found_default THEN
+				IF result_set = NIL THEN
+					SetAssignedVars(before_set)
+				ELSE
+					SetAssignedVars(result_set)
+				END
+			ELSE
+				Warning("missing `default:' branch in `switch'")
+				res = res | next  # avoid "unreachable statement"
+				SetAssignedVars(before_set)
+			END
+			ReadSym()
+			EXIT
+
+		ELSE
+			UnexpectedSymbol()
+
+		END
+	END
+	inc(loop_level, -1)
+
+	RETURN res
+END
+
+
+FUNCTION ParseClassConstDecl(visibility: Visibility)
+VAR
+	cl: Class
+	c: ClassConst
+	r: Result
+BEGIN
+	# The caller already parsed @access and set the visibility argument.
+	# Only remains to check for forbidden line tags:
+	DocBlockCheckAllowedLineTags(ACCESS_PRIVATE_TAG | ACCESS_PROTECTED_TAG
+	| ACCESS_PUBLIC_TAG, "class constant")
+
+	ReadSym()
+
+	LOOP
+		Expect(sym_identifier, "expected constant name")
+
+		(*
+			Check multiple definitions or re-definition of inherited consts:
+		*)
+		ResolveClassConst(curr_class, s,  cl, c)
+		IF c <> NIL THEN
+			IF NOT c[forward] THEN
+				IF cl = curr_class THEN
+					Error("class constant `" + s + "' already defined in "
+					+ reference(c[decl_in]))
+				ELSIF cl[abstract] OR cl[interface] THEN
+					Error("cannot re-define the constant `"
+					+ pc(curr_class, cl) + "::" + s
+					+ "' inherited from interface or abstract class")
+				END
+				c = NIL
+				c[name] = s
+				curr_class[consts][] = c
+			END
+		ELSE
+			c[name] = s
+			curr_class[consts][] = c
+		END
+
+		c[forward] = FALSE
+		c[visibility] = visibility
+		c[decl_in] = here()
+		IF NOT report_unused THEN
+			c[used] = 100
+		END
+		ReadSym()
+		Expect(sym_assign, "expected `=' after constant name")
+		ReadSym()
+		r = ParseStaticExpr()
+		IF r = NIL THEN
+			#Warning("constant `" + c[name]
+			#+ "': cannot determine the type of the expression")
+		ELSIF r[type][basetype] = array THEN
+			Error("arrays are not allowed in class constants")
+		END
+		c[value] = r
+
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+
+	Expect(sym_semicolon, "missing `;'")
+	ReadSym()
+
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		c[descr] = s
+		c[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		c[descr] = pdb[descr]
+		c[deprecated] = ExtractDeprecated(pdb[descr])
+		pdb = NIL
+	END
+
+END
+
+
+FUNCTION ParseClassPropertyDecl(visibility: Visibility, static: BOOLEAN, t: Type)
+VAR
+	P: Class
+	p: Property
+	r: Result
+BEGIN
+	# The caller already parsed DocBlock line tags and set the visibility,
+	# static and t arguments.
+	# Only remains to check for forbidden line tags:
+	IF php_ver = php4 THEN
+		DocBlockCheckAllowedLineTags(VAR_TAG | STATIC_TAG
+		| ACCESS_PRIVATE_TAG | ACCESS_PROTECTED_TAG | ACCESS_PUBLIC_TAG,
+		"property")
+	ELSE
+		DocBlockCheckAllowedLineTags(VAR_TAG, "property")
+	END
+
+	LOOP
+
+		# Get property name $NAME:
+		IF sym <> sym_variable THEN
+			Fatal("expected property name $NAME")
+		END
+
+		# Check multiple definitions; properties cannot be overridden:
+		SearchClassProperty(curr_class, s,   P, p)
+		IF p <> NIL THEN
+			Error("property `$" + s + "' already defined in "
+				+ reference(p[decl_in]))
+		END
+
+		# Add property to the list:
+		p = NIL
+		p[name] = s
+
+		p[visibility] = visibility
+
+		# Staticity:
+		p[static] = static
+
+		p[type] = t
+
+		p[decl_in] = here()
+		IF NOT report_unused THEN
+			p[used] = 100
+		END
+		ReadSym()
+
+		# Get property initial value:
+		IF sym = sym_assign THEN
+			ReadSym()
+			r = ParseStaticExpr()
+			IF r = NIL THEN
+				#Warning("cannot determine the type of the expression")
+			ELSIF p[type] = NIL THEN
+				IF r[type] = null_type THEN
+					Error("NULL value must be cast to some specific type, for example /*.(resource).*/ NULL or /*.(string).*/ NULL or /*.(array[int]string).*/ NULL or /*.(CLASSNAME).*/ NULL.")
+				ELSE
+					p[type] = r[type]
+					p[value] = r[value]
+				END
+			ELSE
+				SWITCH LhsMatchRhs(p[type], r[type]) DO
+				CASE match_good:
+				CASE match_warn:
+					Warning("property `$" + p[name] + "' of type "
+					+ TypeToString(p[type]) + ", expression of type "
+					+ TypeToString(r[type]))
+				CASE match_err:
+					Error("property `$" + p[name] + "' of type "
+					+ TypeToString(p[type]) + ", expression of type "
+					+ TypeToString(r[type]))
+				END
+				p[value] = r[value]
+			END
+		ELSIF t = NIL THEN
+			Error("undefined type for property `$" + p[name]
+			+ "'. Hint: you may"
+			+ " indicate an explicit type (example: `/*.int.*/ $" + p[name] + "')"
+			+ " or assign a default value (example: `$" + p[name] + "=123')"
+			+ " or add a DocBlock line tag (example: `@var int').")
+		ELSE
+			IF LhsMatchRhs(t, null_type) <> match_good THEN
+				Error("property $" + p[name] + " of type " + TypeToString(t)
+				+ " requires an initial value, otherwise it would be initialized to the invalid value NULL at runtime (PHPLint restriction)")
+			END
+		END
+
+		curr_class[properties][] = p
+
+		# More properties in list?
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+
+	END
+
+	Expect(sym_semicolon, "expected ';'")
+	ReadSym()
+
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		p[descr] = s
+		p[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		p[descr] = pdb[descr]
+		p[deprecated] = ExtractDeprecated(pdb[descr])
+		pdb = NIL
+	END
+
+END
+
+
+VAR
+	specialMethods: ARRAY OF RECORD
+		name, name_lower, sign: STRING
+		php4: BOOLEAN
+		not_supported: BOOLEAN
+	END
+
+FUNCTION CheckSpecialMethodSignature(m: Method)
+VAR i: INTEGER  sign: STRING
+BEGIN
+	IF (length(m[name]) <= 2) OR (m[name][0,2] <> "__") THEN
+		RETURN
+	END
+
+	IF specialMethods = NIL THEN
+	specialMethods = {
+
+#{ "__construct",  "__construct",  "public void()", FALSE, FALSE },
+{ "__destruct",   "__destruct",   "public void()", FALSE, FALSE },
+
+# "clone" operator:
+{ "__clone",  "__clone",      "public void()", FALSE, FALSE },
+
+{ "__set_static", "__set_static", "public static void(mixed[string])", FALSE, FALSE },
+
+# serialize()/Unserialize():
+{ "__sleep",  "__sleep",  "public string[int]()", TRUE, FALSE },
+{ "__wakeup", "__wakeup", "public void()", TRUE, FALSE },
+
+{ "__toString", "__tostring", "public string()", FALSE, FALSE },
+
+# Dynamic properties/methods handling not supported by PHPLint:
+{ "__set",    "__set",   "public void(string, mixed)", FALSE, TRUE },
+{ "__get",    "__get",   "public mixed(string)", FALSE, TRUE },
+{ "__isset",  "__isset", "public boolean(string)", FALSE, TRUE },
+{ "__unset",  "__unset", "public void(string)", FALSE, TRUE },
+{ "__call",   "__call",  "public mixed(string, mixed[])", FALSE, TRUE },
+{ "__invoke", "__invoke", "public void(...)", FALSE, FALSE },
+{ "__callStatic", "__callstatic",  "public static mixed(string, mixed[])", FALSE, TRUE },
+{ "__set_state", "__set_state", "public object(mixed[string])", FALSE, TRUE }
+
+	}
+	END
+
+	(* Search between the known special methods: *)
+	i = count(specialMethods)-1
+	LOOP
+		IF i < 0 THEN
+			EXIT
+		END
+		IF m[name_lower] = specialMethods[i][name_lower] THEN
+			IF m[name] <> specialMethods[i][name] THEN
+				Notice("the special method `" + m[name]
+				+ "' should be written as `" + specialMethods[i][name] + "'")
+			END
+			EXIT
+		END
+		inc(i, -1)
+	END
+
+	IF i < 0 THEN # method not found
+		IF (length(m[name]) >= 2) AND (m[name][0,2] = "__") THEN
+			Warning2(m[decl_in], "unknown special method `" + m[name]
+			+ "'. Methods whose name begins with `__' are reserved for future use by the language")
+		END
+		RETURN
+	END
+
+	(* Found method specialMethods[i]. *)
+
+	IF (php_ver = php4) AND NOT specialMethods[i][php4] THEN
+		Warning2(m[decl_in], "the name `" + specialMethods[i][name] + "' is reserved for a special method in PHP5, use another name under PHP4")
+		RETURN
+	ELSIF specialMethods[i][not_supported] THEN
+		Warning2(m[decl_in], "special method `" + specialMethods[i][name]
+		+ "' not supported by PHPLint")
+	END
+
+	(* Allow final special method *)
+	IF m[final] THEN
+		#Notice2(m[decl_in], "special method `" + m[name] + "': method is `final'")
+		m[final] = FALSE
+		sign = MethodSignatureToString(m)
+		m[final] = TRUE
+	ELSE
+		sign = MethodSignatureToString(m)
+	END
+
+	IF sign <> specialMethods[i][sign] THEN
+		Error2(m[decl_in], "special method `" + m[name]
+		+ "': invalid signature `" + sign + "', expected `"
+		+ specialMethods[i][sign] + "'")
+	END
+END
+
+
+FUNCTION SameMethodSignature(m1: Method, m2: Method): BOOLEAN
+BEGIN
+	RETURN eq(m1[final], m2[final])
+		AND eq(m1[static], m2[static])
+		AND (m1[visibility] = m2[visibility])
+		AND SameSign(m1[sign], m2[sign])
+END
+
+
+FUNCTION ParseClassMethodDecl(abstract: BOOLEAN, visibility: Visibility,
+	static: BOOLEAN, final: BOOLEAN, t: Type)
+VAR
+	m: Method  # current method being parsed
+	old_m: Method  # if <> NIL, the forward decl or guessed method
+	old_m_index: INTEGER  # if old_m <> NIL, index to the array of methods
+	sign: SIGNATURE
+	this: VARIABLE
+	guess: BOOLEAN
+	is_constructor, is_destructor: BOOLEAN
+	err: STRING
+	res: ExecutionPath
+
+	FUNCTION ParentConstructor(c: Class): Class
+	(*
+		Returns the parent class containing the constructor, or
+		NIL if no constructors are defined in parent classes.
+	*)
+	BEGIN
+		c = c[extends]
+		WHILE (c <> NIL) AND (c[construct] = NIL) DO
+			c = c[extends]
+		END
+		RETURN c
+	END
+
+	FUNCTION ParentDestructor(c: Class): Class
+	(*
+		Returns the parent class containing the destructor, or
+		NIL if no destructors are defined in parent classes.
+	*)
+	BEGIN
+		c = c[extends]
+		WHILE (c <> NIL) AND (c[destruct] = NIL) DO
+			c = c[extends]
+		END
+		RETURN c
+	END
+
+BEGIN
+
+	# The caller already parsed DocBlock line tags and set the abstract,
+	# visibility, static, final and t arguments.
+	# @param tags will be checked by ParseArgListDecl().
+	# @return tag will be checked below.
+	# @throw tags will be collected below.
+	# Only remains to check for forbidden line tags:
+	IF (pdb <> NIL) AND (php_ver = php4) THEN
+		DocBlockCheckAllowedLineTags(PARAM_TAG | RETURN_TAG |
+		ABSTRACT_TAG | STATIC_TAG | FINAL_TAG | ACCESS_PRIVATE_TAG |
+		ACCESS_PROTECTED_TAG | ACCESS_PUBLIC_TAG, "method")
+
+	ELSIF (pdb <> NIL) AND (php_ver = php5) THEN
+		DocBlockCheckAllowedLineTags(PARAM_TAG | RETURN_TAG | THROWS_TAG,
+		"method")
+
+	END
+
+	(*
+		Check and sanitize flags:
+	*)
+	IF curr_class[interface] THEN
+		abstract = TRUE
+		IF visibility <> public THEN
+			Error("interface methods must be `public'")
+			visibility = public
+		END
+		IF final THEN
+			Error("interface methods cannot be `final'")
+			final = FALSE
+		END
+
+	ELSIF curr_class[abstract] THEN
+		IF abstract THEN
+			IF visibility = private THEN
+				Error("abstract methods cannot be `private'")
+				visibility = protected
+			END
+			IF static THEN
+				Error("abstract methods cannot be static")
+				static = FALSE
+			END
+			IF final THEN
+				Error("abstract methods cannot be `final'")
+				final = FALSE
+			END
+		ELSE
+			IF final AND (visibility = private) THEN
+				Warning("a private method is implicitly `final'")
+				final = FALSE
+			END
+		END
+
+	ELSE (* regular class *)
+		IF abstract THEN
+			Error("abstract method in non-abstract class")
+			abstract = FALSE
+		END
+		IF final AND (visibility = private) THEN
+			Warning("a private method is implicitly `final'")
+			final = FALSE
+		END
+
+	END
+
+	(*
+		Check return type:
+	*)
+	IF (t = NIL) AND (pdb <> NIL) AND (pdb[return] = NIL) THEN
+		Warning("missing `@return TYPE' declaration in DocBlock above")
+	END
+	IF t = NIL THEN
+		guess = TRUE
+	END
+	sign[return] = t
+
+	m[abstract] = abstract
+	m[visibility] = visibility
+	m[static] = static
+	m[final] = final
+
+	ReadSym()
+
+	(*
+		&
+	*)
+	IF sym = sym_bit_and THEN
+		sign[reference] = TRUE
+		IF php_ver = php5 THEN
+			Warning("obsolete syntax `function &func()', don't use in PHP 5")
+		END
+		ReadSym()
+	END
+
+	(*
+		Parse name:
+	*)
+	Expect(sym_identifier, "expected method name")
+
+	(*
+		Search prev. decl of this method inside this class. If found, it is
+		either a forward decl or a guessed method, otherwise it is duplicated.
+		If forward decl or guessed, its signature will be checked against the
+		actual signature we parse next.
+	*)
+	old_m = SearchClassMethod(curr_class, s, FALSE)
+	IF (old_m <> NIL) AND NOT old_m[forward] AND (old_m[decl_in] <> NIL) THEN
+		Error("method `" + s + "()' already defined in " + reference(old_m[decl_in]))
+	END
+
+	m[name] = s
+	m[name_lower] = tolower(s)
+
+	m[decl_in] = here()
+	m[sign] = sign
+
+	(*
+		Check constructor and set is_constructor:
+	*)
+	IF php_ver = php4 THEN
+
+		IF m[name_lower] = "__construct" THEN
+			Warning("constructor `" + m[name] + "': this name is reserved for PHP 5 constructors")
+		ELSIF m[name_lower] = curr_class[name_lower] THEN
+			is_constructor = TRUE
+		END
+
+	ELSE (* php5 *)
+
+		IF m[name_lower] = "__construct" THEN
+			is_constructor = TRUE
+
+		ELSIF m[name_lower] = curr_class[name_lower] THEN
+			is_constructor = TRUE
+			Warning("the constructor `" + m[name]
+				+ "' has the same name of the class. PHP 5 states"
+				+ " it should be called `__construct()'")
+
+		ELSIF Namespace.inNamespace()
+		AND str.ends_with(curr_class[name_lower], "\\" + m[name_lower]) THEN
+			Warning("the method `" + m[name]
+				+ "' has the same name of the class inside a namespace: if it is intended to be a constructor, call it `__construct()' instead (PHP >= 5.3.3)")
+		END
+
+	END
+
+	(*
+		Any class has 2 pre-defined methods: the constructor and the
+		destructor. This latter has a fixed signature, but the former may
+		accept different arguments, may raise differente errors and thrown
+		exceptions. If a custom constructor is found, we must check if somewere
+		in the code just parsed before we erroneusly called the pre-defined or
+		the inherited constructor. So, if it is a constructor, and there is not
+		previous forward decl., and the constructor of this class had called
+		before, raise an error:
+	*)
+	IF is_constructor AND (old_m = NIL)
+	AND (curr_class[constructor_last_used_here] <> NIL) THEN
+		Error("the default or inherited constructor for this class was already invoked before declaration in " + reference(curr_class[constructor_last_used_here]) + ". Hint: change the order of the declarations or declare a `forward' class or `forward' constructor, ensuring that everything be defined before usage.")
+	END
+
+	(*
+		Check destructor:
+	*)
+	is_destructor = (php_ver = php5) AND (m[name_lower] = "__destruct")
+
+	IF NOT report_unused OR is_constructor OR is_destructor OR abstract THEN
+		m[used] = 100
+	END
+
+	curr_method = m
+	inc(scope, 1)
+	ReadSym()
+
+	(*
+		Virtual declaration of the $this variable:
+	*)
+	# Hack: use "*" to prevent errors from AccountVarLHS()
+	AccountVarLHS("*", FALSE)
+	this = SearchVar("*")
+	this[name] = "this"
+	this[type] = curr_class[type]
+
+	(*
+		Parse formal args:
+	*)
+	ParseArgsListDecl(sign)
+
+	IF NOT is_constructor THEN
+		(*
+			Check signature of special methods __xxx() only if it is fully
+			provided. If the signature has to be guessed, we need to parse
+			the body looking the 'return EXPR' statement before this check
+			can be made.
+		*)
+		IF NOT guess THEN
+			CheckSpecialMethodSignature(m)
+		END
+
+	ELSE
+		(*
+			Check visibility/static properties and signature
+			of the constructor (since it may or may not have
+			arguments, its signature cannot be checked by
+			CheckSpecialMethodSignature()):
+		*)
+		IF m[static] THEN
+			Error("constructor `" + m[name]
+			+ "': a constructor cannot be `static'")
+			m[static] = FALSE
+		END
+		IF (sign[return] <> NIL) AND (sign[return] <> void_type) THEN
+			Error("constructor `" + m[name] + "': a constructor cannot"
+			+ " return a value. It must be declared `void'.")
+		END
+		sign[return] = void_type
+	END
+
+	(*
+		Collect thrown exceptions from @throws line tags:
+	*)
+
+	IF pdb <> NIL THEN
+		AddExceptions(pdb[exceptions])
+	END
+
+	(*
+		Collect descriptions of thrown exceptions from @throws line tags:
+	*)
+
+	IF pdb <> NIL THEN
+		m[thrown_exceptions_descr] = pdb[thrown_exceptions_descr]
+	END
+
+	(*
+		Parse list of thrown exceptions:
+	*)
+	IF sym = sym_x_throws THEN
+		ParseThrows()
+	END
+
+	IF (old_m <> NIL) AND old_m[forward] THEN
+		(*
+			Compare declared thrown set vs. proto:
+		*)
+		err = ClassesList(
+			Sort(
+				OrphanClasses(
+					CheckedExceptionsSubset(old_m[exceptions]),
+					CheckedExceptionsSubset(m[exceptions])
+				)
+			)
+		)
+		IF err > NIL THEN
+			Error2(m[decl_in], "method `" + m[name]
+			+ "()' throws more exceptions than those listed in the prototype declared in "
+			+ reference(old_m[decl_in]) + ": " + err)
+		END
+	ELSIF (old_m <> NIL) AND (old_m[guessed_sign_in] <> NIL) THEN
+		(*
+			Guessed methods cannot throw exceptions:
+		*)
+		IF CheckedExceptionsSubset(m[exceptions]) <> NIL THEN
+			Error2(m[decl_in], "method `" + m[name] + "()' already guessed in "
+			+ reference(old_m[guessed_sign_in])
+			+ " cannot throw unexpected exception(s): "
+			+ Classes.ClassesList( CheckedExceptionsSubset(m[exceptions]) ))
+		END
+	END
+
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		IF (php_ver = php5) AND abstract THEN
+			Warning("the DOC description for abstract methods must follow `;'")
+		END
+		m[descr] = s
+		m[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		m[descr] = pdb[descr]
+		m[deprecated] = ExtractDeprecated(pdb[descr])
+	END
+
+	(*
+		Add method to this class:
+	*)
+	IF old_m = NIL THEN
+		# Add new method to the class:
+		curr_class[methods][] = m
+	ELSE
+		# Substitute this definition to the guessed one or duplicated one:
+		old_m_index = 0
+		WHILE curr_class[methods][old_m_index] <> old_m DO
+			inc(old_m_index, 1)
+		END
+		curr_class[methods][old_m_index] = m
+	END
+	IF is_constructor THEN
+		IF (curr_class[construct] = NIL) OR (curr_class[construct][forward]) THEN
+			curr_class[construct] = m
+		ELSE
+			Error("constructor `" + m[name]
+			+ "': constructor already declared as `"
+			+ curr_class[construct][name] + "'")
+		END
+	END
+	IF is_destructor THEN
+		curr_class[destruct] = m
+	END
+
+	(*
+		Parse method body:
+	*)
+
+	IF sym = sym_semicolon THEN
+
+		IF php_ver = php4 THEN
+			IF abstract THEN
+				Error("expected empty body `{}' for abstract method")
+			ELSE
+				Error("expected method body")
+			END
+		ELSE
+			IF NOT abstract THEN
+				Error("missing method body in non abstract method")
+			END
+		END
+
+		ReadSym()
+
+		this[used] = 100
+
+		IF sym = sym_x_doc THEN
+			m[descr] = s
+			m[deprecated] = ExtractDeprecated(s)
+			ReadSym()
+		ELSIF pdb <> NIL THEN
+			m[descr] = pdb[descr]
+		END
+
+		pdb = NIL
+
+	ELSIF sym = sym_lbrace THEN
+
+		pdb = NIL  # ...otherwise local vars. would get a DocBlock.
+
+		IF php_ver = php4 THEN
+			IF abstract THEN
+				ReadSym()
+				Expect(sym_rbrace, "expected `}'. The body of an abstract method must be empty.")
+				ReadSym()
+				IF NOT static THEN
+					this[used] = 100
+				END
+			ELSE
+				(* ignored *) res = ParseBlock()
+			END
+
+		ELSE
+			IF abstract THEN
+				Error("expected `;'. Abstract method cannot contain a body.")
+			END
+			(* ignored *) res = ParseBlock()
+
+		END
+
+		(*
+			Check if the method actually returns a value:
+		*)
+		IF (sign[return] <> NIL) AND (sign[return] <> void_type)
+		AND NOT m[abstract]
+		AND (res & next <> 0)
+		# Avoid to lauch error on module packages, since they use dummy
+		# code and no proper `return EXPR' statements:
+		AND NOT curr_package[module]
+		THEN
+			Error2(m[decl_in], "missing `return' in at least one execution path in non-void method " + m[name])
+		END
+
+		(*
+			Check if parent contructor was called in overridding constructor:
+		*)
+		IF is_constructor
+		AND (ParentConstructor(curr_class) <> NIL)
+		AND NOT curr_class[parent_constructor_called]
+		THEN
+			Error2(m[decl_in], "missing call to the parent constructor in overridding constructor " + curr_class[name] + "::" + m[name] + "()")
+		END
+
+		(*
+			Check if parent destructor called in overridding destructor:
+		*)
+		IF is_destructor
+		AND (ParentDestructor(curr_class) <> NIL)
+		AND NOT curr_class[parent_destructor_called]
+		THEN
+			Error2(m[decl_in], "missing call to the parent destructor in overridding destructor " + curr_class[name] + "::" + m[name] + "()")
+		END
+
+	ELSE
+		UnexpectedSymbol()
+
+	END
+
+	pdb = NIL
+
+	IF sign[return] = NIL THEN
+		# No `return' statement found in body - guess `void':
+		guess = TRUE
+		sign[return] = void_type
+	END
+
+	(*
+		Check signature of special methods __xxx()
+		if it was not fully provided:
+	*)
+	IF guess AND NOT is_constructor THEN
+		CheckSpecialMethodSignature(m)
+	END
+
+	(*
+		Check usage of $this in static (forbidden) and non-static
+		methods (allowed). Guess the static attribute for PHP4.
+	*)
+	(****
+	IF NOT static AND (this[used] = 0) THEN
+		# $this not used in non-static method:
+		IF php_ver = php4 THEN
+			IF print_notices THEN
+				Notice2(m[decl_in], "the method " + mn(curr_class, m)
+				+ " does not use `$this': guessing `static' attribute. Hint: you can add `/*. static .*/' to prevent this message to be shown.")
+				static = TRUE
+				m[static] = TRUE
+				guess = TRUE
+			END
+		ELSE
+			IF print_notices THEN
+				Notice2(m[decl_in], "the method " + mn(curr_class, m)
+				+ " does not use `$this'. Is it `static'?")
+			END
+		END
+	END
+	****)
+
+	this[used] = 100  # prevent "unused var. $this"
+
+	IF guess THEN
+		Notice2(m[decl_in], "guessed signature of the method "
+		+ mn(curr_class, m) + " as " + MethodSignatureToString(m))
+	END
+
+	CheckOverriddenMethod(curr_class, m)
+
+	IF NOT m[abstract] THEN
+		CheckFormalArgsByReference(FALSE)
+	END
+
+	CleanCurrentScope()
+	inc(scope, -1)
+	curr_method = NIL
+
+	IF old_m <> NIL THEN
+		IF NOT SameMethodSignature(m, old_m) THEN
+			IF old_m[forward] THEN (* forward decl. method *)
+				Error2(m[decl_in], "method " + mn(curr_class, m)
+				+ " with signature `" + MethodSignatureToString(m)
+				+ "' does not match forward signature `"
+				+ MethodSignatureToString(old_m)
+				+ "' as declared in "
+				+ reference(old_m[decl_in]))
+			ELSE (* guessed signature *)
+				Error2(m[decl_in], "method " + mn(curr_class, m)
+				+ " with signature `" + MethodSignatureToString(m)
+				+ "' does not match the signature `"
+				+ MethodSignatureToString(old_m)
+				+ "' as guessed in "
+				+ reference(old_m[guessed_sign_in]))
+			END
+		END
+	END
+END
+
+
+FUNCTION ParseClass(private_class: BOOLEAN)
+
+	FUNCTION CheckForwardAttribute(c: Class,
+		a_attribute: BOOLEAN, b_attribute: BOOLEAN, attribute: STRING)
+	(*
+		Check if a class attribute of the actual implementation matches the
+		same attribute as set in the forward declaration.
+		Parameters:
+		c: forward class.
+		a_attribute: attribute in the forward declaration.
+		b_attribute: attribute in the actual declaration.
+		attribute: name of the attribute.
+	*)
+	BEGIN
+		IF a_attribute AND b_attribute
+		OR NOT a_attribute AND NOT b_attribute THEN
+			RETURN
+		END
+		Error("class " + c[name] + ": attribute `" + attribute
+		+ "' does not match the forward declaration in "
+		+ reference(c[decl_in]))
+	END
+
+VAR
+	class, colliding, forward, parent, if: Class
+	class_name, class_name_lower: STRING
+	t: Type
+	surrogates: ARRAY OF Class
+	should_implement: ARRAY OF Class
+
+	(* Members attributes: *)
+	x_visibility_set: BOOLEAN    x_visibility: Visibility
+	x_abstract: BOOLEAN # /*.abstract.*/
+	x_final: BOOLEAN # /*.final.*/
+	x_static: BOOLEAN # /*.static.*/
+	abstract: BOOLEAN
+	visibility_set: BOOLEAN    visibility: Visibility
+	static: BOOLEAN
+	final: BOOLEAN
+
+	i: INTEGER
+	m: Method
+	class_decl_in: WHERE
+
+BEGIN
+	IF php_ver = php4 THEN
+		DocBlockCheckAllowedLineTags(FINAL_TAG|ABSTRACT_TAG|ACCESS_PRIVATE_TAG,
+			"class")
+	ELSE
+		DocBlockCheckAllowedLineTags(ACCESS_PRIVATE_TAG, "class")
+	END
+
+	IF scope > 0 THEN
+		Warning("class declaration inside a function. The namespace of the classes is still global so the function cannot be called twice.")
+	END
+
+	class_decl_in = here()
+	class[decl_in] = class_decl_in
+
+	IF NOT report_unused THEN
+		class[used] = 100
+	END
+
+	(*
+		Collect flags private/abstract/final from DocBlock:
+	*)
+	class[private]  = private_class OR (pdb <> NIL) AND pdb[private]
+	class[abstract] = (pdb <> NIL) AND pdb[abstract]
+	class[final]    = (pdb <> NIL) AND pdb[final]
+
+	(*
+		Collect flags abstract/final from PHP5 and meta-code:
+	*)
+	LOOP
+		IF sym = sym_x_abstract THEN
+			IF php_ver = php5 THEN
+				Error("invalid attribute `/*.abstract.*/', use `abstract' instead")
+			END
+			IF class[abstract] THEN
+				Notice("`abstract' attribute already set")
+			END
+			class[abstract] = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_x_final THEN
+			IF php_ver = php5 THEN
+				Error("invalid attribute `/*.final.*/', use `final' instead")
+			END
+			IF class[final] THEN
+				Notice("`final' attribute already set")
+			END
+			class[final] = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_abstract THEN
+			IF php_ver = php4 THEN
+				Error("invalid attribute `abstract', use `/*.abstract.*/' instead")
+			END
+			IF class[abstract] THEN
+				Notice("`abstract' attribute already set")
+			END
+			class[abstract] = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_final THEN
+			IF php_ver = php4 THEN
+				Error("invalid attribute `final', use `/*.final.*/' instead")
+			END
+			IF class[final] THEN
+				Notice("`final' attribute already set")
+			END
+			class[final] = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_x_unchecked THEN
+			IF php_ver = php4 THEN
+				Error("invalid attribute `unchecked' (PHP 5)")
+			END
+			IF class[unchecked] THEN
+				Notice("`unchecked' attribute already set")
+			END
+			class[unchecked] = TRUE
+			ReadSym()
+
+		ELSE
+			EXIT
+
+		END
+	END
+
+	IF class[final] AND class[abstract] THEN
+		Error("a class cannot be both final and abstract")
+	END
+
+	Expect(sym_class, "expected `class'")
+	ReadSym()
+
+	(*
+		Class name:
+	*)
+	Expect(sym_identifier, "expected class name")
+	s = Namespace.CheckBareID(s)
+	class_name = Namespace.Absolute(s)
+	class_name_lower = tolower(class_name)
+
+	(*
+		Check collision with classes imported with `use' from another
+		NS (collisions with classes declared in the current NS are
+		detected next). Note that we can't use SearchClass() here
+		because it might trigger class autoloading.
+	*)
+	
+	colliding = SearchClassByAbsName(Namespace.ApplyUse(s, TRUE), FALSE)
+	IF (colliding <> NIL) AND (colliding[name_lower] <> class_name_lower) THEN
+		Error("cannot declare " + class_name
+		+ " because the name is already accessible as " + colliding[name]
+		+ " declared in " + reference(colliding[decl_in]))
+	END
+
+	(*
+		Check if we are implementing a forward declaration.
+	*)
+
+	forward = SearchClassByAbsName(class_name, FALSE)
+	IF forward = NIL THEN (* new class - store it: *)
+		class[name] = class_name
+		class[name_lower] = class_name_lower
+		class[type] = {object, void, NIL, class}
+		classes[] = class
+
+	ELSIF forward[forward] THEN  (* found actual decl. of a forward class *)
+		CheckForwardAttribute(forward, forward[private], class[private], "private")
+		CheckForwardAttribute(forward, forward[abstract], class[abstract], "abstract")
+		CheckForwardAttribute(forward, forward[final], class[final], "final")
+		CheckForwardAttribute(forward, forward[unchecked], class[unchecked], "unchecked")
+
+		###forward[decl_in] = class[decl_in]
+		should_implement = forward[implements]
+		forward[implements] = NIL
+		forward[used] = class[used]
+		forward[forward] = FALSE
+		class = forward
+
+	ELSE
+		Error("class `" + class_name + "' already declared in "
+			+ reference(forward[decl_in]))
+	END
+
+	curr_class = class
+
+	(* Detect special class "Exception" and remember for later use: *)
+	IF (php_ver = php5) AND (class[name] = "Exception") THEN
+		ExceptionClass = class
+	END
+
+	ReadSym()
+
+	(*
+		Template?
+	*)
+	IF sym = sym_x_lt THEN
+		surrogates = Template.ParseClassDeclTemplate()
+	END
+
+	(*
+		Extends?
+	*)
+	IF sym = sym_extends THEN
+		ReadSym()
+		Expect(sym_identifier, "expected parent class name after `extends'")
+		parent = SearchClass(s)
+		IF parent = NIL THEN
+			Error("undeclared parent class `" + s + "'")
+		ELSIF IsSubclassOf(parent, class) THEN
+			Error("class " + class[name] + " cannot extend child class "
+			+ parent[name] + ": forbidden circular reference")
+		ELSIF parent[final] THEN
+			Error("can't extend final class `" + parent[name] + "'")
+		ELSIF parent[interface] THEN
+			Error("can't extend interface class `" + parent[name] + "'")
+		ELSE
+			IF (forward <> NIL)
+			AND (forward[extends] <> NIL)
+			AND (forward[extends] <> parent)
+			THEN
+				Error("class " + class[name]
+				+ ": actual implementation must extend " + class[extends][name]
+				+ " according to the forward declaration")
+			END
+			class[extends] = parent
+			AccountClass(parent)
+			IF parent[deprecated] > "" THEN
+				Warning("extending deprecated class `" + parent[name] + "': "
+				+ parent[deprecated])
+			END
+
+			# Check usage of the `unchecked' attribute:
+			IF class[unchecked] THEN
+				IF parent = NIL THEN
+					Error("unchecked attribute allowed only if class extends exception")
+					
+				ELSIF NOT IsExceptionClass(parent) THEN
+					Error("invalid `unchecked' attribute for non-exception class "
+					+ parent[name])
+				END
+
+			ELSIF IsSubclassOf(parent, ExceptionClass) AND parent[unchecked]
+			THEN
+				Error("missing `unchecked' attribute extending unchecked exception " + parent[name])
+			END
+
+		END
+		ReadSym()
+
+	ELSE
+		IF class[unchecked] THEN
+			Error("cannot use `unchecked' attribute on non-exception")
+		END
+	END
+
+	(*
+		Implements?
+	*)
+	IF sym = sym_implements THEN
+		ReadSym()
+		LOOP
+			Expect(sym_identifier, "expected interface name")
+			if = SearchClass(s)
+			IF if = NIL THEN
+				Error("undeclared interface class `" + s + "'")
+			ELSIF NOT if[interface] THEN
+				Error("the class `" + s + "' isn't an interface")
+			ELSIF (php_ver = php5) AND (if[name] = "Traversable") AND NOT curr_package[module] THEN
+				Error("can't implement abstract interface `Traversable', use `Iterator' or `IteratorAggregate' instead")
+			ELSIF IsSubclassOf(class, if) THEN
+				Notice("class " + class[name]
+				+ " redundantly extends interface "
+				+ if[name] + " -- ignoring")
+			ELSE
+				class[implements][] = if
+				# FIXME: check multiple recurrence of the same class
+				# not really an error, however
+				AccountClass(if)
+				IF if[deprecated] > "" THEN
+					Warning("implementing deprecated interface `"
+					+ if[name] + "': " + if[deprecated])
+				END
+			END
+			ReadSym()
+			IF sym = sym_comma THEN
+				ReadSym()
+			ELSE
+				EXIT
+			END
+		END
+	END
+	FOR i=0 TO count(should_implement)-1 DO
+		if = should_implement[i]
+		IF NOT IsSubclassOf(class, if) THEN
+			Error("class " + class[name] + " must implement " + if[name]
+			+ " according to the forward declaration")
+		END
+	END
+
+	# class[decl_in] may be NIL or it contains the location of the forward
+	# decl.: we will not use it anymore, so it is the time to set it:
+	class[decl_in] = class_decl_in
+
+	Classes.CheckCollisionsBetweenExtendedAndImplementedClasses(class)
+	Classes.CheckTraversableUsage(class)
+
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		class[descr] = s
+		class[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		class[descr] = pdb[descr]
+		class[deprecated] = ExtractDeprecated(pdb[descr])
+		pdb = NIL
+	END
+
+	Expect(sym_lbrace, "expected '{' in class declaration")
+	ReadSym()
+
+	LOOP
+
+		IF sym = sym_rbrace THEN
+			ReadSym()
+			EXIT
+		END
+
+		# Meta-code or DocBlock flags:
+		x_visibility_set = FALSE
+		x_visibility = public
+		x_abstract = FALSE
+		x_final = FALSE
+		x_static = FALSE
+
+		# PHP5 flags:
+		abstract = FALSE
+		visibility_set = FALSE
+		visibility = public
+		static = FALSE
+		final = FALSE
+
+		# FIXME: /**#@-*/ /** xxx */public function... would crash the parser
+		# because of the two consecutive DocBlocks. Remove this loop
+		# once /**#@-*/ will be implemented.
+		WHILE sym = sym_x_docBlock DO
+			pdb = ParseDocBlock(s)
+			IF pdb <> NIL THEN
+				IF pdb[private] THEN
+					x_visibility = private
+					x_visibility_set = TRUE
+				ELSIF pdb[protected] THEN
+					x_visibility = protected
+					x_visibility_set = TRUE
+				ELSIF pdb[public] THEN
+					x_visibility = public
+					x_visibility_set = TRUE
+				END
+				x_abstract = pdb[abstract]
+				x_final = pdb[final]
+				x_static = pdb[static]
+			END
+			ReadSym()
+		END
+
+		# Parses flags:
+		LOOP
+			(****
+			FIXME: These checks do not work properly because
+			sym_x_private/protected/public is allowed also in PHP5
+			for constants.
+			IF (php_ver = php4) AND (
+				(sym = sym_public)
+				OR (sym = sym_protected)
+				OR (sym = sym_private)
+				OR (sym = sym_abstract)
+				OR (sym = sym_final)
+				OR (sym = sym_static)
+			) THEN
+				Error("this attribute is available only as PHPLint meta-code")
+
+			ELSIF (php_ver = php5) AND (
+				(sym = sym_x_public)
+				OR (sym = sym_x_protected)
+				OR (sym = sym_x_private)
+				OR (sym = sym_x_abstract)
+				OR (sym = sym_x_final)
+				OR (sym = sym_x_static)
+			) THEN
+				Error("this attribute is available only as regular PHP code")
+				
+			END
+			****)
+			SWITCH sym DO
+
+			CASE sym_x_public:
+				IF x_visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				x_visibility_set = TRUE
+				x_visibility = public
+
+			CASE sym_x_protected:
+				IF x_visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				x_visibility_set = TRUE
+				x_visibility = protected
+
+			CASE sym_x_private:
+				IF x_visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				x_visibility_set = TRUE
+				x_visibility = private
+
+			CASE sym_x_abstract:
+				IF x_abstract THEN
+					Error("abstract attribute already set")
+				END
+				x_abstract = TRUE
+
+			CASE sym_x_final:
+				IF x_final THEN
+					Error("final attribute already set")
+				END
+				x_final = TRUE
+
+			CASE sym_x_static:
+				IF x_static THEN
+					Error("static attribute already set")
+				END
+				x_static = TRUE
+
+			CASE sym_abstract:
+				IF abstract THEN
+					Error("abstract attribute already set")
+				END
+				abstract = TRUE
+
+			CASE sym_public:
+				IF visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				visibility = public
+				visibility_set = TRUE
+
+			CASE sym_protected:
+				IF visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				visibility = protected
+				visibility_set = TRUE
+
+			CASE sym_private:
+				IF visibility_set THEN
+					Error("visibility attribute already set")
+				END
+				visibility = private
+				visibility_set = TRUE
+
+			CASE sym_static:
+				IF static THEN
+					Error("static attribute already set")
+				END
+				static = TRUE
+
+			CASE sym_final:
+				IF final THEN
+					Error("final attribute already set")
+				END
+				final = TRUE
+
+			ELSE
+				EXIT
+
+			END
+
+			ReadSym()
+		END
+
+		# Parses type:
+		t = ParseType(FALSE)
+		IF t = NIL THEN
+			IF pdb <> NIL THEN
+				IF pdb[var_type] <> NIL THEN
+					t = pdb[var_type]
+				ELSIF pdb[return] <> NIL THEN
+					t = pdb[return]
+				END
+			END
+		ELSE
+			IF (pdb <> NIL)
+			AND ((pdb[var_type] <> NIL) OR (pdb[return] <> NIL)) THEN
+				Error("type declaration both in DocBlock and PHPLint meta-code")
+			END
+		END
+
+		IF sym = sym_x_forward THEN
+			IF pdb <> NIL THEN
+				Error("unexpected DocBlock for forward declaration")
+			END
+			IF t <> NIL THEN
+				Error("unexpected type for forward declaration")
+			END
+			IF x_visibility_set OR x_abstract OR x_final OR x_static
+			OR abstract OR visibility_set OR static OR final THEN
+				Error("unexpected attribute for forward declaration")
+			END
+			Proto.ParseForwardDecl()
+
+		# Const (PHP5):
+		ELSIF sym = sym_const THEN
+			IF php_ver = php4 THEN
+				Error("invalid `const' declaration (PHP5)")
+			END
+			IF t <> NIL THEN
+				Error("explicit type declaration not allowed for class constant")
+			END
+			IF x_abstract OR x_final OR x_static
+			OR abstract OR visibility_set OR static OR final THEN
+				Error("invalid attribute. Only /*.public|protected|private.*/ is allowed for class constant.")
+			END
+			ParseClassConstDecl(x_visibility)
+
+		# Property (PHP4):
+		ELSIF sym = sym_var THEN
+			IF php_ver = php4 THEN
+				IF x_abstract OR x_final OR x_static
+				OR abstract OR visibility_set OR static OR final THEN
+					Error("invalid attribute. Only /*.public|protected|private.*/ are allowed for a property.")
+				END
+			ELSE
+				Error("invalid attribute `var' (PHP 4), use `public'")
+			END
+			ReadSym()
+			IF t = NIL THEN
+				t = ParseType(FALSE)
+			END
+			Expect(sym_variable, "expected property name $xxx")
+			IF x_visibility_set THEN
+				visibility = x_visibility
+			END
+			ParseClassPropertyDecl(visibility, x_static OR static, t)
+
+		# Property (PHP5):
+		ELSIF sym = sym_variable THEN
+			IF php_ver = php4 THEN
+				Error("missing `var' before property name")
+			ELSE
+				IF x_visibility_set OR x_abstract OR x_final OR x_static THEN
+					Error("cannot use meta-code or DocBlock to set visibility|abstract|final attributes, use proper language keywords")
+				ELSIF abstract OR final THEN
+					Error("properties cannot be abstract nor final")
+				ELSIF NOT visibility_set AND NOT static THEN
+					Error("property requires visibility attribute or static attribute")
+				END
+			END
+			ParseClassPropertyDecl(visibility, static, t)
+
+		# Method:
+		ELSIF sym = sym_function THEN
+			IF php_ver = php4 THEN
+				IF abstract OR visibility_set OR static OR final THEN
+					Error("invalid attribute. Only /*.abstract public|protected|private final static.*/ are allowed for a method.")
+				END
+				IF x_abstract AND NOT class[abstract] THEN
+					Error("abstract method in non-abstract class")
+					x_abstract = FALSE
+				END
+				ParseClassMethodDecl(x_abstract, x_visibility, x_static, x_final, t)
+			ELSE
+				IF x_visibility_set OR x_abstract OR x_static OR x_final THEN
+					Error("invalid meta-code or DocBlock visibility|abstract|static|final attribute, use proper language keywords")
+				END
+				IF abstract AND NOT class[abstract] THEN
+					Error("abstract method in non-abstract class")
+					abstract = FALSE
+				END
+				ParseClassMethodDecl(abstract, visibility, static, final, t)
+			END
+
+		ELSE
+			UnexpectedSymbol()
+		END
+
+	END
+
+	IF NOT class[abstract] THEN
+		CheckImplementedMethods(class)
+	END
+
+	FOR i = 0 TO count(class[methods])-1 DO
+		m = class[methods][i]
+		IF m[forward] THEN
+			Error2(here(), "missing method `" + m[name]
+				+ "()' declared forward in " + reference(m[decl_in]))
+		END
+	END
+
+	Template.MangleNamesOfSurrogateClasses(class, surrogates)
+
+	curr_class = NIL
+END
+
+
+FUNCTION ParseInterface(private_class: BOOLEAN)
+
+VAR
+	class, forward, if: Class
+	static: BOOLEAN
+	t: Type
+BEGIN
+	IF scope > 0 THEN
+		Warning("class declaration inside a function. The namespace of the classes is still global so the function cannot be called twice.")
+	END
+	IF php_ver = php4 THEN
+		Error("invalid keyword `interface' (PHP 5)")
+	END
+
+	(*
+		Check DocBlock. Only @access private allowed.
+	*)
+	DocBlockCheckAllowedLineTags(ACCESS_PRIVATE_TAG, "interface")
+	IF (pdb <> NIL) AND pdb[private] THEN
+		private_class = TRUE
+	END
+
+	class[private] = private_class
+	class[decl_in] = here()
+	class[interface] = TRUE
+	IF NOT report_unused THEN
+		class[used] = 100
+	END
+
+	(*
+		Class name:
+	*)
+	ReadSym()
+	Expect(sym_identifier, "expected class name")
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	forward = SearchClassByAbsName(s, FALSE)
+	IF forward <> NIL THEN
+		IF forward[forward] THEN
+			IF forward[private] AND NOT private_class
+			OR NOT forward[private] AND private_class THEN
+				Error("interface " + s + ": attribute `private' does not match the forward declaration in "
+				+ reference(forward[decl_in]))
+			END
+			class = forward
+			class[forward] = FALSE
+		ELSE
+			Error("class `" + s + "' already declared in "
+				+ reference(forward[decl_in]))
+		END
+	ELSE
+		(*
+			Store new class:
+		*)
+		class[name] = s
+		class[name_lower] = tolower(s)
+		class[type] = {object, void, NIL, class}
+		classes[] = class
+	END
+
+	curr_class = class
+	ReadSym()
+
+	(*
+		Extends?
+	*)
+	IF sym = sym_extends THEN
+		ReadSym()
+		LOOP
+			Expect(sym_identifier, "expected interface class name")
+			if = SearchClass(s)
+			IF if = NIL THEN
+				Error("undeclared interface class `" + s + "'")
+			ELSIF IsSubclassOf(if, class) THEN
+				Error("interface " + class[name] + " cannot extend interface "
+				+ if[name] + ": forbidden circular reference")
+			ELSIF NOT if[interface] THEN
+				Error("interface cannot extend non-interface class `" + s + "'")
+			ELSIF IsSubclassOf(class, if) THEN
+				Notice("interface " + class[name]
+				+ " redundantly extends interface "
+				+ if[name] + " -- ignoring")
+			ELSE
+				class[implements][] = if
+				AccountClass(if)
+				IF if[deprecated] > "" THEN
+					Warning("extending deprecated class `"
+					+ if[name] + "': " + if[deprecated])
+				END
+			END
+			ReadSym()
+			IF sym = sym_comma THEN
+				ReadSym()
+			ELSE
+				EXIT
+			END
+		END
+	END
+	Classes.CheckCollisionsBetweenExtendedAndImplementedClasses(class)
+
+	IF sym = sym_x_doc THEN
+		IF pdb <> NIL THEN
+			Error("mixing PhpDoc and DOC documenting style")
+			pdb = NIL
+		END
+		class[descr] = s
+		class[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+	ELSIF pdb <> NIL THEN
+		class[descr] = pdb[descr]
+		class[deprecated] = ExtractDeprecated(pdb[descr])
+		pdb = NIL
+	END
+
+	Expect(sym_lbrace, "expected '{' in class declaration")
+	ReadSym()
+	LOOP
+
+		IF sym = sym_rbrace THEN
+			ReadSym()
+			EXIT
+		END
+
+		static = FALSE
+
+		pdb = NIL
+		IF sym = sym_x_docBlock THEN
+			pdb = ParseDocBlock(s)
+			IF pdb <> NIL THEN
+				IF pdb[private] OR pdb[protected] OR pdb[public] THEN
+					Error("in DocBlock: visibility attributes not allowed in interface")
+				END
+				IF pdb[final] THEN
+					Error("in DocBlock: final attribute not allowed in interface")
+				END
+				IF pdb[static] THEN
+					Error("in DocBlock: static attribute not allowed, use proper language keyword `static' instead")
+				END
+			END
+			ReadSym()
+		END
+
+		IF sym = sym_const THEN
+			ParseClassConstDecl(public)
+
+		ELSE
+
+			(*
+				Attributes (only `public' and `static' allowed):
+			*)
+			static = FALSE
+			LOOP
+				IF sym = sym_public THEN
+					ReadSym()
+				ELSIF (sym = sym_protected) OR (sym = sym_private) THEN
+					Error("invalid visibility attribute for interface method. Abstract methods are always `public'.")
+					ReadSym()
+				ELSIF sym = sym_final THEN
+					Error("invalid `final' attribute for abstract method")
+					ReadSym()
+				ELSIF sym = sym_static THEN
+					static = TRUE
+					ReadSym()
+				ELSE
+					EXIT
+				END
+			END
+
+			(*
+				Type:
+			*)
+			IF pdb <> NIL THEN
+				t = pdb[return]
+			ELSE
+				t = ParseType(FALSE)
+			END
+
+			IF sym = sym_variable THEN
+				Fatal("properties cannot be defined in interfaces")
+			END
+
+			Expect(sym_function, "expected `function' declaration in interface class")
+			ParseClassMethodDecl(TRUE, public, static, FALSE, t)
+
+		END
+	END
+
+	curr_class = NIL
+END
+
+
+FUNCTION ParseStatic()
+VAR
+	r: Result
+	id: STRING
+	v: VARIABLE
+	t: Type
+BEGIN
+	IF scope = 0 THEN
+		Warning("static declaration at global scope has no effect")
+	END
+	ReadSym()
+
+	IF sym = sym_double_colon THEN
+		ReadSym()
+		IF php_ver = php4 THEN
+			Error("invalid `static::' (PHP 5)")
+		END
+		IF curr_class = NIL THEN
+			Fatal("invalid `static::': not inside a class")
+		ELSE
+			r = ParseClassStaticAccess(curr_class)
+			RETURN
+		END
+	END
+
+	t = ParseType(FALSE)
+
+	LOOP
+		Expect(sym_variable, "expected variable name in static declaration")
+		id = s
+
+		# Check if already exists in scope:
+		v = SearchVar(id)
+		IF (v <> NIL) AND (v[scope] = scope) THEN
+			Error("`static $" + id + "': variable already exists")
+		END
+
+		AccountVarLHS(id, FALSE)
+		v = SearchVar(id)
+
+		IF t <> NIL THEN
+			v[type] = t
+		END
+
+		ReadSym()
+		IF sym = sym_assign THEN
+			ReadSym()
+			r = ParseStaticExpr()
+			IF r = NIL THEN
+				#Warning("the type of the initial value of the variable "
+				#+ "cannot be determined")
+			END
+			IF r <> NIL THEN
+				IF t = NIL THEN
+					v = SearchVar(id)
+					v[type] = r[type]
+				ELSE
+					SWITCH LhsMatchRhs(t, r[type]) DO
+					CASE match_warn:
+						Warning("the type of the expression "
+						+ TypeToString(r[type]) + " does not match the "
+						+ "type of the variable `" + id + "' "
+						+ TypeToString(t))
+					CASE match_err:
+						Warning("the type of the expression "
+						+ TypeToString(r[type]) + " does not match the "
+						+ "type of the variable `" + id + "' "
+						+ TypeToString(t))
+					ELSE
+					END
+				END
+			END
+		ELSIF t = NIL THEN
+			Error("undefined type for static variable `$" + id
+			+ "'. Hint: you may"
+			+ " indicate an explicit type (example: `static /*.int.*/ $" + id + "')"
+			+ " or assign a default value (example: `static $" + id + "=123').")
+			v[type] = NIL
+		ELSE
+			IF LhsMatchRhs(t, null_type) <> match_good THEN
+				Error("static local variable $" + id + " of type " + TypeToString(t)
+				+ " requires an initial value, otherwise it would be initialized to the invalid value NULL at runtime (PHPLint restriction)")
+			END
+		END
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSIF sym = sym_semicolon THEN
+			EXIT
+		ELSE
+			Error("expected `=' or `,' or `;' in static declaration, found " + SymToName(sym))
+		END
+	END
+END
+
+
+FUNCTION ParseIf(): ExecutionPath
+VAR
+	r: Result
+	p, q, res: ExecutionPath
+	before, a, b: AssignedSet
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected '(' after `if'")
+	ReadSym()
+	r = ParseExpr()
+	Expect(sym_rround, "expected closing ')' after 'if' condition")
+	CheckBoolean("`if(EXPR)'", r)
+	ReadSym()
+
+	# Parse `then' branch:
+	before = GrabAssignedVars()
+	p = ParseBlock()
+
+	# Parse `else' or `elseif' branch:
+	IF (sym = sym_else) OR (sym = sym_elseif) THEN
+
+		IF p & next = 0 THEN
+			a = before
+		ELSE
+			a = GrabAssignedVars()
+		END
+		SetAssignedVars(before) # restore assigned set
+
+		IF sym = sym_elseif THEN
+			q = ParseIf()
+		ELSE
+			ReadSym()
+			q = ParseBlock()
+		END
+		IF q & next = 0 THEN
+			b = before
+		ELSE
+			b = GrabAssignedVars()
+		END
+
+		IF isTrue(r) THEN
+			SetAssignedVars(a)
+			res = p
+		ELSIF isFalse(r) THEN
+			SetAssignedVars(b)
+			res = q
+		ELSE # general case: non-static boolean expr
+			IF p & next = 0 THEN
+				SetAssignedVars(b)
+			ELSIF q & next = 0 THEN
+				SetAssignedVars(a)
+			ELSE
+				SetAssignedVars( IntersectAssignedVars(a, b) )
+			END
+			res = p | q
+		END
+	ELSE
+		IF isTrue(r) THEN
+			# keep current assigned vars.
+			res = p
+		ELSE
+			SetAssignedVars(before)
+			res = p | next
+		END
+	END
+
+	RETURN res
+END
+
+
+FUNCTION ParseDefine(private: BOOLEAN)
+VAR
+	name: STRING
+	r: Result
+	t: Type
+	c: CONSTANT
+	descr: STRING
+BEGIN
+
+	DocBlockCheckAllowedLineTags(ACCESS_PRIVATE_TAG, "define()")
+
+	ReadSym()
+	Expect(sym_lround, "missing '(' after 'define'")
+
+	(* parse name of the constant: *)
+	ReadSym()
+	r = ParseExprOfType(string_type)
+	IF r = NIL THEN
+		# bad expr
+	ELSIF r[value] = NIL THEN
+		Error("unable to parse the name of the constant as a value statically determined, will ignore")
+	ELSE
+		name = r[value]
+		IF NOT match(name, ID) THEN
+			Error("invalid characters in constant name `" + name + "'")
+		ELSIF SearchPhpKeyword(name) <> sym_unknown THEN
+			Error("constant name `" + name + "' is a keyword")
+		END
+	END
+
+	Expect(sym_comma, "expexted `,' in define()")
+	ReadSym()
+
+	(* parse value of the constant: *)
+	r = ParseExpr()
+	IF r = NIL THEN
+		#Warning("can't parse the value of the constant as a statically determinable value")
+	ELSE
+		t = r[type]
+		IF NOT ( (t = null_type) OR (t = boolean_type) OR (t = int_type) OR (t = float_type) OR (t = string_type) ) THEN
+			Error("invalid constant value of type " + TypeToString(t)
+			+ ". It must be boolean, int, float or string")
+		ELSIF r[value] = NIL THEN
+			Warning("can't parse the value of the constant as a statically determinable value")
+		END
+	END
+
+	IF name <> NIL THEN
+		c = AccountConstLHS(name, private, r)
+	END
+
+	IF sym = sym_comma THEN
+		ReadSym()
+		Error("will ignore third argument of define(): constants are always case-sensitive")
+		r = ParseExprOfType(boolean_type)
+	END
+
+	Expect(sym_rround, "expected closing ')' in 'define'")
+	ReadSym()
+
+	(*
+		The define() statement may be followed either by:
+
+		1. sym_semicolon and sym_x_doc
+		2. sym_semicolon but no sym_x_doc
+		3. sym_close_tag
+		4. sym_eof
+	*)
+
+	IF sym = sym_semicolon THEN
+		ReadSym()
+		IF sym = sym_x_doc THEN
+			descr = s
+			ReadSym()
+		END
+
+	ELSIF (sym = sym_close_tag) OR (sym = sym_eof) THEN
+		# OK
+
+	ELSE
+		# Unexpected symbol. Leave error to the caller.
+
+	END
+
+	(*
+		Evaluate DOC comment or DocBlock:
+	*)
+
+	IF descr <> NIL THEN
+		c[descr] = descr
+		c[deprecated] = ExtractDeprecated(descr)
+	ELSIF pdb <> NIL THEN
+		c[descr] = pdb[descr]
+		c[deprecated] = ExtractDeprecated(pdb[descr])
+		c[private] = (private OR pdb[private])
+		pdb = NIL
+	END
+	
+END
+
+
+FUNCTION ParseConst(private: BOOLEAN)
+VAR
+	name: STRING
+	r: Result
+	t: Type
+	c: CONSTANT
+BEGIN
+	IF php_ver = php4 THEN
+		Error("`const' keyword is reserved by PHP 5")
+	ELSIF scope > 0 THEN
+		Error("`const' declaration allowed only in classes and in global scope")
+	END
+
+	DocBlockCheckAllowedLineTags(ACCESS_PRIVATE_TAG, "const")
+
+	ReadSym()
+
+	LOOP
+
+		(* parse name of the constant: *)
+		Expect(sym_identifier, "expected name of the constant")
+		name = Namespace.CheckBareID(s)
+		name = Namespace.Absolute(name)
+		ReadSym()
+
+		Expect(sym_assign, "expected `='")
+		ReadSym()
+
+		(* parse value of the constant: *)
+		r = ParseStaticExpr()
+		IF r = NIL THEN
+			#Warning("can't parse the value of the constant as a statically determinable value")
+		ELSE
+			t = r[type]
+			IF NOT ( (t = null_type) OR (t = boolean_type) OR (t = int_type) OR (t = float_type) OR (t = string_type) ) THEN
+				Error("invalid constant value of type " + TypeToString(t)
+				+ ". It must be boolean, int, float or string")
+			ELSIF r[value] = NIL THEN
+				Warning("can't parse the value of the constant as a statically determinable value")
+			END
+		END
+
+		c = AccountConstLHS(name, private, r)
+
+		IF pdb <> NIL THEN
+			c[descr] = pdb[descr]
+			c[deprecated] = ExtractDeprecated(pdb[descr])
+			c[private] = (private OR pdb[private])
+		END
+
+		(*
+			The const statement may be followed either by:
+
+			0. sym_comma
+			1. sym_semicolon and sym_x_doc
+			2. sym_semicolon but no sym_x_doc
+			3. sym_close_tag
+			4. sym_eof
+		*)
+
+		IF sym = sym_comma THEN
+			ReadSym()
+
+		ELSIF sym = sym_semicolon THEN
+			ReadSym()
+			IF sym = sym_x_doc THEN
+				c[descr] = s
+				c[deprecated] = ExtractDeprecated(s)
+				ReadSym()
+			END
+			EXIT
+
+		ELSIF (sym = sym_close_tag) OR (sym = sym_eof) THEN
+			EXIT
+
+		ELSE
+			# Unexpected symbol. Leave error to the caller.
+			EXIT
+
+		END
+
+	END
+
+	pdb = NIL
+	
+END
+
+
+FUNCTION ParseDeclare(): ExecutionPath
+
+	FUNCTION ParseDirective()
+	VAR r: Result
+	BEGIN
+		IF sym <> sym_identifier THEN
+			Fatal("expected identifier")
+		END
+		IF (s <> "ticks") AND (s <> "encoding") THEN
+			Warning("unknown directive \"" + s + "\"")
+		END
+		ReadSym()
+
+		Expect(sym_assign, "expected `='")
+		ReadSym()
+
+		r = ParseStaticExpr()
+	END
+
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected `('")
+	ReadSym()
+	LOOP
+		ParseDirective()
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+	Expect(sym_rround, "expected `,' or `)'")
+	ReadSym()
+	RETURN ParseBlock()
+END
+
+
+FUNCTION readable(f: STRING): BOOLEAN
+VAR fd: FILE
+BEGIN
+	TRY io.Open(fd, f, "r")
+	CATCH SUCCESS:
+		TRY io.Close(fd) END
+		RETURN TRUE
+	ELSE
+		RETURN FALSE
+	END
+END
+
+
+FUNCTION AddPackageToIncludePath(p: STRING)
+(*
+	Adds the package name 'p' to the list of the packages that must be
+	reacheable through the include_path directive of the php.ini.
+*)
+VAR i: INTEGER
+BEGIN
+	FOR i=0 TO count(include_path)-1 DO
+		IF include_path[i] = p THEN
+			RETURN
+		END
+	END
+	include_path[] = p
+END
+
+
+FUNCTION SearchFileOnPaths(name: STRING, module: BOOLEAN): STRING
+(*
+	Returns the absolute, normalized pathfile of the module/package,
+	or NIL if not found
+*)
+VAR
+	n: STRING
+	a: ARRAY OF STRING
+	i: INTEGER
+BEGIN
+
+	IF NOT module THEN
+		# Search package in current dir.:
+		n = FileName.Absolute(NIL, name)
+		IF readable(n) THEN
+			RETURN n
+		END
+	END
+
+	IF NOT FileName.IsAbsolute(name) THEN
+		IF module THEN
+			a = modules_abs_path
+		ELSE
+			a = packages_abs_path
+		END
+		FOR i=0 TO count(a)-1 DO
+			n = FileName.Absolute(NIL, a[i] + "/" + name)
+			IF readable(n) THEN
+				IF NOT module THEN
+					AddPackageToIncludePath( Basename(name) )
+				END
+				RETURN n
+			END
+		END
+	END
+
+	IF module THEN
+		Error("module `" + name + "' not found")
+	ELSE
+		Error("package `" + name + "' not found")
+	END
+
+	RETURN NIL
+
+END
+
+
+FUNCTION SearchPackage(abs_pathfile: STRING): Package
+(*
+	Search package among already parsed packages.
+	Parameters:
+	abs_pathfile: absolute pathfile of the package.
+	Return: the package if found, NIL otherwise.
+*)
+VAR
+	i: INTEGER
+BEGIN
+	FOR i=0 TO count(required_packages)-1 DO
+		IF abs_pathfile = required_packages[i][fn] THEN
+			RETURN required_packages[i]
+		END
+	END
+	RETURN NIL
+END
+
+
+FUNCTION RequirePackage(pathfile: STRING, module: BOOLEAN)
+(*
+	Parses another PHP file from the context of the current file being parsed:
+
+	require_module 'xxxx';  (module=TRUE)
+	require_once 'xxxx';    (module=FALSE)
+	class autoloading performed by Search.SearchClass() (module=FALSE).
+
+	Current context is saved and then restored once the other package has been
+	parsed. Note that this function cannot be called directly from the main
+	program because in such case these is not a current context to save.
+*)
+VAR
+	abs_pathfile: STRING
+	sc: Scanner.Status
+	s_scope: INTEGER
+	s_loop_level: INTEGER
+	s_try_block_nesting_level: INTEGER
+	s_report_unused, s_print_source, s_print_notices: BOOLEAN
+	s_curr_package: Package
+	s_curr_func: Function
+	s_curr_class: Class
+	s_curr_method: Method
+	s_pdb: ParsedDocBlock
+	s_exceptions: ThrownExceptions
+	pdb_status: ParseDocBlock.Status
+	s: STRING
+	loaded_package: Package
+BEGIN
+	abs_pathfile = SearchFileOnPaths(pathfile, module)
+	IF abs_pathfile = NIL THEN
+		RETURN
+	END
+
+	IF SearchPackage(abs_pathfile) <> NIL THEN
+		RETURN
+	END
+
+	(* Save current parsing context and set a suitable one: *)
+	s_scope = scope   scope = 0
+	s_loop_level = loop_level  loop_level = 0
+	s_try_block_nesting_level = try_block_nesting_level  try_block_nesting_level = 0
+	s_pdb = pdb   pdb = NIL
+	pdb_status = ParseDocBlock.Suspend()
+	sc = Scanner.Suspend()
+	s_report_unused = report_unused
+	report_unused = FALSE
+	s_print_source = print_source
+	print_source = FALSE
+	s_print_notices = print_notices
+	print_notices = FALSE
+	s_curr_func = curr_func        curr_func = NIL
+	s_curr_class = curr_class      curr_class = NIL
+	s_curr_method = curr_method    curr_method = NIL
+	s_curr_package = curr_package  curr_package = NIL
+	s_exceptions = Globals.exceptions  Globals.exceptions = NIL
+
+$	Globals_curr_package = Statements_ParsePackage(Statements_abs_pathfile, Statements_module);
+	loaded_package = curr_package
+
+	(* Restore status: *)
+	Globals.exceptions = s_exceptions
+	curr_func = s_curr_func
+	curr_class = s_curr_class
+	curr_method = s_curr_method
+	curr_package = s_curr_package
+	report_unused = s_report_unused
+	print_source = s_print_source
+	print_notices = s_print_notices
+	try_block_nesting_level = s_try_block_nesting_level
+	loop_level = s_loop_level
+	scope = s_scope
+	Scanner.Resume(sc)
+	ParseDocBlock.Resume(pdb_status)
+	pdb = s_pdb
+
+	IF NOT loaded_package[library] THEN
+		Error("loaded package " + pathfile + " is not a library: "
+		+ loaded_package[why_not_library])
+	END
+
+	IF (loaded_package <> NIL) AND (loaded_package[deprecated] > "") THEN
+		IF module THEN
+			s = "module"
+		ELSE
+			s = "package"
+		END
+		Warning("using deprecated " + s + " " + abs_pathfile
+		+ ": " + loaded_package[deprecated])
+	END
+
+	IF module AND (pathfile = "spl") THEN
+		Classes.PreloadBuiltinSplClasses()
+	END
+END
+
+
+FUNCTION ParseRequireModule()
+(*
+	Parses the /*. require_module 'MODULE'; .*/ statement.
+*)
+BEGIN
+	IF scope > 0 THEN
+		Error("found `require_module' in scope level > 0")
+	END
+	ReadSym()
+	Expect(sym_x_single_quoted_string, "expected single quoted string after `require_module'")
+	IF NOT match(s, "^[a-zA-Z0-9_]+$") THEN
+		Error("require_module '" + s + "': module name contains invalid characters. Hint: only letters, digits and underscore allowed; path not allowed.")
+	ELSE
+		RequirePackage(s, TRUE)
+	END
+	ReadSym()
+	Expect(sym_x_semicolon, "missing `;'")
+	ReadSym()
+END
+
+
+FUNCTION ParseRequireOnce()
+(*
+	Parses the require_once 'PACKAGE'; statement. Normally this statement is
+	allowed only at scope level 0, but we must made an exception for the magic
+	function __autoload().
+*)
+VAR
+	autoload: BOOLEAN  # are we inside autoload()?
+	r: Result
+BEGIN
+	autoload = (curr_func <> NIL) AND (curr_func[name_lower] = "__autoload")
+	IF NOT autoload AND (scope > 0) THEN
+		Error("found `require_once' in scope level > 0")
+	END
+	ReadSym()
+
+	r = ParseExprOfType(string_type)
+	IF r = NIL THEN
+		# bad expr
+	ELSIF r[value] = NIL THEN
+		IF NOT autoload THEN
+			Error("require_once: can't check file name, value undetermined")
+		END
+	ELSIF length(r[value]) = 0 THEN
+		Error("require_once: empty file name")
+	ELSE
+		IF NOT FileName.IsAbsolute(r[value]) THEN
+			Error("file path \"" + r[value] + "\" must be absolute (PHPLint safety restriction). Hint: under PHP5 the magic constant __DIR__ gives the directory of the current source.")
+
+		(* Check if recursive inclusion with require_once() is allowed. If
+		   not, we cannot require_once() other packages from deep level 1,
+		   that is from a file passed from the command line. *)
+		ELSIF NOT recursive_parsing AND (recursion_level = 1) THEN
+			Error("cannot load package: recursive parsing disabled by --no-recursive option")
+		ELSE
+			RequirePackage(r[value], FALSE )
+		END
+	END
+END
+
+
+FUNCTION ParseInclude(n: STRING)
+VAR r: Result
+BEGIN
+	ReadSym()
+	r = ParseExprOfType(string_type)
+	IF r = NIL THEN
+		# bad expr
+	ELSIF r[value] = NIL THEN
+		Warning(n + ": can't check file name, value undetermined")
+	ELSIF length(r[value]) = 0 THEN
+		Error(n + ": empty file name")
+	ELSIF NOT FileName.IsAbsolute(r[value]) THEN
+		Warning(n + " \"" + r[value]
+		+ "\" uses relative pathfile, check `include_path' in php.ini. Hint: under PHP5 the magic constant __DIR__ gives the directory of the current source.")
+	ELSE
+		Notice(n + " \"" + r[value] + "\"")
+	END
+END
+
+
+FUNCTION ParseThrow()
+VAR
+	r: Result
+	t: Type
+	e: Class
+BEGIN
+	ReadSym()
+	r = ParseExpr()
+	IF r = NIL THEN
+		#Warning("can't determine the type of the expression")
+		RETURN
+	END
+	t = r[type]
+	IF t[basetype] = object THEN
+		IF t[class] = NIL THEN
+			#Error("the object isn't an extension of the Exception class")
+		ELSIF IsExceptionClass(t[class]) THEN
+			e = t[class]
+			ThrowExceptions({e})
+		ELSE
+			Error("the class `" + t[class][name]
+			+ "' isn't an extension of the `Exception' class")
+		END
+	ELSE
+		Error("expected an object, found " + TypeToString(t))
+	END
+
+	IF (scope = 0) AND (e <> NIL) THEN
+		CurrPackageNotLibrary("Uncaught exception " + e[name]
+		+ " in global scope in " + reference(here()) + ".")
+	END
+END
+
+
+FUNCTION ParseTry(): ExecutionPath
+VAR
+	try_location: WHERE
+	class: Class
+	v: VARIABLE
+	t: Type
+	saved_exceptions, thrown, caught: ThrownExceptions
+	res, p: ExecutionPath
+	before, after: AssignedSet
+	dummy_var_name: STRING
+
+VAR STATIC catch_nesting_level: INTEGER
+
+BEGIN
+	try_location = here()
+	ReadSym()
+	Expect(sym_lbrace, "expected `{' after try")
+
+	(* Prepare to collect exceptions thrown inside try{}: *)
+	inc(try_block_nesting_level, 1)
+	saved_exceptions = Globals.exceptions
+	Globals.exceptions = NIL  # here thrown exceptions will be collected
+
+	(* Parse try{} block: *)
+	before = GrabAssignedVars()
+	res = ParseBlock()
+	IF res & next = 0 THEN
+		after = before
+	ELSE
+		after = GrabAssignedVars()
+	END
+
+	(* Gets exceptions thrown inside try{}: *)
+	inc(try_block_nesting_level, -1)
+	thrown = Globals.exceptions
+	Globals.exceptions = saved_exceptions
+	#IF thrown = NIL THEN
+	#	Notice2(try_location, "no exception at all thrown inside this try{} block")
+	#END
+
+
+	(* Parses catch() branches: *)
+	Expect(sym_catch, "expected `catch'")
+	dummy_var_name = "catch#" + catch_nesting_level
+	inc(catch_nesting_level, 1)
+	REPEAT
+		ReadSym()
+
+		Expect(sym_lround, "expected `(' after `catch'")
+		ReadSym()
+
+		(*
+			Parse caught exception.
+		*)
+
+		Expect(sym_identifier, "expected exception name")
+		class = SearchClass(s)
+		IF class = NIL THEN
+			Error("undefined class `" + s + "'")
+		ELSIF IsExceptionClass(class) THEN
+			IF RemoveExceptionFromSet(class, thrown) THEN
+				AddExceptionToSet(class, caught)
+			ELSE
+				IF class[unchecked] THEN
+					IF IsSubclassOfSet(class, caught) THEN
+						Error("exception `" + s + "' already caught")
+					END
+				ELSE
+					Error("exception `" + s + "' not thrown or already caught")
+				END
+			END
+		ELSE
+			Error("the class `" + s + "' isn't an extension of the `Exception' class")
+		END
+		ReadSym()
+
+		(*
+			Parse cought exception variable.
+
+			We have a problem here: this variable is the only variable in
+			PHPLint that may change type dynamically:
+
+			try{}
+			catch(E1 $e){}  # $e of type E1
+			catch(E2 $e){}  # $e of type E2
+
+			Then:
+
+			1. $e cannot exist before try{}.
+			2. $e must be destroyed after the catch{} branch.
+
+			Variables cannot be easily destroyed because this would
+			invalidate all the existing AssignedSet, so we simply
+			change its name to an invalid name
+			"$catch#"+catch_nesting_level, the
+			try_block_nesting_level number accounts for possible
+			nested try/catch statements. This solution if quite
+			imperfect because:
+
+			a. Cought exception variables $e cannot be used outside
+			the catch() branches.
+
+			b. If the try/catch statement sppears in global scope,
+			then the documentation reports these dummy variables
+			$catch#1, etc. We mitigate this latter problem marking
+			these dummy variables as `private'.
+		*)
+
+		SetAssignedVars(before)
+		Expect(sym_variable, "expected variable name")
+		v = SearchVar(s)
+		IF v = NIL THEN
+			v = SearchVar(dummy_var_name)
+			IF v = NIL THEN
+				AccountVarLHS(dummy_var_name, FALSE)
+				v = SearchVar(dummy_var_name)
+			END
+		ELSE
+			Error("variable `$" + s + "' is already in use, it cannot be used in catch() branch (PHPLint restriction)")
+		END
+
+		(*
+			Assign properties to the variable.
+		*)
+
+		IF class = NIL THEN
+			t = NIL
+		ELSE
+			t = class[type]
+		END
+		v[name] = s  # Set actual name.
+		v[type] = t
+		v[private] = TRUE
+		v[decl_in] = here()
+		v[used] = 0
+		AccountVarLHS2(v)
+		ReadSym()
+
+		Expect(sym_rround, "expected `)'")
+		ReadSym()
+
+		Expect(sym_lbrace, "expected `{'")
+		p = ParseBlock()
+
+		(*
+			Checks the variable has been used.
+		*)
+		IF v[used] = 0 THEN
+			IF report_unused THEN
+				Notice2(v[decl_in], "caught exception variable `$" + v[name]
+					+ "' assigned but never used")
+			END
+			AccountVarRHS2(v)  # Avoids "unused variable $catch#1" messages
+		END
+
+		(*
+			Invalidate the variable.
+		*)
+		v[name] = dummy_var_name
+		v[type] = NIL
+
+		res = res | p
+		IF p & next <> 0 THEN
+			after = IntersectAssignedVars(after, GrabAssignedVars())
+		END
+
+	UNTIL sym <> sym_catch
+
+	inc(catch_nesting_level, -1)
+
+	(* Throw remaining uncaught exceptions as usual: *)
+	ThrowExceptions(thrown)
+
+	SetAssignedVars(after)
+
+	RETURN res
+END
+
+
+FUNCTION ParseEchoBlock()
+(* Parse <?= ... [;] ?> *)
+VAR r: Result  t: Type
+BEGIN
+	ReadSym()
+	LOOP
+		r = ParseExpr()
+		IF r = NIL THEN
+			#Warning("can't determine type of the argument of `<?= ... ?>'")
+		ELSE
+			t = r[type]
+			IF NOT ( (t = int_type) OR (t = float_type)
+			OR (t = string_type) ) THEN
+				Error("found " + TypeToString(t)
+				+ ". The arguments of the `<?= ... ?>' block must be of"
+				+ " type int, float or string.")
+			END
+		END
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSIF sym = sym_close_tag THEN
+			ReadSym()
+			RETURN
+		ELSIF sym = sym_eof THEN
+			RETURN
+		ELSIF sym = sym_semicolon THEN
+			Notice("useless `;' symbol")
+			ReadSym()
+			Expect(sym_close_tag, "missing closing tag")
+			ReadSym()
+			RETURN
+		ELSE
+			UnexpectedSymbol()
+		END
+	END
+END
+
+
+FUNCTION ParseTextBlock()
+(* Parse text_block = "?>" { text | echo_block } "<?"; *)
+BEGIN
+	ReadSym()
+	LOOP
+		IF sym = sym_text THEN
+			IF (scope = 0)
+			AND (s > "") AND NOT ((s = "\r\n") OR (s = "\n")) THEN
+				CurrPackageNotLibrary("Found text in " + reference(here())
+				+ ".")
+			END
+			ReadSym()
+		ELSIF sym = sym_open_tag_with_echo THEN
+			ParseEchoBlock()
+		ELSIF sym = sym_open_tag THEN
+			ReadSym()
+			RETURN
+		ELSE
+			UnexpectedSymbol()
+		END
+	END
+END
+
+
+FUNCTION ParseCodeBlock(): ExecutionPath
+(*
+	Parse <? ... ?>.
+*)
+VAR
+	res: ExecutionPath
+BEGIN
+	ReadSym()
+	res = next
+	LOOP
+		IF sym = sym_close_tag THEN
+			ReadSym()
+			RETURN res
+		ELSIF sym = sym_eof THEN
+			RETURN res
+		ELSE
+			IF res & next = 0 THEN
+				Error("unreachable statement")
+			END
+			res = (res & ~next) | ParseStatement()
+		END
+	END
+END
+
+
+FUNCTION ParserInit()
+
+	VAR
+		STATIC parser_init: BOOLEAN
+		here: WHERE
+		asm, ass: Type
+
+
+	FUNCTION addVar(s: STRING, t: Type)
+	(*
+		Add a superglobal variable.
+	*)
+	VAR v: VARIABLE
+	BEGIN
+		v[name] = s
+		v[decl_in] = here
+		v[scope] = -1
+		v[global] = TRUE
+		v[last_lhs] = here
+		v[used] = 100
+		v[assigned] = TRUE
+		v[type] = t
+		vars[vars_n] = v
+		inc(vars_n, 1)
+	END
+
+
+	FUNCTION addConst(name: STRING, type: Type)
+	(*
+		Add a magic constant.
+	*)
+	VAR c: CONSTANT
+	BEGIN
+		#c = AccountConstLHS(name, FALSE, {type, NIL})
+		c[name] = name
+		c[name_normalized] = name
+		c[private] = FALSE
+		c[decl_in] = here
+		c[used] = 100
+		c[last_rhs] = here
+		c[value] = {type, NIL}
+		consts[] = c
+	END
+
+
+BEGIN
+	IF parser_init THEN
+		RETURN
+	END
+	parser_init = TRUE
+
+	InitScanner()
+
+	(*
+		Types that do not have a variable part (i.e. all, with
+		the exception of the arrays and classes) are allocated
+		once for all:
+	*)
+	null_type = {null, void, NIL, NIL}
+	void_type = {void, void, NIL, NIL}
+	boolean_type = {boolean, void, NIL, NIL}
+	int_type = {int, void, NIL, NIL}
+	float_type = {float, void, NIL, NIL}
+	string_type = {string, void, NIL, NIL}
+	mixed_type = {mixed, void, NIL, NIL}
+	resource_type = {resource, void, NIL, NIL}
+	object_type = {object, void, NIL, NIL}
+
+	here = {"standard", 0}
+
+	(*
+		Magic constants that cannot be defined in regular PHP code
+		because their type is "resource" and not scalar:
+	*)
+	addConst("STDIN", resource_type)
+	addConst("STDOUT", resource_type)
+	addConst("STDERR", resource_type)
+
+	(*
+		Magic constants __XXX__ whose value must be resolved at parse time:
+	*)
+	addConst("__DIR__", string_type)
+	addConst("__CLASS__", string_type)
+	addConst("__FILE__", string_type)
+	addConst("__FUNCTION__", string_type)
+	addConst("__LINE__", int_type)
+	addConst("__METHOD__", string_type)
+	addConst("__NAMESPACE__", string_type)
+
+	(*
+		Superglobals:
+	*)
+	asm = {array, string, mixed_type, NIL}
+	ass = {array, string, string_type, NIL}
+	addVar("GLOBALS",  asm)
+	addVar("_SERVER",  ass)
+	addVar("_GET",     asm)
+	addVar("_POST",    asm)
+	addVar("_COOKIE",  asm)
+	addVar("_REQUEST", asm)
+	addVar("_FILES",   {array, string, asm, NIL})
+	addVar("_ENV",     ass)
+	addVar("_SESSION", asm)
+
+	addVar("php_errormsg", string_type)
+	# FIXME: actually $php_errormsg is a variable dynamically created
+	# into the current scope, not a super-global variable.
+
+END
+
+
+FUNCTION DetectBOM(s: STRING): STRING
+(*
+	If the beginning of the string contains an Unicode BOM sequence,
+	returns a description, otherwise return NIL.
+*)
+	VAR
+		STATIC patterns: ARRAY OF RECORD head, descr: STRING END
+		i: INTEGER
+BEGIN
+	IF patterns = NIL THEN
+		patterns = {
+			{ "\xfe\xff", "UTF-16 BE" },
+			{ "\xff\xfe", "UTF-16 LE" },
+			{ "\xef\xbb\xbf", "UTF-8" },
+			{ "\x00\x00\xfe\xff", "UTF-32 BE" },
+			{ "\xff\xfe\x00\x00", "UTF-32 LE" }
+		}
+	END
+
+	FOR i = 0 TO count(patterns)-1 DO
+		IF str.starts_with(s, patterns[i][head]) THEN
+			RETURN patterns[i][descr]
+		END
+	END
+
+	RETURN NIL
+END
+
+
+FUNCTION ParsePackage(abs_pathfile: STRING, module: BOOLEAN): Package
+
+	FUNCTION ShortLiteral(s: STRING): STRING
+	BEGIN
+		IF length(s) > 35 THEN
+			s = s[0,35] + "..."
+		END
+		RETURN StringToLiteral(s)
+	END
+
+VAR
+	package: Package
+	saved_cwd: STRING
+	code_found: BOOLEAN
+	i: INTEGER
+	f: Function
+	c: Class
+	res: ExecutionPath
+	bom: STRING
+BEGIN
+	package = SearchPackage(abs_pathfile)
+	IF package <> NIL THEN
+		RETURN package
+	END
+
+	IF NOT readable(abs_pathfile) THEN
+		Error2(NIL, "can't read `" + fmt_fn(abs_pathfile) + "': "
+		+ ERROR_MESSAGE)
+		RETURN NIL
+	END
+
+	TRY saved_cwd = GetCWD() END
+	TRY ChDir( Dirname(abs_pathfile) )
+	ELSE
+		Error("can't move to the dir. of " + abs_pathfile + ": "
+		+ ERROR_MESSAGE)
+		RETURN NIL
+	END
+	IF NOT Scanner.Open(abs_pathfile) THEN
+		TRY ChDir(saved_cwd) END
+		RETURN NIL
+	END
+
+	ParserInit()
+
+	inc(recursion_level, 1)
+
+	curr_package = NIL
+	curr_package[fn] = abs_pathfile
+	curr_package[module] = module
+	curr_package[library] = TRUE
+	# The other fields have default value:
+	#curr_package[used] = 0
+	#curr_package[descr] = NIL
+	#curr_package[deprecated] = NIL
+	#curr_package[namespace_current] = NIL
+	#curr_package[namespace_use] = NIL
+
+	required_packages[] = curr_package
+
+	IF sym = sym_text THEN
+		IF module THEN
+			CurrPackageNotLibrary("Found leading text in file before opening PHP tag: "
+			+ ShortLiteral(s) + ".")
+		ELSIF match(s, "^#!/[ -\xff]+\n$") THEN
+			CurrPackageNotLibrary("Unix CGI executable script detected: "
+			+ ShortLiteral(s) + ".")
+		ELSE
+			bom = DetectBOM(s)
+			IF bom = NIL THEN
+				CurrPackageNotLibrary("Bare textual content detected before PHP opening tag: "
+				+ ShortLiteral(s) + ".")
+			ELSE
+				CurrPackageNotLibrary("Unicode " + bom
+					+ " BOM sequence detected: " + ShortLiteral(s) + ".")
+				Error("unsupported Unicode " + bom
+					+ " BOM sequence detected: " + ShortLiteral(s) + ".")
+			END
+		END
+		ReadSym()
+	END
+
+	WHILE sym <> sym_eof DO
+		IF sym = sym_open_tag THEN
+			code_found = TRUE
+			res = ParseCodeBlock()
+			IF res & return <> 0 THEN
+				#Notice("found terminal statement in package: not a library")
+			END
+		ELSIF sym = sym_open_tag_with_echo THEN
+			code_found = TRUE
+			ParseEchoBlock()
+		ELSIF sym = sym_text THEN
+			CurrPackageNotLibrary("Bare textual content detected in "
+			+ reference(here()) + ".")
+			ReadSym()
+		ELSE
+			UnexpectedSymbol()
+		END
+	END
+	IF NOT code_found THEN
+		Warning("no PHP code found at all")
+	END
+
+	Namespace.ReportUnusedUseClauses()
+
+	(*
+		Check undefined function protos
+	*)
+
+	FOR i=0 TO count(funcs)-1 DO
+		f = funcs[i]
+		IF f[forward] AND (f[decl_in][fn] = abs_pathfile) THEN
+			Error2(here(), "missing function `" + f[name]
+				+ "()' declared forward in " + reference(f[decl_in]))
+		END
+	END
+
+	(*
+		Check undefined class protos
+	*)
+
+	FOR i=0 TO count(classes)-1 DO
+		c = classes[i]
+		IF c[forward] AND (c[decl_in][fn] = abs_pathfile) THEN
+			Error2(here(), "missing class `" + c[name]
+				+ "' declared forward in " + reference(c[decl_in]))
+		END
+	END
+
+	Scanner.Close()
+	TRY ChDir(saved_cwd) END
+
+	IF loop_level <> 0 THEN
+		error("phplint: INTERNAL ERROR: loop_level=" + loop_level + "\n")
+		exit(1)
+	END
+
+	inc(recursion_level, -1)
+	RETURN curr_package
+END
+
+
+FUNCTION ParsePragma()
+VAR
+	a: ARRAY OF STRING
+	where: WHERE
+BEGIN
+	where = Scanner.here()
+	# Retrieve all the arguments of the pragma:
+	ReadSym()
+	WHILE sym = sym_x_single_quoted_string DO
+		a[] = s
+		ReadSym()
+	END
+	IF count(a) = 0 THEN
+		Fatal("expected one or more pragma arguments in single quoted string")
+	END
+	Expect(sym_x_semicolon, "expected `;'")
+	ReadSym()
+
+	# Apply pragma:
+	IF a[0] = "autoload" THEN
+		IF (curr_func = NIL) OR (curr_func[name_lower] <> "__autoload") THEN
+			Error2(where, "autoload pragma allowed only inside __autoload() magic function")
+		END
+		IF count(a) = 1 THEN
+			Error2(where, "missing required arguments in autoload pragma")
+		ELSIF a[1] = "schema1" THEN
+			IF count(a) <> 5 THEN
+				Error2(where, "expected 5 arguments for pragma autoload, but " + count(a) + " found")
+				RETURN
+			END
+			IF autoload_prepend <> NIL THEN
+				Error2(where, "pragma already set before")
+				RETURN
+			END
+			IF recursive_parsing THEN
+				autoload_prepend = FileName.Absolute(NIL, a[2]) + "/"
+				autoload_separator = a[3]
+				autoload_append = a[4]
+			ELSE
+				Error("recursive parsing disabled by --no-recursive option")
+			END
+		ELSE
+			Error2(where, "undefined autoload schema: " + a[1])
+		END
+
+	ELSIF a[0] = "error_throws_exception" THEN
+		Errors.ParseErrorThrowsExceptionPragma(where, a)
+
+	ELSE
+		Error2(where, "unknown pragma: " + a[0])
+	END
+END
+
+
+VAR skip_else_php_ver: BOOLEAN
+
+
+FUNCTION ForwardParseStatement(): ExecutionPath
+(*
+	FIXME: sadly, M2 still lacks complete support for FORWARD decls,
+	so this is the actual ParseStatement() function. The ParseStatement()
+	defined above merely calls this one.
+*)
+
+
+	FUNCTION ParseSimpleStatementBeginningWithVar(private: BOOLEAN, t: Type)
+	(*
+		A "statement beginning with a variable can be many things,
+		but they are all managed by ParseExpr(). The only thing
+		we have to do here is handling meta-code and DocBlock,
+		gathering attributes and applying them to the variable.
+		
+		FIXME: unsatisfactory: assumes that if there is meta-code or
+		DocBlock the statement is a simple assignment $v = EXPR;
+		or $v[] = EXPR; or $v[]..[] = EXPR; but fails to detect
+		$undefVar->... (but an error is raised by ParseExpr()).
+		Forgot something?
+
+		private: the /*. private .*/ meta code was used
+		t<>NIL: the /*. TYPE .*/ meta code was used
+	*)
+	VAR
+		v: VARIABLE
+		r: Result
+		vn: STRING
+	BEGIN
+
+		IF (private OR (t <> NIL) OR (pdb <> NIL))
+		AND (s = "GLOBALS") THEN
+			Error("defining private attribute or type for $GLOBALS[] variables not supported (PHPLint limitation). Global variables can be declared in global scope in usual way `$varName = EXPR'.")
+		END
+
+		IF pdb <> NIL THEN
+			DocBlockCheckAllowedLineTags(GLOBAL_TAG|ACCESS_PRIVATE_TAG, "variable")
+			private = private OR pdb[private]
+
+			IF (pdb[var_type] <> NIL)
+			AND (pdb[var_type][basetype] <> array) THEN
+				t = pdb[global_type]
+			END
+
+			IF pdb[global_name] <> NIL THEN
+				IF s <> pdb[global_name] THEN
+					Error2(here(), "the name of the assigned variable `$"
+					+ s +"' does not match `$"
+					+ pdb[global_name] + "' as indicated in @global")
+				END
+				IF t = NIL THEN
+					t = pdb[global_type]
+				END
+				IF scope > 0 THEN
+					Error2(here(), "@global line in inner scope level, must be at global scope")
+				END
+			END
+
+		END
+
+		(*
+			Set private and type of the variable as given by
+			meta-code or DocBlock:
+		*)
+		IF private OR (t <> NIL) THEN
+			v = SearchVar(s)
+			IF v = NIL THEN
+				AccountVarLHS(s, private)
+				v = SearchVar(s)
+				v[type] = t
+				v[private] = private
+			END
+		END
+
+		vn = s
+		r = ParseExpr()
+		Expect(sym_semicolon, "expected `;'")
+		ReadSym()
+
+		(*
+			Apply meta-code and DOC to v:
+		*)
+		IF (sym = sym_x_doc) OR (pdb <> NIL) THEN
+			IF v = NIL THEN
+				v = SearchVar(vn)
+			END
+			IF v = NIL THEN
+				Error("can't apply documentation to unknown variable `$"
+				+ vn + "'")
+				
+			ELSIF sym = sym_x_doc THEN
+				v[descr] = s
+				v[deprecated] = ExtractDeprecated(s)
+				ReadSym()
+
+			ELSIF pdb <> NIL THEN
+				v[descr] = pdb[descr]
+				v[deprecated] = ExtractDeprecated(pdb[descr])
+			END
+			pdb = NIL
+		END
+
+	END
+
+
+	FUNCTION ParseGlobalStatement()
+	BEGIN
+		IF scope = 0 THEN
+			Warning("`global' declaration at global scope has no effect."
+			+ " Accounting variables as mixed type, and continuing anyway.")
+		END
+		ReadSym()
+		LOOP
+			Expect(sym_variable, "expected variable name in global declaration")
+			IF scope = 0 THEN  # erroneus 'global' at global scope:
+				AccountVarLHS(s, FALSE)
+			ELSE # regular accounting of global var:
+				AccountGlobalVar(s)
+			END
+			ReadSym()
+			IF sym = sym_comma THEN
+				ReadSym()
+			ELSE
+				EXIT
+			END
+		END
+	END
+
+
+	FUNCTION ParseStatementTerminator()
+	(*
+		Check statements be terminated by sym_semicolon, sym_close_tag
+		(aka "?>") or sym_eof. Gives error otherwise. sym_semicolon
+		gets discarded, the other symbols are retained.
+	*)
+	BEGIN
+		IF sym = sym_semicolon THEN
+			ReadSym()
+		ELSIF (sym = sym_close_tag) OR (sym = sym_eof) THEN
+			# OK
+		ELSE
+			Error("missing statement terminator `;' or `?>'")
+		END
+	END
+
+
+VAR
+	private: BOOLEAN
+	r: Result
+	t: Type
+	res: ExecutionPath
+
+BEGIN
+
+	SWITCH sym DO
+
+	CASE sym_lbrace:
+		RETURN ParseCompound()
+
+	CASE sym_namespace:
+		ParseNamespace()
+		RETURN next
+	
+	CASE sym_use:
+		ParseUse()
+		RETURN next
+	
+	CASE sym_x_require_module:
+		ParseRequireModule()
+		RETURN next
+
+	CASE sym_require_once:
+		ParseRequireOnce()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_require:
+		IF scope > 0 THEN
+			Warning("`require' inside a function. Suggest `require_once' instead")
+		END
+		ParseInclude("require")
+		ParseStatementTerminator()
+		RETURN next
+	
+	CASE sym_include:
+		IF scope > 0 THEN
+			Warning("include() inside a function. Suggest include_once() instead")
+		END
+		ParseInclude("include")
+		ParseStatementTerminator()
+		RETURN next
+	
+	CASE sym_include_once:
+		ParseInclude("include_once")
+		ParseStatementTerminator()
+		RETURN next
+	
+	CASE sym_x_doc:
+		IF scope > 0 THEN
+			Error("invalid scope for documentation")
+		END
+		curr_package[descr] = s
+		curr_package[deprecated] = ExtractDeprecated(s)
+		ReadSym()
+		RETURN next
+	
+	CASE sym_x_docBlock:
+		IF scope > 0 THEN
+			Error("invalid scope for documentation")
+		END
+		pdb = ParseDocBlock(s)
+		(*
+			Guess if DocBlock is bounded to package or item:
+		*)
+		IF (pdb <> NIL) AND pdb[package_tag_found] THEN
+			# This pdb is a package description:
+			DocBlockCheckAllowedLineTags(PACKAGE_TAG, "package")
+			curr_package[descr] = pdb[descr]
+			curr_package[deprecated] = ExtractDeprecated(pdb[descr])
+			pdb = NIL
+		ELSE
+			# This pdb (if present) is an item description.
+		END
+		ReadSym()
+		RETURN next
+
+	CASE sym_x_forward:
+		IF pdb <> NIL THEN
+			Error("unexpected DocBlock for forward declaration")
+		END
+		Proto.ParseForwardDecl()
+		RETURN next
+	
+	CASE sym_x_pragma:
+		ParsePragma()
+		RETURN next
+
+	CASE sym_x_if_php_ver_4:
+		IF php_ver = php4 THEN
+			skip_else_php_ver = TRUE
+			ReadSym()
+		ELSE
+			skip_else_php_ver = FALSE
+			LOOP
+				ReadSym()
+				SWITCH sym DO
+
+				CASE sym_x_else:
+					ReadSym()
+					EXIT
+
+				CASE sym_x_end_if_php_ver:
+					ReadSym()
+					EXIT
+
+				CASE sym_eof:
+					Fatal("premature end of the file. Expected closing of `if_php_ver_4'.")
+
+				ELSE
+
+				END
+			END
+		END
+		RETURN next
+	
+	CASE sym_x_if_php_ver_5:
+		IF php_ver = php5 THEN
+			skip_else_php_ver = TRUE
+			ReadSym()
+		ELSE
+			skip_else_php_ver = FALSE
+			LOOP
+				ReadSym()
+				SWITCH sym DO
+
+				CASE sym_x_else:
+					ReadSym()
+					EXIT
+
+				CASE sym_x_end_if_php_ver:
+					ReadSym()
+					EXIT
+
+				CASE sym_eof:
+					Fatal("premature end of the file. Expected closing of `if_php_ver_5'.")
+
+				ELSE
+
+				END
+			END
+		END
+		RETURN next
+
+	CASE sym_x_else:
+		IF skip_else_php_ver THEN
+			skip_else_php_ver = FALSE
+			REPEAT ReadSym()
+			UNTIL (sym = sym_x_end_if_php_ver) OR (sym = sym_eof)
+			IF sym = sym_x_end_if_php_ver THEN
+				ReadSym()
+			ELSE
+				Fatal("missing closing `end_if_php_ver'")
+			END
+		ELSE
+			ReadSym()
+		END
+		RETURN next
+
+	CASE sym_x_end_if_php_ver:
+		ReadSym()
+		RETURN next
+	
+	CASE sym_define:
+		ParseDefine(FALSE)
+		RETURN next
+	
+	CASE sym_const:
+		ParseConst(FALSE)
+		RETURN next
+
+	CASE sym_declare:
+		RETURN ParseDeclare()
+
+	CASE sym_static:
+		ParseStatic()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_global:
+		ParseGlobalStatement()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_echo:
+		ParseEcho()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_trigger_error:
+		ParseTriggerError()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_identifier, sym_at, sym_list, sym_print, sym_self,
+		sym_parent, sym_lround, sym_incr, sym_decr, sym_new, sym_isset:
+		r = ParseExpr()
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_exit:
+		ParseExit()
+		ParseStatementTerminator()
+		RETURN return
+
+	CASE sym_variable:
+		ParseSimpleStatementBeginningWithVar(FALSE, NIL)
+		RETURN next
+
+	CASE sym_if:
+		RETURN ParseIf()
+
+	CASE sym_for:
+		RETURN ParseFor()
+
+	CASE sym_foreach:
+		RETURN ParseForeach()
+
+	CASE sym_switch:
+		RETURN ParseSwitch()
+
+	CASE sym_break:
+		ParseBreak()
+		ParseStatementTerminator()
+		RETURN break
+
+	CASE sym_class, sym_x_abstract, sym_x_final, sym_abstract, sym_final, sym_x_unchecked:
+		ParseClass(FALSE)
+		RETURN next
+
+	CASE sym_interface:
+		ParseInterface(FALSE)
+		RETURN next
+
+	CASE sym_while:
+		RETURN ParseWhile()
+
+	CASE sym_do:
+		res = ParseDo()
+		ParseStatementTerminator()
+		RETURN res
+
+	CASE sym_continue:
+		ParseContinue()
+		ParseStatementTerminator()
+		RETURN continue
+
+	CASE sym_return:
+		ParseReturn()
+		ParseStatementTerminator()
+		RETURN return
+
+	CASE sym_semicolon:
+		# Empty statement.
+		ParseStatementTerminator()
+		RETURN next
+
+	CASE sym_function:
+		ParseFuncDecl(FALSE, NIL)
+		RETURN next
+
+	CASE sym_x_void, sym_x_boolean, sym_x_int, sym_x_float,
+	sym_x_string, sym_x_array, sym_x_mixed,
+	sym_x_resource, sym_x_object, sym_x_identifier,
+	sym_x_private:
+		IF sym = sym_x_private THEN
+			private = TRUE
+			ReadSym()
+		END
+		IF sym = sym_define THEN
+			ParseDefine(private)
+			RETURN next
+		ELSIF sym = sym_const THEN
+			ParseConst(private)
+			RETURN next
+		ELSIF (sym = sym_class) OR (sym = sym_abstract)
+		OR (sym = sym_final) THEN
+			ParseClass(private)
+			RETURN next
+		ELSIF sym = sym_interface THEN
+			ParseInterface(TRUE)
+			RETURN next
+		END
+		t = ParseType(FALSE)
+		IF sym = sym_variable THEN
+			ParseSimpleStatementBeginningWithVar(private, t)
+			RETURN next
+		ELSIF sym = sym_function THEN
+			ParseFuncDecl(private, t)
+			RETURN next
+		ELSE
+			Fatal("expected variable or `function' after type")
+		END
+
+	CASE sym_throw:
+		ParseThrow()
+		ParseStatementTerminator()
+		RETURN return
+
+	CASE sym_try:
+		RETURN ParseTry()
+
+	CASE sym_close_tag:
+		ParseTextBlock()
+		RETURN next
+	
+	CASE sym_goto:
+		Error("goto: unimplemented statement -- trying to continue anyway")
+		ReadSym()
+		Expect(sym_identifier, "expected identifier after `goto'")
+		ReadSym()
+		Expect(sym_semicolon, "expected `;'")
+		ReadSym()
+		RETURN return
+	
+	ELSE
+		UnexpectedSymbol()
+	END
+
+	IF FALSE AND (ForwardParseStatement() = 0) THEN
+		# Dummy call to this otherwise M2 complains "never used" function
+	END
+END
+
+
+END

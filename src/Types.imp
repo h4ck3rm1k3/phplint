@@ -1,0 +1,137 @@
+IMPLEMENTATION MODULE Types
+
+
+FUNCTION TypeToString(t: Type): STRING
+VAR
+	x: STRING
+BEGIN
+	IF t = NIL THEN
+		RETURN "unknown"
+	END
+
+	SWITCH t[basetype] DO
+	CASE null: RETURN "null"
+	CASE void: RETURN "void"
+	CASE boolean: RETURN "boolean"
+	CASE int: RETURN "int"
+	CASE float: RETURN "float"
+	CASE string: RETURN "string"
+
+	CASE array:
+		REPEAT
+			SWITCH t[index_type] DO
+			CASE void:   x = x + "[unknown]"
+			CASE int:    x = x + "[int]"
+			CASE string: x = x + "[string]"
+			CASE mixed:  x = x + "[]"
+			END
+			t = t[elem_type]
+		UNTIL (t = NIL) OR (t[basetype] <> array)
+		RETURN TypeToString(t) + x
+
+	CASE mixed: RETURN "mixed"
+	CASE resource: RETURN "resource"
+	CASE object:
+		IF t[class] = NIL THEN
+			RETURN "object"
+		ELSE
+			RETURN t[class][name]
+		END
+	END
+END
+
+
+FUNCTION SameType(a: Type, b: Type): BOOLEAN
+BEGIN
+	IF (a = NIL) OR (b = NIL) OR (a[basetype] <> b[basetype]) THEN
+		RETURN FALSE
+	END
+	IF a[basetype] = array THEN
+		RETURN (a[index_type] = b[index_type])
+			AND SameType(a[elem_type], b[elem_type])
+	ELSIF a[basetype] = object THEN
+		RETURN a[class] = b[class]
+	ELSE
+		RETURN TRUE
+	END
+END
+
+
+FUNCTION FunctionSignatureToString(s: SIGNATURE): STRING
+VAR
+	t: STRING
+	i: INTEGER
+	a: FormalArg
+BEGIN
+	t = TypeToString(s[return])
+	IF s[reference] THEN
+		t = t + " &"
+	END
+	t = t + "("
+
+	# Mandatory args:
+	FOR i=0 TO s[mandatory]-1 DO
+		a = s[args][i]
+		IF i > 0 THEN
+			t = t + ", "
+		END
+		IF a[reference_return] THEN
+			t = t + "return "
+		END
+		t = t + TypeToString(a[type])
+		IF a[reference] THEN
+			t = t + " &"
+		END
+	END
+
+	# Optional args:
+	IF s[mandatory] < count(s[args]) THEN
+		IF s[mandatory] > 0 THEN
+			t = t + " ["
+		ELSE
+			t = t + "["
+		END
+		FOR i=s[mandatory] TO count(s[args])-1 DO
+			a = s[args][i]
+			IF i > 0 THEN
+				t = t + ", "
+			END
+			IF a[reference_return] THEN
+				t = t + "return "
+			END
+			t = t + TypeToString(a[type])
+			IF a[reference] THEN
+				t = t + " &"
+			END
+		END
+		t = t + "]"
+	END
+
+	IF s[more_args] THEN
+		IF count(s[args]) > 0 THEN
+			t = t + ", "
+		END
+		t = t + "..."
+	END
+	t = t + ")"
+	RETURN t
+END
+
+
+FUNCTION MethodSignatureToString(m: Method): STRING
+VAR s: STRING
+BEGIN
+	SWITCH m[visibility] DO
+	CASE public: s = "public"
+	CASE protected: s = "protected"
+	CASE private: s = "private"
+	END
+	#IF m[abstract] THEN s = s + " abstract" END
+	IF m[final]    THEN s = s + " final"    END
+	IF m[static]   THEN s = s + " static"   END
+	s = s + " " + FunctionSignatureToString(m[sign])
+	RETURN s
+END
+
+
+END

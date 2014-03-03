@@ -1,0 +1,301 @@
+IMPLEMENTATION MODULE FileName
+
+IMPORT m2, io, str
+
+
+VAR
+	initialized: BOOLEAN
+	WIN: BOOLEAN
+
+
+FUNCTION init()
+BEGIN
+	IF initialized THEN
+		RETURN
+	END
+	initialized = TRUE
+$#if defined(_WIN32)
+$	FileName_WIN = 1;
+$#else
+$	FileName_WIN = 0;
+$#endif
+END
+
+
+FUNCTION SetTargetOS(windows: BOOLEAN)
+BEGIN
+	init()
+	WIN = windows
+END
+
+
+FUNCTION slash_convert(p: STRING): STRING
+BEGIN
+	RETURN substitute(p, "\\", "/")
+END
+
+
+FUNCTION IsAbsolute(f: STRING): BOOLEAN
+BEGIN
+	init()
+	IF WIN THEN
+		f = slash_convert(f)
+		RETURN match(f, "^[a-zA-Z]:$") OR match(f, "^[a-zA-Z]:/") OR match(f, "^//")
+	ELSE
+		(* Unix, Linux *)
+		RETURN (f > "") AND (f[0] = "/")
+	END
+END
+
+
+FUNCTION Normalize(f: STRING): STRING
+(*
+	Once the non-empty string f has been splitted at each "/", the resulting
+	array is a sequence of the symbols e,c,u,w where:
+
+	^ = beginnig of the sequence
+	e = ""    (empty)
+	c = "."   (current dir.)
+	u = ".."  (go up)
+	w = "any string different from those above"  (word, or sorta of)
+	$ = end of the sequence
+
+	For example:
+	A        becomes  ^w$
+	/        becomes  ^ee$
+	/A/B     becomes  ^eww$
+	./A      becomes  ^cw$
+	../../A  becomes  ^uuw$
+
+	Note that:
+	- absolute paths always begin with ^e.
+	- the symbol c can be ignored.
+	- ^eu reduces to ^e.
+	- wu can be dropped.
+*)
+VAR
+	a, b: ARRAY OF STRING
+	i, j: INTEGER
+	w: STRING
+	abs: BOOLEAN
+	drive: STRING
+BEGIN
+	init()
+	IF f <= "" THEN
+		HALT("path is NIL or empty")
+	END
+
+	(* On WIN, exclude drive reference from normalization: *)
+	IF WIN THEN
+		f = slash_convert(f)
+		IF match(f, "^[a-zA-Z]:") THEN (* "X:/a/b" *)
+			drive = f[0,2]
+			f = f[2,length(f)]
+		ELSIF match(f, "^//") THEN  (* UNC path: "//host/a/b" *)
+			i = find(f[2,length(f)], "/")
+			IF i > 0 THEN
+				drive = f[0, 2 + i]
+				f = f[2 + i, length(f)]
+			ELSE
+				drive = ""
+			END
+		ELSE
+			drive = ""
+		END
+	ELSE
+		drive = ""
+	END
+
+	a = split(f, "/")
+	j = 0
+	FOR i=0 TO count(a)-1 DO
+		w = a[i]
+		IF w = "" THEN  # found "e"
+			IF i = 0 THEN
+				# found ^e: that's an abs path
+				abs = TRUE
+			END
+		ELSIF w = "." THEN  # found "c"
+			# ignore
+		ELSIF w = ".." THEN  # found "u"
+			IF j = 0 THEN
+				IF abs THEN
+					# ignore because ^eu = ^e
+				ELSE
+					b[0] = ".."
+					j = 1
+				END
+			ELSIF b[j-1] = ".." THEN
+				b[j] = ".."
+				j = j+1
+			ELSE
+				# found wu: drop
+				j = j-1
+			END
+		ELSE  # found "w"
+			b[j] = w
+			j = j+1
+		END
+	END
+	IF j = 0 THEN
+		IF abs THEN
+			RETURN drive + "/"
+		ELSE
+			RETURN "."
+		END
+	ELSE
+		IF abs THEN
+			f = "/" + b[0]
+		ELSE
+			f= b[0]
+		END
+		FOR i=1 TO j-1 DO
+			f = f + "/" + b[i]
+		END
+	END
+	RETURN drive + f
+END
+
+
+FUNCTION Dirname(f: STRING): STRING
+VAR i: INTEGER
+BEGIN
+	init()
+	IF WIN THEN
+		f = slash_convert(f)
+	END
+
+	FOR i=length(f)-1 TO 0 BY -1 DO
+		IF f[i] = "/" THEN
+			IF i = 0 THEN
+				RETURN "/"
+			ELSE
+				RETURN f[0,i]
+			END
+		END
+	END
+	RETURN "."
+END
+
+
+FUNCTION Basename(f: STRING): STRING
+VAR i: INTEGER
+BEGIN
+	init()
+	IF WIN THEN
+		f = slash_convert(f)
+	END
+
+	IF f = "/" THEN
+		RETURN "/"
+	END
+	FOR i=length(f)-1 TO 0 BY -1 DO
+		IF f[i] = "/" THEN
+			RETURN f[i+1,length(f)]
+		END
+	END
+	RETURN f
+END
+
+
+FUNCTION Absolute(cwd: STRING, f: STRING): STRING
+(*
+	IMPLEMENTATION NOTE: realpath() would be faster, but it would not
+	preserve symbolic links.
+*)
+BEGIN
+	init()
+	IF WIN THEN
+		cwd = slash_convert(cwd)
+		f = slash_convert(f)
+	END
+
+	IF f <= "" THEN
+		HALT("empty path")
+	END
+
+	IF NOT IsAbsolute(f) THEN
+		IF cwd = NIL THEN
+			TRY cwd = GetCWD() END
+		END
+		cwd = slash_convert(cwd)
+		f = cwd + "/" + f
+	END
+
+	RETURN Normalize(f)
+END
+
+
+FUNCTION Relative(a: STRING, b: STRING): STRING
+VAR
+	i, j: INTEGER
+	c: STRING
+BEGIN
+	init()
+	IF WIN THEN
+		a = slash_convert(a)
+		b = slash_convert(b)
+	END
+
+	# Looks for the common base directory a[0,j] = b[0,j]:
+	j = -1
+	i = 0
+	LOOP
+		IF i = length(a) THEN
+			IF (i = length(b)) OR (b[i] = "/") THEN
+				j = i
+			END
+			EXIT
+		ELSIF i = length(b) THEN
+			IF a[i] = "/" THEN
+				j = i
+			END
+			EXIT
+		ELSIF a[i] = b[i] THEN
+			IF a[i] = "/" THEN
+				j = i
+			END
+			inc(i, 1)
+		ELSE
+			EXIT
+		END
+	END
+	IF j = -1 THEN
+		RETURN b
+	END
+	IF j = length(b) THEN
+		RETURN Basename(b)
+	END
+
+	# Add so many "../" as required from b to the common base dir.:
+	i = j + 1
+	c = ""
+	WHILE i < length(a) DO
+		IF a[i] = "/" THEN
+			c = c + "../"
+		END
+		inc(i, 1)
+	END
+
+	RETURN c + b[j+1,length(b)]
+END
+
+
+FUNCTION DropExtension(f: STRING): STRING
+VAR i: INTEGER
+BEGIN
+	init()
+	IF WIN THEN
+		f = slash_convert(f)
+	END
+	FOR i = length(f)-1 TO 0 BY -1 DO
+		IF f[i] = "." THEN
+			RETURN f[0,i]
+		ELSIF f[i] = "/" THEN
+			RETURN f
+		END
+	END
+	RETURN f
+END
+
+END

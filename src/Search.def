@@ -1,0 +1,125 @@
+DEFINITION MODULE Search
+(*
+	Basic search routines. The name of the item we are looking for can be
+	either absolute (ex.: a/b/f) or relative to the current namespace as
+	indicated in curr_package global variable, so for any type of item we
+	provide two specific functions SearcXxxByAbsName() and SearchXxx().
+*)
+
+IMPORT Types
+
+FUNCTION NormalizeConstName(name: STRING): STRING
+(*
+	Normalize the namespace path part of a constant name for faster
+	constant search. The name can be fully qualified, qualified or a
+	bare identifier. Return a qualified or bare identifier.
+	Since constants are case-sensitive, the namespace part is rendered
+	in lower-case letters, while the proper name of the constant is
+	left untouched. Example:
+	NormalizeConstName("N") ==> "N"
+	NormalizeConstName("a\\B\\c\\N") ==> "a\\b\\c\N"
+*)
+
+FUNCTION SearchConstByAbsName(name: STRING, warn: BOOLEAN): CONSTANT
+(*
+	Search a constant by absolute name.
+	If warn=TRUE, warns if the name is found but the namespace does not
+	match exactly in upper/lower-case letters the declaration.
+*)
+
+FUNCTION SearchConst(name: STRING, warn: BOOLEAN): CONSTANT
+(*
+	Search a constant by absolute or relative name.
+	If warn=TRUE, warns if the name is found but the namespace does not
+	match exactly in upper/lower-case letters the declaration.
+*)
+
+FUNCTION SearchVarInScope(name: STRING, scope: INTEGER): VARIABLE
+(*
+	Search the var. NAME inside the given SCOPE.
+	Return NIL if not found.
+*)
+
+FUNCTION SearchVar(name: STRING): VARIABLE
+(*
+	Search the var. NAME inside the current scope and then between the
+	superglobals (scope = 0).
+	Return NIL if not found.
+*)
+
+FUNCTION SearchFuncLower(name_lower: STRING): Function
+(*
+	Search a function between the declared, prototypes and guessed
+	functions.
+	Parameters:
+	name_lower: name of the function, in lower-case letters.
+	Return: The function, or NIL if not found.
+*)
+
+FUNCTION SearchFuncByAbsName(name: STRING, warn: BOOLEAN): Function
+(*
+	Search a function between the declared, prototypes and guessed
+	functions.
+	Parameters:
+	name: name of the function, case-insensitive, absolute.
+	warn: warning if the function is found but the name does not match
+		exactly in upper/lower-case letters.
+*)
+
+FUNCTION SearchFunc(name: STRING, warn: BOOLEAN): Function
+(*
+	Search a function between the declared, prototypes and guessed
+	functions.
+	Parameters:
+	name: name of the function, case-insensitive, absolute or relative.
+	warn: warning if the function is found but the name does not match
+		exactly in upper/lower-case letters.
+*)
+
+FUNCTION SearchClassByAbsName(name: STRING, warn: BOOLEAN): Class
+(*
+	Search the class between existing classes.
+
+	Parameters:
+	name: absolute name of the class, without leading \.
+	warn: if TRUE, warns if the the class is already defined but with a name
+		that differs in upper/lower-cases.
+	
+	Return: the found class, or NIL if not found.
+*)
+
+FUNCTION SearchClass(name: STRING): Class
+(*
+	Search the class between existing classes; if not found, also try
+	autoloading. Warns if the the class is already defined but with a name that
+	differs in upper/lower-cases.
+
+	Parameters:
+	name: name of the class as it appears in the source, possibly fully,
+		qualified, qualified or unqualified.
+	
+	Return: the found class, or NIL if not found.
+*)
+
+FUNCTION SearchClassProperty(class: Class, id: STRING,
+	VAR P: Class, VAR p: Property)
+
+FUNCTION SearchClassMethod(class: Class, name: STRING, warn: BOOLEAN): Method
+(*
+	Search the method NAME inside the class CLASS. WARN if already defined/
+	guessed with a name that differ for upper-/lower-case letters.
+	ATTENTION: does not scans inherited methods; see also
+	Class.ResolveClassMethod() if you want to search also between inherited
+	methods.
+*)
+
+FUNCTION ResolveClassConst(class: Class, id: STRING,
+	VAR res_class: Class, VAR res_const: ClassConst)
+(*
+	Resolve the class constant ID searcing inside the class CLASS and in all
+	the parent classes extended and implemented, in this order. Returns the
+	resolved class/const, or both NIL if not found. Only the first match
+	is returned.
+*)
+
+END

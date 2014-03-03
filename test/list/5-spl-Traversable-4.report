@@ -1,0 +1,29 @@
+
+BEGIN parsing of 5-spl-Traversable-4.php
+1:	<?php
+2:	
+3:		/*. require_module 'spl'; .*/
+4:	
+5:		class Test implements Iterator, IteratorAggregate {
+
+		class Test implements Iterator, IteratorAggregate {
+	                                                       \_ HERE
+==== 5: ERROR: can't implement both `Iterator' and `IteratorAggregate'
+6:	
+7:			/*. mixed .*/ function current() { return NULL; }
+8:			/*. mixed .*/ function key() { return NULL; }
+9:			/*. void  .*/ function next() {}
+10:			/*. void  .*/ function rewind() {}
+11:			/*. bool  .*/ function valid() { return FALSE; }
+12:	
+13:			/*. Traversable .*/ function getIterator() { return NULL; }
+14:	
+15:		}
+16:	
+END parsing of 5-spl-Traversable-4.php
+==== 5-spl-Traversable-4.php:5: notice: unused class `Test'
+==== ?: notice: required module `spl'
+==== ?: notice: required module `simplexml'
+==== ?: notice: required module `dom'
+==== ?: notice: required module `standard'
+Overall test results: 1 errors, 0 warnings.

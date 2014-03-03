@@ -1,0 +1,26 @@
+DEFINITION MODULE Documentator
+
+IMPORT Types
+
+FUNCTION Init()
+
+FUNCTION ParseParameter(i: INTEGER, args: ARRAY OF STRING): INTEGER
+
+FUNCTION Generate(
+	php_ver: PHP_VERSION,
+	fn: STRING,
+	package_descr: STRING,
+	required_packages: ARRAY OF Package,
+	include_path: ARRAY OF STRING,
+	consts: ARRAY OF CONSTANT,
+	vars: ARRAY OF VARIABLE,
+	funcs: ARRAY OF Function,
+	classes: ARRAY OF Class)
+
+FUNCTION ExtractDeprecated(descr: STRING): STRING
+(*
+	Collects all the <@deprecated> tags in a linear string suitable
+	to be used in a warning message.
+*)
+
+END

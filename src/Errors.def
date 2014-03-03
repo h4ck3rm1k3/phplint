@@ -1,0 +1,76 @@
+DEFINITION MODULE Errors
+(*
+	PHP errors: mapping between codes and names and other utils.
+*)
+
+IMPORT Types
+
+FUNCTION NameToCode(name: STRING): INTEGER
+(*
+	Return the error code corresponding to the given error name.
+	Return -1 if the name is unknown.
+	Example: NameToCode("E_USER_ERROR") => 256.
+*)
+
+FUNCTION CodeToName(code: INTEGER): STRING
+(*
+	Return the name corresponding to the given error code.
+	Return NIL if the code does not correspond to a known error.
+	Example: CodeToName(256) => "E_USER_ERROR".
+*)
+
+FUNCTION ErrorsSetToNames(set: INTEGER): ARRAY OF STRING
+(*
+	Return the error set as a list of errors names. If set = 0, return NIL.
+	Unknown bit masks are returned as a dummy error "FIXME_UNKNOWN_ERROR_x"
+	where x is the remaining mask of bits.
+	Example: ErrorsSetToNames(E_USER_ERROR | E_USER_WARNING)
+	=> {"E_USER_ERROR", "E_USER_WARNING"}.
+*)
+
+FUNCTION ErrorsSetToString(set: INTEGER): STRING
+(*
+	Return the error set as a string of error names. If err = 0 return NIL.
+	Unknown bit masks are returned as a dummy error "FIXME_UNKNOWN_ERROR_x"
+	where x is the remaining mask of bits.
+	Example: ErrorsSetToString(E_USER_ERROR | E_USER_WARNING)
+	=> "E_USER_ERROR, E_USER_WARNING".
+*)
+
+FUNCTION IsUserError(code: INTEGER): BOOLEAN
+(*
+	Return TRUE if 'code' can be used in user's code. Return FALSE in any
+	other case, or on invalid error code.
+*)
+
+FUNCTION RaiseErrors(set: INTEGER)
+(*
+	Accounts for errors raised considering also possibly the error silencer "@"
+	and the errors mapping into exceptions. Unhandled errors raised in global
+	scope marks the current package as non suitable as library.
+*)
+
+FUNCTION ParseErrorThrowsExceptionPragma(where: WHERE, a: ARRAY OF STRING)
+(*
+	Parse the 'error_throws_exception' pragma. Sets the exception into
+	which errors are converted, so that the RaiseError() function can
+	account errors and exceptions properly.
+
+	Parameters:
+	where: location of the pragma.
+	a: arguments of the pragma, a[0] being "error_throws_exception".
+*)
+
+FUNCTION EnteringSilencer()
+(*
+	Call this entering a portion of code "silenced" by @.
+	Obviously, every call to this function must be balanced by another
+	call to the ExitingSilencer() function.
+*)
+
+FUNCTION ExitingSilencer()
+(*
+	Call this exiting from a portion of code "silenced" by @.
+*)
+
+END

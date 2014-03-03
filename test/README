@@ -1,0 +1,53 @@
+Test list for PHPLint
+---------------------
+
+This is the "poor-man" test suite of PHPLint.
+
+
+
+run-tests
+=========
+
+This script scan for the PHP source files inside the list/ directory, generates
+a PHPLint report, then compares the result with the old report.
+
+If differences are found, diffs are shown and then asks the user in order to
+confirm, reject or repeat the test.
+
+If a new source file gets found, the report is generated then displays the
+report and asks for confirmation.
+
+The same script work as a "batch" job if the "batch" argument is provided, then
+it exits with an error status (1) if differences were found. Normally it should
+be invoked with "make test" from the base directory of the package.
+
+Use tkdiff if available, otherwise use diff in side-by-side layout. Use
+mousepad as editor if available, otherwise "less".
+
+
+tkdiff is Copyright(C) 1998 by Dean S. Jones
+http://www.gallant.com/icons.htm
+
+mousepad is Copyright(C) 2005-2006 by Erik Harrison
+Commonly available along the Xfce desktop environment.
+
+
+list/
+=====
+
+This dir. contains some test sources that are read by run-tests.
+
+Every source file name MUST have the structure
+
+4-*.php  (PHP 4 specific test)
+5-*.php  (PHP 5 specific test)
+
+Since PHP 4 is mostly a subset of PHP 5, PHP 5 tests are also good PHP 4 tests.
+
+For every n-*.php the run-tests script will generate the corresponding
+n-*.report file containing the stdout+stderr of the PHPLint output.
+
+To add new tests, simply add the source to this directory following the
+naming scheme detailed here, then launch run-test.
+
+That's all!

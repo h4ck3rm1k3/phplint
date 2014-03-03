@@ -1,0 +1,94 @@
+DEFINITION MODULE ParseDocBlock
+
+(*
+	Parser of the phpDocumentor comments.
+*)
+
+IMPORT Types
+
+TYPE
+	Parameter = RECORD
+		name: STRING
+		type: Type
+		reference: BOOLEAN
+		descr: STRING
+		used: BOOLEAN
+	END
+
+	ParsedDocBlock = RECORD
+
+		package_tag_found: BOOLEAN
+		(* the docBlock contains @package? *)
+
+		descr: STRING
+		(* here all the @package, @author, @version, etc. converted
+		from PhpDoc* to PHPLint Documentator tags *)
+
+		global_type: Type
+		global_name: STRING
+		(* @global TYPE NAME *)
+
+		var_type: Type
+		(* @var type *)
+
+		abstract, private, protected, public, final, static: BOOLEAN
+
+		return: Type
+		(* @return type *)
+
+		params: ARRAY OF Parameter
+		(* @param type name *)
+
+		exceptions: ThrownExceptions
+		(* @throws exceptions *)
+
+		thrown_exceptions_descr: ARRAY OF ThrownExceptionDescr
+		(* descriptions for thrown exceptions that have a non-empty description *)
+
+	END
+
+	Status = FORWARD
+	(*
+		Since this module is not reentrant, we save in a variable of this
+		type the current status, that is all the private global variables of
+		the module. In practice, this is required to support autoloading
+		which may be triggered resolving classes and methods in DocBlocks.
+		Se also the functions Suspend() and Resume().
+	*)
+
+VAR
+	parse_phpdoc: BOOLEAN
+	(* enable parsing of DocBlocks *)
+
+FUNCTION ParseDocBlock(docBlock: STRING): ParsedDocBlock
+(*
+	Parses a docBlock comment /** ... */ and returns
+	the list of defined parameters, possibly NIL if none found.
+*)
+
+
+FUNCTION SearchParam(pdb: ParsedDocBlock, name: STRING): Parameter
+(*
+	Returns the @param named `name'
+*)
+
+FUNCTION ReportUnusedParams(pdb: ParsedDocBlock)
+(*
+	Checks and reports unused parameters, ths is parameters declared in
+	DocBlock but not in the actual PHP code. If pdb = NIL does nothing.
+*)
+
+FUNCTION Suspend(): Status
+(*
+	Returns the status of the module. This is required when autoloading is
+	triggered. Also sets the global variable pdb (current DocBlock) to NIL.
+*)
+
+FUNCTION Resume(status: Status)
+(*
+	Restores the status of the module. This is required returning from the
+	autoloading. If the status is NIL, simply resets the global variable pdb to
+	NIL.
+*)
+
+END

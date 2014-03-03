@@ -1,0 +1,28 @@
+
+BEGIN parsing of 5-namespace-example-7.php
+1:	<?php
+2:	# Accessing global classes, functions and constants from within a namespace
+3:	/*. require_module 'standard'; .*/
+4:	namespace Foo;
+5:	
+6:	/*. string .*/ function strlen(/*. string .*/ $s) { return $s; }
+7:	const INI_ALL = "my new constant";
+8:	class Exception {}
+9:	
+10:	$a = \strlen('hi'); // calls global function strlen
+11:	$b = \INI_ALL; // accesses global constant INI_ALL
+12:	$c = new \Exception('error'); // instantiates global class Exception
+13:	
+14:	$d = strlen('xx');
+15:	$e = INI_ALL;
+16:	$f = new Exception();
+17:	?>
+END parsing of 5-namespace-example-7.php
+==== 5-namespace-example-7.php:16: notice: variable `$f' assigned but never used
+==== 5-namespace-example-7.php:15: notice: variable `$e' assigned but never used
+==== 5-namespace-example-7.php:14: notice: variable `$d' assigned but never used
+==== 5-namespace-example-7.php:12: notice: variable `$c' assigned but never used
+==== 5-namespace-example-7.php:11: notice: variable `$b' assigned but never used
+==== 5-namespace-example-7.php:10: notice: variable `$a' assigned but never used
+==== ?: notice: required module `standard'
+Overall test results: 0 errors, 0 warnings.

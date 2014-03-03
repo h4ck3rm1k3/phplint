@@ -1,0 +1,1811 @@
+IMPLEMENTATION MODULE Documentator
+
+IMPORT m2, str, io, Classes, Errors, Scanner, Types, buffer, FileName
+
+CONST
+	HSPACE = "&nbsp;&nbsp;&nbsp;&nbsp;"
+	VSPACE = "<P>\n"
+	BIG_VSPACE = "<PRE>\n\n</PRE>\n"
+
+VAR
+
+	(*
+		Options parsed by ParseParameter():
+	*)
+
+	generate: BOOLEAN
+	(* generate the documentation *)
+
+	extension: STRING
+	(* the extension for the generated HTML file - def. ".html" *)
+
+	page_header, page_footer: STRING
+	(* header and footer for the HTML page generated *)
+
+	ref_remap: ARRAY OF STRING
+	(* Reference remapping: ref_remap[i] is the target, ref_remap[i+1] is
+	   the substitution - see RefMap() *)
+
+
+	(*
+		The arguments passed to Generate() are available to all
+		the functions of this module as global variables:
+	*)
+	php_ver: PHP_VERSION
+	fn: STRING
+	(* the source we have just parsed, for ex. "MyProg.php" *)
+	package_descr: STRING
+	required_packages: ARRAY OF Package
+	include_path: ARRAY OF STRING
+	consts: ARRAY OF CONSTANT
+	vars: ARRAY OF VARIABLE
+	funcs: ARRAY OF Function
+	classes: ARRAY OF Class
+
+	fd: FILE
+	(* the HTML document being generated, for ex. "MyProg"+extension *)
+
+	fn_remapped: STRING
+	(* fn remapped by RefMap() and with the new extension,
+	   for ex. "MyProg"+extension *)
+
+	curr_class: Class
+	(* the class currently being documented - NIL=not inside a class *)
+
+
+	(*
+		Parsed <@...> tags by the last run of DocDescr():
+	*)
+
+	package, version, copyright, license, authors, since, deprecated,
+		see: STRING
+
+
+	(*
+		Internal state:
+	*)
+
+	prev_item_big_vspace: BOOLEAN
+	(* the last item printed required a big v-space *)
+
+	private_items: STRING
+
+
+FUNCTION DocError(msg: STRING)
+BEGIN
+	Scanner.Error2({fn, 0}, msg)
+END
+
+
+FUNCTION p(s: STRING)
+BEGIN
+	TRY fd->Write(s) END
+END
+
+
+FUNCTION is_space(c: STRING): BOOLEAN
+BEGIN
+	RETURN (c = " ") OR (c = "\t") OR (c = "\n") OR (c = "\r")
+END
+
+
+FUNCTION Anchor(url: STRING, text: STRING): STRING
+BEGIN
+	RETURN "<a href=\"" + url + "\"><code>" + text + "</code></a>"
+END
+
+
+FUNCTION RefMap(f: STRING): STRING
+(*
+	Apply the ref_remap[] mappings to the file name f.
+	The elements of ref_remap[] of even index are the targets, and
+	the odd elements are the substitutions. If a target match the
+	beginning of "f", then the substitution is applied.  For example,
+	if ref_remap={"abcd", "AB"} then RefMap("abcdefg") would give
+	"ABefg".
+*)
+VAR
+	t: STRING
+	i: INTEGER
+BEGIN
+	FOR i=0 TO count(ref_remap)-1 BY 2 DO
+		t = ref_remap[i]
+		IF (length(t) <= length(f)) AND (f[0,length(t)] = t) THEN
+			RETURN ref_remap[i+1] + f[length(t),length(f)]
+		END
+	END
+	RETURN f
+END
+
+
+FUNCTION ItemToUrl(t: STRING): STRING
+(*
+	Returns the URL of the target item t. t must be one of these forms:
+
+	const
+	$var
+	func(xxxx)
+	class
+	class::const
+	class::$var
+	class::func(xxxx)
+
+	Checks if the given item exits. On error send a message to
+	stdout and returns "#".
+*)
+
+	FUNCTION err(msg: STRING): STRING
+	BEGIN
+		DocError("<@item " + t + ">: " + msg + "\n")
+		RETURN "#"
+	END
+
+
+	FUNCTION SearchConst(n: STRING): CONSTANT
+	VAR i: INTEGER
+	BEGIN
+		FOR i=0 TO count(consts)-1 DO
+			IF consts[i][name] = n THEN
+				RETURN consts[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchVar(n: STRING): VARIABLE
+	VAR i: INTEGER
+	BEGIN
+		FOR i=0 TO count(vars)-1 DO
+			IF (vars[i] <> NIL) AND (vars[i][name] = n) THEN
+				RETURN vars[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchFunc(n: STRING): Function
+	VAR i: INTEGER
+	BEGIN
+		FOR i=0 TO count(funcs)-1 DO
+			IF funcs[i][name] = n THEN
+				RETURN funcs[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchClass(n: STRING): Class
+	VAR i: INTEGER
+	BEGIN
+		FOR i=0 TO count(classes)-1 DO
+			IF classes[i][name] = n THEN
+				RETURN classes[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchClassConst(cl: Class, n: STRING): ClassConst
+	VAR i: INTEGER  consts: ARRAY OF ClassConst
+	BEGIN
+		consts = cl[consts]
+		FOR i=0 TO count(consts)-1 DO
+			IF consts[i][name] = n THEN
+				RETURN consts[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchClassVar(cl: Class, n: STRING): Property
+	VAR i: INTEGER  p: ARRAY OF Property
+	BEGIN
+		p = cl[properties]
+		FOR i=0 TO count(p)-1 DO
+			IF p[i][name] = n THEN
+				RETURN p[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION SearchClassFunc(cl: Class, n: STRING): Method
+	VAR i: INTEGER  m: ARRAY OF Method
+	BEGIN
+		m = cl[methods]
+		FOR i=0 TO count(m)-1 DO
+			IF m[i][name] = n THEN
+				RETURN m[i]
+			END
+		END
+		RETURN NIL
+	END
+
+
+	FUNCTION report(decl_in: WHERE): STRING
+	VAR i: INTEGER
+	BEGIN
+		IF decl_in = NIL THEN
+			RETURN err("not declared / not assigned")
+		END
+		i = find(t, "(")
+		IF i >= 0 THEN
+			t = t[0,i] + "()"
+		END
+		t = substitute(t, "\\", "/")
+		IF decl_in[fn] = fn THEN
+			RETURN "#" + t
+		ELSE
+			RETURN Relative(fn_remapped,
+				RefMap( DropExtension(decl_in[fn]) + extension + "#" + t ) )
+		END
+	END
+
+VAR
+	n: STRING
+	j: INTEGER
+	tlen: INTEGER
+	c: CONSTANT
+	v: VARIABLE
+	f: Function
+	cl: Class
+	cl_c: ClassConst
+
+BEGIN
+	tlen = length(t)
+	IF tlen = 0 THEN
+		RETURN err("empty target")
+	END
+
+	IF t[0] = "$" THEN
+		v = SearchVar(t[1,tlen])
+		IF v = NIL THEN
+			RETURN err("variable not found in global scope")
+		ELSE
+			RETURN report(v[decl_in])
+		END
+	END
+
+	j = find(t, "::")
+	IF j >= 0 THEN
+
+		(* Determinate the class cl: *)
+		IF j = 0 THEN
+			IF curr_class = NIL THEN
+				DocError("missing class name")
+				cl = NIL
+			ELSE
+				cl = curr_class
+				t = cl[name] + t
+				j = length(cl[name])
+				tlen = length(t)
+			END
+		ELSE
+			cl = SearchClass(t[0,j])
+		END
+		IF cl = NIL THEN
+			RETURN err("class not found")
+		END
+
+		(* Determinate the class member: *)
+
+		n = t[j+2,tlen]
+
+		IF (length(n) >= 1) AND (n[0] = "$") THEN
+			IF SearchClassVar(cl, n[1,length(n)]) = NIL THEN
+				RETURN err("property not found")
+			ELSE
+				RETURN report(cl[decl_in])
+			END
+		END
+
+		IF (length(n) >= 2) AND (n[length(n)-1] = ")") THEN
+			j = find(n, "(")
+			IF j < 0 THEN
+				RETURN err("missing ( in method name")
+			END
+			IF SearchClassFunc(cl, n[0,j]) = NIL THEN
+				RETURN err("method not found")
+			ELSE
+				RETURN report(cl[decl_in])
+			END
+		END
+
+		cl_c = SearchClassConst(cl, n)
+		IF cl_c <> NIL THEN
+			RETURN report(cl_c[decl_in])
+		END
+
+		RETURN err("class constant not found")
+	END
+
+	IF (tlen > 2) AND (t[tlen-1] = ")") THEN
+		j = find(t, "(")
+		IF j < 0 THEN
+			RETURN err("missing ( in function name")
+		END
+		f = SearchFunc(t[0,j])
+		IF f = NIL THEN
+			RETURN err("function not found")
+		END
+		RETURN report(f[decl_in])
+	END
+
+	cl = SearchClass(t)
+	IF cl <> NIL THEN
+		RETURN report(cl[decl_in])
+	END
+
+	c = SearchConst(t)
+	IF c <> NIL THEN
+		RETURN report(c[decl_in])
+	END
+
+	RETURN err("constant / class not found")
+END
+
+
+FUNCTION AnchorToClass(c: Class)
+VAR name: STRING
+BEGIN
+	name = c[name]
+	IF c[private] THEN
+		DocError("the class " + name + " is private and cannot be referenced")
+		p( name )
+	ELSE
+		p( Anchor( ItemToUrl( name ), name ) )
+	END
+END
+
+
+FUNCTION ResolveTag(tag: STRING, arg: STRING): STRING
+VAR s: STRING
+BEGIN
+	IF tag = "package" THEN
+		package = arg
+	ELSIF tag = "version" THEN
+		version = arg
+	ELSIF tag = "copyright" THEN
+		copyright = arg
+	ELSIF tag = "license" THEN
+		license = arg
+	ELSIF tag = "author" THEN
+		IF length(authors) = 0 THEN
+			authors = arg
+		ELSE
+			authors = authors + ", " + arg
+		END
+	ELSIF tag = "since" THEN
+		since = arg
+	ELSIF tag = "item" THEN
+		RETURN Anchor(ItemToUrl(arg), arg)
+	ELSIF tag = "deprecated" THEN
+		deprecated = arg
+	ELSIF tag = "see" THEN
+		s = Anchor(ItemToUrl(arg), arg)
+		IF length(see) = 0 THEN
+			see = s
+		ELSE
+			see = see + ", " + s
+		END
+	ELSE
+		DocError("undefined tag <@" + tag + ">")
+	END
+	RETURN ""
+END
+
+
+FUNCTION ResolveTags(s: STRING): STRING
+(*
+	Search and substitute the <@tag [arg]>.
+*)
+VAR
+	i: INTEGER
+	tag, arg, r: STRING
+	l: INTEGER # no. of nested <...> in arg
+	recursive_tags: BOOLEAN
+BEGIN
+	REPEAT
+		i = find(s, "<@")
+		IF i < 0 THEN
+			RETURN r + s
+		END
+		r = r + s[0,i]
+		inc(i, 2)
+
+		(* Skip spaces: *)
+		WHILE (i < length(s)) AND is_space(s[i]) DO
+			inc(i, 1)
+		END
+
+		(* Sets the tag: *)
+		tag = NIL 
+		WHILE (i < length(s)) AND NOT is_space(s[i]) AND (s[i] <> ">") DO
+			tag = tag + s[i]
+			inc(i, 1)
+		END
+
+		(* Skip spaces: *)
+		WHILE (i < length(s)) AND is_space(s[i]) DO
+			inc(i, 1)
+		END
+
+		(* Sets the arg: *)
+		arg = NIL
+		recursive_tags = FALSE
+		l = 0
+		WHILE (i < length(s)) AND ( (l > 0) OR (s[i] <> ">") ) DO
+			arg = arg + s[i]
+			IF s[i] = "<" THEN
+				recursive_tags = TRUE
+				inc(l, 1)
+			END
+			IF s[i] = ">" THEN
+				inc(l, -1)
+			END
+			inc(i, 1)
+		END
+
+		(* Skip spaces: *)
+		WHILE (i < length(s)) AND is_space(s[i]) DO
+			inc(i, 1)
+		END
+
+		IF (i = length(s)) OR (s[i] <> ">") THEN
+			DocError("missing closing > IN <@" + tag + "...>\n")
+		ELSE
+			inc(i, 1)
+		END
+
+		IF recursive_tags THEN
+			arg = ResolveTags(arg)
+		END
+
+		r = r + ResolveTag(tag, arg)
+		s = s[i,length(s)]
+	UNTIL length(s) = 0
+	RETURN r
+END
+
+
+FUNCTION trim(s: STRING): STRING
+VAR i, j, len: INTEGER
+BEGIN
+	len = length(s)
+	IF len = 0 THEN
+		RETURN NIL
+	END
+
+	i = 0
+	WHILE (i < len) AND is_space(s[i]) DO
+		inc(i, 1)
+	END
+
+	j = len-1
+	WHILE (j >= i) AND is_space(s[i]) DO
+		inc(j, -1)
+	END
+
+	RETURN s[i,j+1]
+END
+
+
+FUNCTION VSpaceBeforeItem(big: BOOLEAN)
+BEGIN
+	IF prev_item_big_vspace THEN
+		RETURN
+	ELSIF big THEN
+		p(BIG_VSPACE)
+	ELSE
+		p(VSPACE)
+	END
+END
+
+
+FUNCTION VSpaceAfterItem(big: BOOLEAN)
+BEGIN
+	IF big THEN
+		p(BIG_VSPACE)
+	END
+	prev_item_big_vspace = big
+END
+
+
+FUNCTION ItemAnchor(s: STRING)
+BEGIN
+	p("\n<A name=\"" + substitute(s, "\\", "/") + "\"></A>\n")
+END
+
+
+FUNCTION DocString(s: STRING)
+(*
+	Print to stdout the string s as a literal PHP string encoded as HTML.
+
+	FIXME: ASCII "extended" chars are not encoded. Actually, this program
+	is completely unaware of the encoding of the resulting output.
+*)
+
+	FUNCTION hex(h: INTEGER): STRING
+	BEGIN
+		IF h < 10 THEN
+			RETURN CHR( ASC("0") + h )
+		ELSE
+			RETURN CHR( ASC("A") + h - 10 )
+		END
+	END
+
+VAR
+	c: STRING
+	i, ch: INTEGER
+BEGIN
+	IF s = "NULL" THEN
+		# FIXME: mostly an hack: it might be a valid string
+		p("NULL")
+		RETURN
+	END
+	p("\"")
+	FOR i=0 TO length(s)-1 DO
+		c = s[i]
+		ch = ASC(c)
+		#p("[" + ch + "]")
+		IF (ch <= 31) OR (ch >= 127) THEN
+			IF    ch = 10 THEN p("\\n")
+			ELSIF ch = 13 THEN p("\\r")
+			ELSIF ch =  9 THEN p("\\t")
+			ELSE
+				p("\\x")
+				p( hex(ch DIV 16) )
+				p( hex(ch MOD 16) )
+			END
+
+		ELSIF c = " " THEN p("&nbsp;")
+		ELSIF c = "\\" THEN p("\\\\")
+		ELSIF c = "\"" THEN p("\\\"")
+		ELSIF c = "&" THEN p("&amp;")
+		ELSIF c = "<" THEN p("&lt;")
+		ELSIF c = ">" THEN p("&gt;")
+		ELSE p(c)
+		END
+	END
+	p("\"")
+END
+
+
+FUNCTION DocValue(t: Type, v: STRING)
+BEGIN
+	IF t = NIL THEN
+		p("<I>FIXME_UNKNOWN_TYPE</I>")
+		RETURN
+	END
+	IF v = NIL THEN
+		p("<I>FIXME_UNKNOWN_VALUE</I>")
+		RETURN
+	END
+	IF t[basetype] = string THEN
+		IF v = "NIL" THEN
+			p("NULL")
+			# FIXME: ambiguous guess: NULL and "NULL" both give NULL
+		ELSE
+			DocString(v)
+		END
+	ELSIF t[basetype] = null THEN
+		p("NULL")
+	ELSE
+		p(v)
+	END
+END
+
+
+FUNCTION sort(a: ARRAY OF STRING)
+VAR
+	i, j: INTEGER
+	t: STRING
+BEGIN
+	FOR i=0 TO count(a)-2 DO
+		FOR j=i+1 TO count(a)-1 DO
+			IF a[j] > a[i] THEN
+				t = a[j]    a[j] = a[i]    a[i] = t
+			END
+		END
+	END
+END
+
+
+VAR
+	descr: BUFFER
+
+
+FUNCTION DocDescr(pkg_descr: BOOLEAN, s: STRING)
+(*
+	pkg_descr: is it the top-level description?
+	s: contents of the /*. DOC ... .*/
+
+	Resolve special tags <@xxx>. Write to fd the results, properly
+	formatted.
+*)
+VAR
+	i: INTEGER
+	short, long: STRING
+	path: STRING
+	pkg: Package
+	none: BOOLEAN
+BEGIN
+	(*
+		Most of the items are not commented:
+	*)
+	IF NOT pkg_descr AND (s = NIL) THEN
+		RETURN
+	END
+
+	(* Sets initial state of the description: *)
+	package = NIL
+	version = NIL
+	copyright = NIL
+	license = NIL
+	authors = NIL
+	since = NIL
+	deprecated = NIL
+	see = NIL
+
+	(*
+		Extract the short and the long description, resolving
+		the special tags <@xxx>:
+	*)
+	i = find(s, "\n")
+	IF i < 0 THEN
+		short = ResolveTags( trim(s) )
+		long = ""
+	ELSE
+		short = ResolveTags( trim(s[0,i]) )
+		long = ResolveTags( trim(s[i+1,length(s)]) )
+	END
+
+	(*
+		Build the formatted description:
+	*)
+
+	descr->Empty()
+
+	IF pkg_descr THEN
+		IF package = NIL THEN
+			package = DropExtension( Basename(fn) )
+		END
+		descr->AddString("<H1>" + package + "</H1>\n")
+	ELSE
+		# FIXME: forbid <@package>
+	END
+
+	IF short > "" THEN
+		descr->AddString("<P><b>" + short + "</b></P>")
+	END
+
+	IF version <> NIL THEN
+		descr->AddString("<P><B>Version:</B> " + version + "</P>\n")
+	END
+	
+	IF copyright <> NIL THEN
+		descr->AddString("<P><B>Copyright:</B> " + copyright + "</P>\n")
+	END
+	
+	IF license <> NIL THEN
+		descr->AddString("<P><B>License:</B> " + license + "</P>\n")
+	END
+
+	IF pkg_descr THEN
+
+		descr->AddString("<P><B>PHP version:</B> ")
+		IF php_ver = php4 THEN
+			descr->AddString("4</P>\n")
+		ELSE
+			descr->AddString("5</P>\n")
+		END
+
+		descr->AddString("<P><B>Required modules:</B>\n")
+		none = TRUE
+		FOR i=0 TO count(required_packages)-1 DO
+			pkg = required_packages[i]
+			IF (pkg[fn] <> fn) AND pkg[module] THEN
+				IF NOT none THEN
+					descr->AddString(", ")
+				END
+				none = FALSE
+				path = Relative( fn_remapped,
+					RefMap( pkg[fn] + extension ) )
+				descr->AddString( Anchor(path, Basename(pkg[fn])) )
+			END
+		END
+		IF none THEN
+			descr->AddString("<I>none</I>")
+		END
+		descr->AddString("<P>\n")
+
+		descr->AddString("<P><B>Required packages:</B>\n")
+		none = TRUE
+		FOR i=0 TO count(required_packages)-1 DO
+			pkg = required_packages[i]
+			IF (pkg[fn] <> fn) AND NOT pkg[module] THEN
+				IF NOT none THEN
+					descr->AddString(", ")
+				END
+				none = FALSE
+				path = Relative( fn_remapped,
+					RefMap( DropExtension( pkg[fn] ) + extension ) )
+				descr->AddString(
+					Anchor(
+						path,
+						Basename( Relative( fn_remapped, pkg[fn] ) )
+					)
+				)
+			END
+		END
+		IF none THEN
+			descr->AddString("<I>none</I>")
+		END
+		descr->AddString("<P>\n")
+	END
+
+	IF count(include_path) > 0 THEN
+		descr->AddString("<P><B>include_path must resolve these packages:</B>\n")
+		FOR i=0 TO count(include_path)-1 DO
+			IF i > 0 THEN
+				descr->AddString(", ")
+			END
+			descr->AddString("<code>")
+			descr->AddString(include_path[i])
+			descr->AddString("</code>")
+		END
+		descr->AddString("</P>\n")
+	END
+
+	IF authors <> NIL THEN
+		descr->AddString("<P><B>Author:</B> " + authors + "</P>\n")
+	END
+	
+	IF since <> NIL THEN
+		descr->AddString("<P><B>Since:</B> " + since + "</P>\n")
+	END
+	
+	IF deprecated <> NIL THEN
+		descr->AddString("<P><B>Deprecated:</B> " + deprecated + "</P>\n")
+	END
+	
+	IF long > "" THEN
+		descr->AddString("<P>\n" + long + "\n</P>\n")
+	END
+
+	IF see > "" THEN
+		descr->AddString("<P><b>See also:</b> " + see + "\n</P>\n")
+	END
+
+	IF pkg_descr THEN
+		p( descr->ToString() )
+		p( "<HR>\n" )
+	ELSE
+		p("<BLOCKQUOTE>\n")
+		p(descr->ToString())
+		p("</BLOCKQUOTE>\n")
+	END
+END
+
+
+FUNCTION AddPrivateItem(item: STRING)
+BEGIN
+	private_items = private_items + "<code>" + item + "</code><br>\n"
+END
+
+
+FUNCTION DocConst(c: CONSTANT)
+BEGIN
+	IF c[private] THEN
+		AddPrivateItem(c[name])
+		RETURN
+	END
+	VSpaceBeforeItem(c[descr] <> NIL)
+	ItemAnchor(c[name])
+	p("<CODE><BIG><B>")
+	p( c[name] )
+	p( "</B></BIG> = " )
+	IF c[value] = NIL THEN
+		p( "<i>FAILED_TO_PARSE</i>" )
+	ELSE
+		DocValue(c[value][type], c[value][value])
+	END
+	p("</CODE>\n")
+	DocDescr(FALSE, c[descr])
+	VSpaceAfterItem(c[descr] > NIL)
+END
+
+
+FUNCTION DocType(t: Type): STRING
+(*
+	Differ from Types.TypeToString() since it reports the reference
+	to the non-private classes.
+*)
+VAR
+	c: Class
+	x: STRING
+BEGIN
+	IF t = NIL THEN
+		RETURN "FIXME_UNKNOWN_TYPE"
+	END
+
+	SWITCH t[basetype] DO
+	CASE null: RETURN "null"
+	CASE void: RETURN "void"
+	CASE boolean: RETURN "boolean"
+	CASE int: RETURN "int"
+	CASE float: RETURN "float"
+	CASE string: RETURN "string"
+
+	CASE array:
+		REPEAT
+			SWITCH t[index_type] DO
+			CASE void:   x = x + "[unknown]"
+			CASE int:    x = x + "[int]"
+			CASE string: x = x + "[string]"
+			CASE mixed:  x = x + "[]"
+			END
+			t = t[elem_type]
+		UNTIL (t = NIL) OR (t[basetype] <> array)
+		RETURN DocType(t) + x
+
+	CASE mixed: RETURN "mixed"
+	CASE resource: RETURN "resource"
+	CASE object:
+		c = t[class]
+		IF c = NIL THEN
+			RETURN "object"
+		ELSIF c[private] THEN
+			RETURN c[name]
+		ELSE
+			RETURN Anchor( ItemToUrl( c[name] ), c[name] )
+		END
+	END
+END
+
+
+FUNCTION DocVar(v: VARIABLE)
+BEGIN
+	IF v[private] THEN
+		AddPrivateItem("$" + v[name])
+		RETURN
+	END
+	VSpaceBeforeItem(v[descr] <> NIL)
+	ItemAnchor("$" + v[name])
+	p("<CODE><I>")
+	p(DocType(v[type]))
+	p("</I> <BIG><B>$")
+	p(v[name])
+	p("</B></BIG>")
+	(*******
+	p(" = ")
+	DocValue(v[type], v[value])
+	*******)
+	p("</CODE>\n")
+	DocDescr(FALSE, v[descr])
+	VSpaceAfterItem(v[descr] <> NIL)
+END
+
+
+FUNCTION DocSignature(name: STRING, s: SIGNATURE)
+VAR
+	i: INTEGER
+	args: ARRAY OF FormalArg
+	a: FormalArg
+BEGIN
+	p( "<I>" )
+	p( DocType( s[return] ) )
+	p( "</I> " )
+	IF s[reference] THEN
+		p( "&amp; " )
+	END
+	p("<BIG><B>")
+	p( name )
+	p( "</B></BIG>(" )
+	args = s[args]
+	FOR i=0 TO count(args)-1 DO
+		a = args[i]
+		IF i = 0 THEN
+			p( "<br>" + HSPACE + HSPACE )
+		ELSE
+			p( ",\n<br>" + HSPACE + HSPACE )
+		END
+		IF a[reference_return] THEN
+			p( "return " )
+		END
+		p( "<I>" )
+		p( DocType(a[type]) )
+		p( "</I>&nbsp;" )
+		IF a[reference] THEN
+			p( "&amp; " )
+		END
+		p( "$" )
+		p( a[name] )
+		IF i >= s[mandatory] THEN
+			p( " = " )
+			DocValue(a[type], a[value])
+		END
+	END
+	IF s[more_args] THEN
+		IF i = 0 THEN
+			p( "..." )
+		ELSE
+			p( ", ..." )
+		END
+	END
+	p( ")" )
+END
+
+
+FUNCTION DocRaisedErrors(errs: TriggeredErrors)
+VAR
+	a: ARRAY OF STRING
+	i: INTEGER
+BEGIN
+	IF errs = 0 THEN
+		RETURN
+	END
+	a = Errors.ErrorsSetToNames(errs)
+	p("<br><i>triggers</i> ")
+	FOR i=0 TO count(a)-1 DO
+		IF i > 0 THEN
+			p(", ")
+		END
+		p("<CODE>" + a[i] + "</CODE>")
+	END
+	p("\n")
+END
+
+
+FUNCTION DocThrownExceptions(exc: ThrownExceptions)
+(* Barely lists the checked exceptions just below the func/method signature. *)
+VAR
+	i: INTEGER
+	e: Class
+BEGIN
+	exc = Classes.Sort( Classes.CheckedExceptionsSubset(exc) )
+	IF count(exc) = 0 THEN
+		RETURN
+	END
+	p("<br>throws ")
+	FOR i=0 TO count(exc)-1 DO
+		IF i > 0 THEN
+			p(", ")
+		END
+		e = exc[i]
+		IF e = NIL THEN
+			p("<i>FIXME_UNKNOWN_EXCEPTION</i>")
+		ELSE
+			IF e[unchecked] THEN
+				p("unchecked ")
+			END
+			AnchorToClass(e)
+		END
+	END
+END
+
+
+FUNCTION DocThrownExceptionsDescr(descrs: ARRAY OF ThrownExceptionDescr)
+(* Prints descriptions for any exception that has a description, including
+   the unchecked ones. *)
+VAR
+	i: INTEGER
+	e: ThrownExceptionDescr
+BEGIN
+	IF count(descrs) = 0 THEN
+		RETURN
+	END
+	p("<blockquote>\n<b>Throws:</b><ul>\n")
+	FOR i=0 TO count(descrs)-1 DO
+		e = descrs[i]
+		p("<li>")
+
+		# Name:
+		IF e[exception][unchecked] THEN
+			p("unchecked ")
+		END
+		AnchorToClass(e[exception])
+
+		# Description:
+		p(HSPACE + ResolveTags( trim( e[descr] ) ) )
+
+		p("\n</li>\n")
+	END
+	p("</ul>\n</blockquote>\n")
+END
+
+
+FUNCTION DocFunc(f: Function)
+BEGIN
+	IF f[private] THEN
+		AddPrivateItem(f[name] + "()")
+		RETURN
+	END
+	VSpaceBeforeItem(f[descr] <> NIL)
+	ItemAnchor(f[name] + "()")
+	p("<CODE>")
+	DocSignature(f[name], f[sign])
+	p("</CODE>\n")
+	DocRaisedErrors(f[errors])
+	DocThrownExceptions(f[exceptions])
+	DocDescr(FALSE, f[descr])
+	DocThrownExceptionsDescr(f[thrown_exceptions_descr])
+	VSpaceAfterItem((f[descr] > NIL)
+		OR (count(f[thrown_exceptions_descr]) > 0))
+END
+
+
+FUNCTION DocClassConst(cl: Class, parent: Class, c: ClassConst)
+(*
+	Report a class constant.
+	cl: the class to which the constant belongs.
+	parent: NIL, or the class where the constant was actually defined.
+*)
+BEGIN
+	IF c[visibility] = private THEN
+		RETURN
+	END
+	VSpaceBeforeItem((parent = NIL) AND (c[descr] <> NIL))
+	ItemAnchor(cl[name] + "::" + c[name])
+	p("<CODE><BIG><B>")
+	p(c[name])
+	p("</B></BIG> = ")
+	DocValue(c[value][type], c[value][value])
+	p("</CODE>\n")
+	IF parent = NIL THEN
+		DocDescr(FALSE, c[descr])
+		VSpaceAfterItem(c[descr] > NIL)
+	ELSE
+		p( "<BR><I>inherited from</i> <CODE>" )
+		p( Anchor( ItemToUrl(parent[name] + "::" + c[name]), parent[name] ) )
+		p( "</CODE>\n" )
+		VSpaceAfterItem(FALSE)
+	END
+END
+
+
+FUNCTION DocClassProperty(c: Class, parent: Class, pr: Property)
+BEGIN
+	IF pr[visibility] = private THEN
+		IF (parent = NIL) AND (php_ver = php4) THEN
+			AddPrivateItem(c[name] + "::$" + pr[name])
+		END
+		RETURN
+	END
+	VSpaceBeforeItem((parent = NIL) AND (pr[descr] <> NIL))
+	ItemAnchor(c[name] + "::$" + pr[name])
+	p("<CODE>")
+	IF pr[visibility] = protected THEN
+		p("protected ")
+	END
+	IF pr[static] THEN
+		p("static ")
+	END
+	(****
+	IF php_ver = php4 THEN
+		p("var ")
+	END
+	****)
+	p("<I>")
+	p(DocType(pr[type]))
+	p("</I> <BIG><B>$")
+	p(pr[name])
+	p("</B></BIG>")
+	IF (pr[type] <> NIL) AND (pr[value] <> NIL) THEN
+		p(" = ")
+		DocValue(pr[type], pr[value])
+	END
+	p("</CODE>\n")
+	IF parent = NIL THEN
+		DocDescr(FALSE, pr[descr])
+		VSpaceAfterItem(pr[descr] > NIL)
+	ELSE
+		p( "<BR><I>inherited from</i> " )
+		p( Anchor( ItemToUrl(parent[name] + "::$" + pr[name]), parent[name] ) )
+		p( "\n" )
+		VSpaceAfterItem(FALSE)
+	END
+END
+
+
+FUNCTION IsClassInSet(c: Class, set: ARRAY OF Class): BOOLEAN
+VAR
+	i: INTEGER
+BEGIN
+	FOR i = 0 TO count(set)-1 DO
+		IF set[i] = c THEN
+			RETURN TRUE
+		END
+	END
+	RETURN FALSE
+END
+
+
+FUNCTION ListImplementedOrOverriddenMethods(c: Class, m: Method,
+	traversed: ARRAY OF Class, found_overridden: BOOLEAN)
+(*
+	Adds list of the implemented methods to the documentation about a method.
+	Recursively descends the extended classes first, so the list of overridden
+	methods gets listed first, and only one "overrides" entry is generated that
+	list the chain of the overridden methods.
+	Parameters:
+	c: Class to scan for overridden or implemented methods. Extended and
+	implemented classes are parsed recursively.
+	m: The concrete method, possibly belonging to c.
+	traversed: Set of classes already traversed (if the class extends or
+	implements A, B, and in turn both A and B extends or implements C, then do
+	not list twice methods from C).
+	found_overridden: if a overridden method was already found. If so,
+	add 
+*)
+VAR
+	i: INTEGER
+	m2: Method
+BEGIN
+	(*
+		If m is abstract, it may be either new or inherited from another class,
+		but in this latter case it has been already listed as "inherited". In
+		any case, ignore and return.
+	*)
+	IF (c = NIL) OR m[abstract] OR IsClassInSet(c, traversed) THEN
+		RETURN
+	END
+
+	(* Scan methods in class c: *)
+	FOR i = 0 TO count(c[methods]) - 1 DO
+		m2 = c[methods][i]
+		IF
+			(* Method does not implement/override itself: *)
+			(m2 <> m)
+			(* Target method must have the same name: *)
+			AND (m2[name] = m[name])
+			(* __construct() is implemented only from interfaces: *)
+			AND (c[interface] OR (m2 <> c[construct]))
+		THEN
+			IF m2[abstract] THEN
+				p( "\n<BR><I>implements</i> " )
+			ELSE
+				IF found_overridden THEN
+					p(", ")
+				ELSE
+					p( "\n<BR><I>overrides</i> " )
+					found_overridden = TRUE
+				END
+			END
+			p( Anchor( ItemToUrl(c[name] + "::" + m2[name] + "()"), c[name] ) )
+		END
+	END
+
+	traversed[] = c
+
+	(* Recursively scan extended class: *)
+	ListImplementedOrOverriddenMethods(c[extends], m, traversed, found_overridden)
+
+	(* Recursively scan implemented classes: *)
+	FOR i = 0 TO count(c[implements]) - 1 DO
+		ListImplementedOrOverriddenMethods(c[implements][i], m, traversed, found_overridden)
+	END
+END
+
+
+FUNCTION DocClassMethod(c: Class, parent: Class, m: Method)
+(*
+	Documents a method that may be either defined or inherited.
+	Parameters:
+	c: Class to which the method belongs.
+	parent: Class from which this method has been inherited; if NIL,
+	it is just defined in c.
+	m: The method.
+*)
+BEGIN
+	IF (parent = NIL) AND (m[visibility] = private) THEN
+		IF php_ver = php4 THEN
+			AddPrivateItem(c[name] + "::" + m[name] + "()")
+		END
+		RETURN
+	END
+
+	VSpaceBeforeItem((parent = NIL) AND (m[descr] <> NIL))
+	ItemAnchor(c[name] + "::" + m[name] + "()")
+	p("<CODE>")
+	IF m[abstract] AND NOT c[interface] THEN p("abstract ") END
+	IF m[visibility] = protected THEN p("protected ") END
+	IF m[static] THEN p("static ") END
+	IF m[final] THEN p("final ") END
+	DocSignature(m[name], m[sign])
+	p("</CODE>\n")
+	DocRaisedErrors(m[errors])
+	DocThrownExceptions(m[exceptions])
+	IF parent = NIL THEN
+		ListImplementedOrOverriddenMethods(c, m, {}, FALSE)
+		DocDescr(FALSE, m[descr])
+		DocThrownExceptionsDescr(m[thrown_exceptions_descr])
+		VSpaceAfterItem((m[descr] > NIL)
+			OR (count(m[thrown_exceptions_descr]) > 0))
+	ELSE
+		p( "<BR><I>inherited from</i> " )
+		p( Anchor( ItemToUrl(parent[name] + "::" + m[name] + "()"), parent[name] ) )
+		p( "\n" )
+		VSpaceAfterItem(FALSE)
+	END
+END
+
+
+FUNCTION NotInList(name: STRING, VAR l: ARRAY OF STRING): BOOLEAN
+VAR i: INTEGER
+BEGIN
+	FOR i=0 TO count(l)-1 DO
+		IF l[i] = name THEN
+			RETURN FALSE
+		END
+	END
+	l[i] = name
+	RETURN TRUE
+END
+
+
+FUNCTION DocInheritedConsts(cl: Class)
+VAR
+	l: ARRAY OF STRING
+	consts: ARRAY OF ClassConst
+	p: Class
+	i: INTEGER
+BEGIN
+	IF cl[extends] = NIL THEN
+		RETURN
+	END
+	consts = cl[consts]
+	FOR i=0 TO count(consts)-1 DO
+		l[i] = consts[i][name]
+	END
+	p = cl[extends]
+	REPEAT
+		consts = p[consts]
+		FOR i=0 TO count(consts)-1 DO
+			IF (consts[i][visibility] <> private)
+			AND NotInList(consts[i][name], l) THEN
+				DocClassConst(cl, p, consts[i])
+			END
+		END
+		p = p[extends]
+	UNTIL p = NIL
+END
+
+
+FUNCTION DocInheritedProperties(cl: Class)
+VAR
+	l: ARRAY OF STRING
+	properties: ARRAY OF Property
+	i: INTEGER
+
+	FUNCTION ScanProperties(c: Class)
+	VAR
+		properties: ARRAY OF Property
+		i: INTEGER
+	BEGIN
+		IF c = NIL THEN
+			RETURN
+		END
+		properties = c[properties]
+		FOR i=0 TO count(properties)-1 DO
+			IF NOT (properties[i][visibility] = private)
+			AND NotInList(properties[i][name], l) THEN
+				DocClassProperty(cl, c, properties[i])
+			END
+		END
+	END
+
+	FUNCTION ScanPropertiesRecursive(c: Class)
+	VAR i: INTEGER
+	BEGIN
+		IF c = NIL THEN
+			RETURN
+		END
+		ScanProperties(c)
+		ScanPropertiesRecursive(c[extends])
+		FOR i=0 TO count(c[implements])-1 DO
+			ScanPropertiesRecursive(c[implements][i])
+		END
+	END
+
+BEGIN
+	IF (cl[extends] = NIL) AND (cl[implements] = NIL) THEN
+		RETURN
+	END
+
+	(* Collects in l[] the properties of the class cl itself: *)
+	properties = cl[properties]
+	FOR i=0 TO count(properties)-1 DO
+		l[i] = properties[i][name]
+	END
+
+	(* Documents properties inherited from the extended class: *)
+	ScanPropertiesRecursive(cl[extends])
+
+	(* Documents properties inherited from the implemented classes: *)
+	IF NOT ( cl[abstract] OR cl[interface] ) THEN
+		RETURN
+	END
+	FOR i=0 TO count(cl[implements])-1 DO
+		ScanPropertiesRecursive(cl[implements][i])
+	END
+END
+
+
+FUNCTION DocInheritedMethods(cl: Class)
+VAR
+	l: ARRAY OF STRING
+	methods: ARRAY OF Method
+	i: INTEGER
+
+	FUNCTION ScanMethods(c: Class)
+	VAR
+		methods: ARRAY OF Method
+		i: INTEGER
+		m: Method
+	BEGIN
+		IF c = NIL THEN
+			RETURN
+		END
+		methods = c[methods]
+		FOR i=0 TO count(methods)-1 DO
+			m = methods[i]
+			IF NOT (m[visibility] = private) AND NotInList(m[name], l) THEN
+				DocClassMethod(cl, c, m)
+			END
+		END
+	END
+
+	FUNCTION ScanMethodsRecursive(c: Class)
+	VAR i: INTEGER
+	BEGIN
+		IF c = NIL THEN
+			RETURN
+		END
+		ScanMethods(c)
+		ScanMethodsRecursive(c[extends])
+		FOR i=0 TO count(c[implements])-1 DO
+			ScanMethodsRecursive(c[implements][i])
+		END
+	END
+
+BEGIN
+	IF (cl[extends] = NIL) AND (cl[implements] = NIL) THEN
+		RETURN
+	END
+
+	(* Collect the methods of the class cl itself: *)
+	methods = cl[methods]
+	FOR i=0 TO count(methods)-1 DO
+		l[i] = methods[i][name]
+	END
+
+	(* Documents properties inherited from the extended class: *)
+	ScanMethodsRecursive(cl[extends])
+
+	(* Documents properties inherited from the implemented classes: *)
+	IF NOT ( cl[abstract] OR cl[interface] ) THEN
+		RETURN
+	END
+	FOR i=0 TO count(cl[implements])-1 DO
+		ScanMethodsRecursive(cl[implements][i])
+	END
+END
+
+
+FUNCTION DocClassHierarchy(c: Class)
+	
+	FUNCTION recurse(c: Class, indent_this: STRING, indent_next: STRING, anchor: BOOLEAN)
+	VAR
+		i: INTEGER
+		a, b: STRING
+	BEGIN
+		p(indent_this)
+		IF anchor THEN
+			IF c[interface] THEN
+				p("(<i>")
+			END
+			IF c[unchecked] THEN
+				p("unchecked ")
+			END
+			AnchorToClass(c)
+			IF c[interface] THEN
+				p("</i>)")
+			END
+		END
+		p( "\n" )
+
+		IF c[extends] <> NIL THEN
+			IF c[implements] = NIL THEN
+				a = "  `--"
+				b = "     "
+			ELSE
+				a = "  +--"
+				b = "  |  "
+			END
+			recurse(c[extends], indent_next + a, indent_next + b, TRUE)
+		END
+
+		FOR i = 0 TO count(c[implements])-1 DO
+			IF i = count(c[implements])-1 THEN
+				a = "  `--"
+				b = "     "
+			ELSE
+				a = "  +--"
+				b = "  |  "
+			END
+			recurse(c[implements][i], indent_next + a, indent_next + b, TRUE)
+		END
+	END
+
+BEGIN
+	IF (c[extends] = NIL) AND (c[implements] = NIL) THEN
+		RETURN
+	END
+	recurse(c, "      |  ", "    ", FALSE)
+END
+
+
+FUNCTION DocClass(c: Class)
+VAR
+	i: INTEGER
+	####parent: Class
+BEGIN
+	IF c[private] THEN
+		AddPrivateItem(c[name])
+		RETURN
+	END
+	VSpaceBeforeItem(TRUE)
+	curr_class = c
+	ItemAnchor(c[name])
+	p("<pre>")
+	IF c[abstract] THEN
+		p( "abstract " )
+	END
+	IF c[final] THEN
+		p( "final " )
+	END
+	IF c[unchecked] THEN
+		p( "unchecked ")
+	END
+	IF c[interface] THEN
+		p( "interface " )
+	ELSE
+		p( "class " )
+	END
+	p("<BIG><B>")
+	p(c[name])
+	p("</B></BIG>\n")
+
+	(*****
+	parent = c[extends]
+	IF parent <> NIL THEN
+		p( "<br>\n" + HSPACE + "extends " )
+		IF parent[unchecked] THEN
+			p("unchecked ")
+		END
+		AnchorToClass(parent)
+	END
+
+	IF c[implements] <> NIL THEN
+		p( "<br>\n" + HSPACE )
+		IF c[interface] THEN
+			p("extends ")
+		ELSE
+			p("implements ")
+		END
+		FOR i=0 TO count( c[implements] )-1 DO
+			IF i > 0 THEN
+				p(", ")
+			END
+			AnchorToClass(c[implements][i])
+		END
+	END
+	****)
+	
+	DocClassHierarchy(c)
+	p("</pre>\n")
+	DocDescr(FALSE, c[descr])
+	VSpaceAfterItem(c[descr] > NIL)
+
+	VSpaceBeforeItem(FALSE)
+	p( "<CODE>{</CODE>\n<BLOCKQUOTE>\n" )
+	VSpaceAfterItem(FALSE)
+
+	(*
+		Report class members, including inherited ones.
+		A class that merely extends another class and does not add any
+		new member (as ususlly happen with exceptions) is reported in
+		short form for brevity:
+	*)
+
+	IF (c[extends] <> NIL)
+		AND (c[implements] = NIL)
+		AND (c[consts] = NIL)
+		AND (c[properties] = NIL)
+		AND (c[methods] = NIL)
+	THEN
+		
+		p("<i>This class merely extends another class and does not add any"
+		+ " new member. Please see the extended class for details.</i>")
+
+	ELSE
+
+		(* Full report of all the members: *)
+
+		FOR i=0 TO count(c[consts])-1 DO
+			DocClassConst(c, NIL, c[consts][i])
+		END
+		DocInheritedConsts(c)
+
+		FOR i=0 TO count(c[properties])-1 DO
+			DocClassProperty(c, NIL, c[properties][i])
+		END
+		DocInheritedProperties(c)
+
+		FOR i=0 TO count(c[methods])-1 DO
+			DocClassMethod(c, NIL, c[methods][i])
+		END
+		DocInheritedMethods(c)
+
+	END
+
+	VSpaceBeforeItem(FALSE)
+	p( "</BLOCKQUOTE>\n<CODE>}</CODE>\n" )
+	VSpaceAfterItem(TRUE)
+
+	curr_class = NIL
+END
+
+
+FUNCTION Help()
+BEGIN
+	print(
+"PHPLint Documentator\n\n" +
+"Options:\n" +
+"  --doc                 generate documentation\n" +
+"  --doc-extension EXT   extension of the generated documents (def. \".html\")\n" +
+"  --doc-page-header H   header text of the generated HTML page\n" +
+"  --doc-page-footer F   footer text of the generated HTML page\n" +
+"  --doc-ref-remap A B   remap HTML anchors references from A* to B*\n" +
+"\nMore help: www.icosaedro.it/phplint/\n\n"
+)
+END
+
+
+# VAR init_done: BOOLEAN
+
+FUNCTION Init()
+BEGIN
+	(*
+	IF init_done THEN
+		RETURN
+	END
+	init_done = TRUE
+	*)
+
+	extension = ".html"
+	page_header = "<HTML><BODY>\n"
+	page_footer = "\n<HR><P align=right>"
+		+ "<FONT size='-2'>Generated by "
+		+ Anchor("http://www.icosaedro.it/phplint/", "PHPLint Documentator")
+		+ "</FONT></P>\n"
+		+ "</BODY></HTML>\n"
+END
+
+
+FUNCTION ParseParameter(i: INTEGER, args: ARRAY OF STRING): INTEGER
+VAR arg: STRING
+BEGIN
+	arg = args[i]
+	IF arg = "--doc-help" THEN
+		Help()
+	ELSIF arg = "--doc" THEN
+		generate = TRUE
+	ELSIF arg = "--doc-extension" THEN
+		inc(i, 1)
+		IF i >= count(args) THEN
+			error("phplint: missing argument for --doc-extension\n")
+			exit(1)
+		END
+		extension = args[i]
+	ELSIF arg = "--doc-page-header" THEN
+		inc(i, 1)
+		IF i >= count(args) THEN
+			error("phplint: missing argument for --doc-page-header\n")
+			exit(1)
+		END
+		page_header = args[i]
+	ELSIF arg = "--doc-page-footer" THEN
+		inc(i, 1)
+		IF i >= count(args) THEN
+			error("phplint: missing argument for --doc-page-footer\n")
+			exit(1)
+		END
+		page_footer = args[i]
+	ELSIF arg = "--doc-ref-remap" THEN
+		IF i+2 >= count(args) THEN
+			error("phplint: more args required for --doc-ref-remap\n")
+			exit(1)
+		END
+		ref_remap[] = args[i+1]
+		ref_remap[] = args[i+2]
+		inc(i, 2)
+	ELSE
+		error("phplint: unknown option `" + arg + "'\n")
+		exit(1)
+	END
+
+	RETURN i
+END
+
+
+FUNCTION Generate(
+	_php_ver: PHP_VERSION,
+	_fn: STRING,
+	_package_descr: STRING,
+	_required_packages: ARRAY OF Package,
+	_include_path: ARRAY OF STRING,
+	_consts: ARRAY OF CONSTANT,
+	_vars: ARRAY OF VARIABLE,
+	_funcs: ARRAY OF Function,
+	_classes: ARRAY OF Class)
+VAR
+	i: INTEGER
+	c: CONSTANT
+	v: VARIABLE
+	f: Function
+	cl: Class
+BEGIN
+
+	IF NOT generate THEN
+		RETURN
+	END
+
+	php_ver = _php_ver
+	fn = _fn
+	package_descr = _package_descr
+	required_packages = _required_packages
+	sort(_include_path)
+	include_path = _include_path
+	consts = _consts
+	vars = _vars
+	funcs = _funcs
+	classes = _classes
+
+	prev_item_big_vspace = FALSE
+	private_items = NIL
+
+	fn_remapped = RefMap( DropExtension(fn) + extension)
+
+	TRY fd->Open(DropExtension(fn) + extension, "cwt") END
+
+	p(page_header)
+
+	DocDescr(TRUE, package_descr)
+
+	FOR i=0 TO count(consts)-1 DO
+		c = consts[i]
+		IF (c[decl_in] <> NIL) AND (c[decl_in][fn] = fn) THEN
+			DocConst(c)
+		END
+	END
+
+	FOR i=0 TO count(vars)-1 DO
+		v = vars[i]
+		IF (v <> NIL) AND (v[decl_in] <> NIL) AND (v[decl_in][fn] = fn) THEN
+			DocVar(v)
+		END
+	END
+
+	FOR i=0 TO count(funcs)-1 DO
+		f = funcs[i]
+		IF (f[decl_in] <> NIL) AND (f[decl_in][fn] = fn) THEN
+			DocFunc(f)
+		END
+	END
+
+	FOR i=0 TO count(classes)-1 DO
+		cl = classes[i]
+		IF (cl[decl_in] <> NIL) AND (cl[decl_in][fn] = fn) THEN
+			DocClass(cl)
+		END
+	END
+
+	IF private_items > NIL THEN
+		VSpaceBeforeItem(TRUE)
+		p("<h2>Private items</h2>\n<blockquote>\n")
+		p(private_items)
+		p("\n</blockquote>\n")
+	END
+
+	p(page_footer)
+
+	TRY fd->Close() END
+END
+
+
+FUNCTION ExtractDeprecated(descr: STRING): STRING
+
+CONST
+	RESULT_MAX_LEN = 240
+
+	FUNCTION trim_to_linear_string(s: STRING): STRING
+	VAR len: INTEGER  s2: STRING
+	BEGIN
+		s = trim(s)
+		len = length(s)
+		IF len > RESULT_MAX_LEN THEN
+			s = s[0,RESULT_MAX_LEN-5] + "[...]"
+		END
+		s = substitute(s, "\t", " ")
+		s = substitute(s, "\r", " ")
+		s = substitute(s, "\n", " ")
+		LOOP
+			s2 = substitute(s, "  ", " ")
+			IF s2 = s THEN
+				EXIT
+			END
+			s = s2
+		END
+		RETURN s
+	END
+
+
+CONST
+	DEPRECATED_TAG = "<@deprecated"
+VAR
+	i, j, len, nest_level: INTEGER
+	deprecated: STRING
+BEGIN
+	LOOP
+
+		# Search next DEPRECATED_TAG:
+		i = find(descr, DEPRECATED_TAG)
+		IF i < 0 THEN
+			RETURN trim_to_linear_string(deprecated)
+		END
+
+		# Extract body of the tag. There may be several nested
+		# <...> due to the HTML formattig, so we need a counter
+		# of the nesting level.
+		i = i + length(DEPRECATED_TAG)
+		j = i
+		len = length(descr)
+		nest_level = 1
+		LOOP
+			IF j >= len THEN
+				j = len
+				EXIT
+			END
+			IF descr[j] = "<" THEN
+				inc(nest_level, 1)
+			ELSIF descr[j] = ">" THEN
+				inc(nest_level, -1)
+				IF nest_level <= 0 THEN
+					EXIT
+				END
+			END
+			inc(j, 1)
+		END
+		IF deprecated > "" THEN
+			deprecated = deprecated + " "
+		END
+		deprecated = deprecated + descr[i,j]
+		IF j >= len THEN
+			RETURN trim_to_linear_string(deprecated)
+		END
+
+		# Continue looking for others tags:
+		descr = descr[j,len]
+	END
+END
+
+
+END

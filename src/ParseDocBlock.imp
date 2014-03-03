@@ -1,0 +1,1921 @@
+IMPLEMENTATION MODULE ParseDocBlock
+
+IMPORT m2
+IMPORT Globals
+IMPORT Classes
+IMPORT Search
+IMPORT Scanner
+IMPORT buffer
+IMPORT str
+
+TYPE
+	Status = RECORD
+		pdb: ParsedDocBlock
+
+		(* Scanner status: *)
+		in: STRING    # docBlock text being scanned
+		pos: INTEGER  # offset of the next char
+		line_n: INTEGER # line no. First is the no. 1
+		len: INTEGER  # length(in)
+		c: STRING     # current char being parsed
+
+		return_descr: STRING
+		descr: BUFFER
+
+		template: ParsedDocBlock
+		(* last parsed /*#@+ ... */ template -- automatically discarded
+		   when a /**#@-*/ is found *)
+
+		template_where: WHERE
+		(* where the template was opended *)
+	END
+
+VAR
+	pdb: ParsedDocBlock
+
+	(* Scanner status: *)
+	in: STRING    # docBlock text being scanned
+	pos: INTEGER  # offset of the next char
+	line_n: INTEGER # line no. First is the no. 1
+	len: INTEGER  # length(in)
+	c: STRING     # current char being parsed
+
+	return_descr: STRING
+	descr: BUFFER
+
+	template: ParsedDocBlock
+	(* last parsed /*#@+ ... */ template -- automatically discarded
+	   when a /**#@-*/ is found *)
+
+	template_where: WHERE
+	(* where the template was opended *)
+
+	
+	types: ARRAY OF RECORD
+		name: STRING
+		type: Type
+	END
+
+
+FUNCTION Suspend(): Status
+VAR
+	status: Status
+BEGIN
+	status[pdb] = pdb      pdb = NIL
+	status[in] = in
+	status[pos] = pos
+	status[line_n] = line_n
+	status[len] = len
+	status[c] = c
+	status[return_descr] = return_descr
+	status[descr] = descr   descr = NIL
+	status[template] = template   template = NIL
+	status[template_where] = template_where   template_where = NIL
+	RETURN status
+END
+
+
+FUNCTION Resume(status: Status)
+BEGIN
+	IF status = NIL THEN
+		pdb = NIL
+		RETURN
+	END
+	pdb = status[pdb]
+	in = status[in]
+	pos = status[pos]
+	line_n = status[line_n]
+	len = status[len]
+	c = status[c]
+	return_descr = status[return_descr]
+	descr = status[descr]
+	template = status[template]
+	template_where = status[template_where]
+END
+
+
+FUNCTION isLWSP(c: STRING): BOOLEAN
+BEGIN
+	RETURN (c = " ") OR (c = "\t")
+END
+
+
+FUNCTION isBlank(c: STRING): BOOLEAN
+BEGIN
+	RETURN (c = " ") OR (c = "\t") OR (c = "\n")
+END
+
+
+FUNCTION trim(s: STRING): STRING
+(*
+	Removes blanks at both ends of the string.
+*)
+VAR
+	i1, i2: INTEGER
+BEGIN
+	IF s = NIL THEN
+		RETURN NIL
+	END
+	i1 = 0
+	WHILE (i1 < length(s)) AND isBlank(s[i1]) DO
+		inc(i1, 1)
+	END
+	i2 = length(s)
+	WHILE (i2 > i1) AND isBlank(s[i2 - 1]) DO
+		inc(i2, -1)
+	END
+	RETURN s[i1,i2]
+END
+
+
+FUNCTION readCh()
+(*
+	Set c with the next char from the DocBlock
+
+	\n\r and single \r are converted to \n.
+	Skip leading "*" if present.
+*)
+
+
+	FUNCTION lowLevelReadCh()
+	(*
+		Returns in c the next char.
+		Maps "\r\n" and "\r" to "\n", so that line ending can be
+		detected easily as c="\n".
+		Update line_n, first line being the no. 1.
+	*)
+	BEGIN
+		IF c = NIL THEN
+			HALT(NIL)
+		END
+		IF c = "\n" THEN
+			inc(line_n, 1)
+		END
+		IF pos >= len THEN
+			c = NIL
+			RETURN
+		END
+		c = in[pos]
+		inc(pos, 1)
+		IF c = "\r" THEN
+			# skip possible following "\n":
+			IF (pos < len) AND (in[pos] = "\n") THEN
+				inc(pos, 1)
+			END
+			c = "\n"
+		END
+	END
+
+VAR
+	line_start_n: INTEGER
+	line_start_pos: INTEGER
+
+BEGIN
+	IF c = NIL THEN
+		RETURN
+	ELSIF c = "\n" THEN
+		# Skip leading asterisk, if it is there:
+		lowLevelReadCh()
+		line_start_n = line_n
+		line_start_pos = pos
+		WHILE isLWSP(c) DO
+			lowLevelReadCh()
+		END
+		IF c = NIL THEN
+			RETURN
+		ELSIF c = "*" THEN
+			# Ignore initial asterisk:
+			lowLevelReadCh()
+		ELSE
+			# Recover initial spaces, required to format properly <pre>:
+			line_n = line_start_n
+			pos = line_start_pos
+			c = in[pos-1]
+		END
+	ELSE
+		lowLevelReadCh()
+	END
+END
+
+
+FUNCTION textToHtml(s: STRING): STRING
+(*
+	Converts verbatim text into HTML. Example:
+	textToHtml("1 < 2") ==> "1 &lt; 2"
+*)
+
+
+	FUNCTION skipEscapedUnicodeChar(s: STRING, i: INTEGER): INTEGER
+	(*
+		Skip verbatim escaped Unicode char "&#123;" (dec) or "&#xabc;" (hex).
+		Prerequisite: s[i] = "&".
+		Returns the index of the ";" character if a valid escape sequence
+		has been found, or the index i itself if not.
+		Does not check for the actual valid range of the codepoint.
+	*)
+	VAR
+		w: STRING
+	BEGIN
+		w = s[i,length(s)]
+		IF match(w, "^&#([0-9]+)|(x|X[0-9a-fA-F]+);") THEN
+			RETURN i + find(w, ";")
+		ELSE
+			RETURN i
+		END
+	END
+
+VAR
+	i, j: INTEGER
+	c: STRING
+	b: BUFFER
+BEGIN
+	b->Reset()
+	FOR i=0 TO length(s)-1 DO
+		c = s[i]
+		IF c = "<" THEN
+			b->AddString("&lt;")
+		ELSIF c = ">" THEN
+			b->AddString("&gt;")
+		ELSIF c = "&" THEN
+			j = skipEscapedUnicodeChar(s, i)
+			IF j = i THEN
+				b->AddString("&amp;")
+			ELSE
+				b->AddString(s[i,j+1])
+				i = j
+			END
+		ELSE
+			b->AddString(c)
+		END
+	END
+	RETURN b->ToString()
+END
+
+
+FUNCTION checkMisspelled(expect: STRING, found: STRING)
+BEGIN
+	IF expect = found THEN
+		RETURN
+	END
+	Error2(here(), "misspelled keyword `" + found
+		+ "', expected `" + expect + "'")
+END
+
+
+FUNCTION SearchClass(name: STRING): Class
+(*
+	Just like Search.SearchClass(), but also interprets special keywords
+	`self' and `parent' (PHP5 only).
+*)
+VAR
+	name_lc: STRING
+BEGIN
+	IF php_ver = php4 THEN
+		RETURN Search.SearchClass(name)
+	END
+
+	name_lc = tolower(name)
+	IF name_lc = "self" THEN
+		checkMisspelled("self", name)
+		IF curr_class = NIL THEN
+			Error2(here(), "`self': not inside a class")
+			RETURN NIL
+		END
+		RETURN curr_class
+	ELSIF name_lc = "parent" THEN
+		checkMisspelled("parent", name)
+		IF curr_class = NIL THEN
+			Error2(here(), "`parent': not inside a class")
+			RETURN NIL
+		ELSIF curr_class[extends] = NIL THEN
+			Error2(here(), "`parent': no parent class")
+			RETURN NIL
+		END
+		RETURN curr_class[extends]
+	ELSE
+		RETURN Search.SearchClass(name)
+	END
+END
+
+
+FUNCTION resolve_namespace_operator(name: STRING): STRING
+VAR
+	s: STRING
+BEGIN
+	IF str.starts_with(name, "namespace\\") THEN
+		s = name[10,length(name)]
+		IF curr_package[namespace_current] = NIL THEN
+			RETURN "\\" + s
+		ELSE
+			RETURN "\\" + curr_package[namespace_current] + "\\" + s
+		END
+	ELSE
+		RETURN name
+	END
+END
+
+
+FUNCTION resolve_ns(item: STRING): STRING
+(*
+	Resolves NS for documented items in {@link ITEM} and return the fully
+	qualified name. Resolution performed in the current NS.
+	No name resolution is performed in PHP 4.
+*)
+VAR
+	c: CONSTANT
+	f: Function
+	class: Class
+	i: INTEGER
+	name: STRING
+BEGIN
+	IF php_ver = php4 THEN
+		RETURN item
+	END
+	
+	item = resolve_namespace_operator(item)
+
+	(*
+		Fully qualified name: remove leading "\":
+	*)
+	IF item[0] = "\\" THEN
+		RETURN item[1,length(item)]
+	END
+
+	(*
+		Global variable:
+	*)
+	IF item[0] = "$" THEN
+		RETURN item
+	END
+
+	(*
+		Class member:
+	*)
+	i = find(item, "::")
+	IF i = 0 THEN
+		IF curr_class = NIL THEN
+			Error2(here(), "{@link " + item + "}: not inside a class")
+			RETURN item
+		END
+		RETURN curr_class[name] + item
+	ELSIF i > 0 THEN
+		name = item[0,i]
+		class = SearchClass(name)
+		IF class = NIL THEN
+			Error2(here(), "{@link " + item + "}: unknown class")
+			RETURN item
+		END
+		RETURN class[name] + item[i,length(item)]
+	END
+
+	(*
+		Function:
+	*)
+	i = find(item, "(")
+	IF i > 0 THEN
+		name = item[0,i]
+		f = SearchFunc(name, TRUE)
+		IF f = NIL THEN
+			Error2(here(), "{@link " + item + "}: unknown function")
+			RETURN item
+		END
+		RETURN f[name] + item[i,length(item)]
+	END
+
+	(*
+		Constant:
+	*)
+	c = SearchConst(item, TRUE)
+	IF c <> NIL THEN
+		RETURN c[name]
+	END
+
+	(*
+		Class:
+	*)
+	class = SearchClass(item)
+	IF class <> NIL THEN
+		RETURN class[name]
+	END
+
+	Error2(here(), "{@link " + item + "}: unknown item")
+	RETURN item
+END
+
+
+FUNCTION expandInlineTags(htmlText: STRING): STRING
+VAR
+	i1, i2, n, i: INTEGER
+	b: BUFFER
+	tag, content, result, w: STRING
+	a, words: ARRAY OF STRING
+BEGIN
+
+	REPEAT
+
+		# Determine beginning of the first inline tag in htmlText:
+		i1 = find(htmlText, "{@")
+		IF i1 < 0 THEN
+			# No inline tags in htmlText.
+			IF b = NIL THEN
+				RETURN htmlText
+			ELSE
+				b->AddString(htmlText)
+				RETURN b->ToString()
+			END
+		END
+
+		# Detect end of the inline tag:
+		i2 = index(htmlText, i1, "}")
+		IF i2 < 0 THEN
+			# Missing matching "}".
+			b->AddString(htmlText)
+			RETURN b->ToString()
+		END
+
+		# Extract content of the inline tag between "{@" and "}":
+		content = htmlText[i1 + 2, i2]
+
+		# Split content into words, removing LWSP around words.
+		a = split(content, " \t\n")
+		words = {}
+		FOR i = 0 TO count(a)-1 DO
+			w = trim(a[i])
+			IF length(w) > 0 THEN
+				words[] = w
+			END
+		END
+
+		# Evaluates words[] and calculate the expanded result:
+		n = count(words)
+		IF n > 0 THEN
+			tag = words[0]
+		END
+		IF n = 0 THEN
+			result = "{@"
+		
+		ELSIF (tag = "*") AND (n = 1) THEN
+			result = "*/"
+		
+		ELSIF (tag = "link") AND (n >= 2) THEN
+			
+			IF match(words[1],
+				"^"
+				+ "(mailto:)|([a-z]+://)" # simpler URLs
+				+ "|(\\./)|(\\.\\./)" # relative path to local file ./xxxx or ../xxxx
+				+ "|/" # abs. path to local file /xxxx (Unix)
+				+ "|([a-zA-Z]:)" # abs. path to local file c:xxxx (Windows)
+			) THEN
+				# It is an URL.
+				result = "<a href=\"" + words[1] + "\">"
+				IF n >= 3 THEN
+					# Custom link description.
+					FOR i = 2 TO n - 1 DO
+						IF i > 2 THEN
+							result = result + " "
+						END
+						result = result + words[i] # FIXME: filter HTML?
+					END
+				ELSE
+					result = result + words[1]
+				END
+				result = result + "</a>"
+
+			ELSE
+				# It is a link to PHP item.
+				result = "<@item " + resolve_ns(words[1]) + ">"
+				IF n >= 3 THEN
+					# Custom link description: unsupported by PHPLint Doc.
+					# so add as bare comment between parentheses.
+					result = result + " ("
+					FOR i = 2 TO n - 1 DO
+						IF i > 2 THEN
+							result = result + " "
+						END
+						result = result + words[i] # FIXME: filter HTML?
+					END
+					result = result + ")"
+				END
+			END
+
+		ELSIF (tag = "img") AND (n = 2) THEN
+			result = "<img src=\"" + words[1] + "\">"
+
+		ELSIF (tag = "id")
+		OR (tag = "toc")
+		THEN
+			Error2(here(), "the {@" + tag
+				+ "} inline tag not allowed in DocBlock")
+			result = htmlText[i1, i2 + 1]
+
+		ELSIF (tag = "example")
+		OR (tag = "internal")
+		OR (tag = "inheritdoc")
+		OR (tag = "source")
+		OR (tag = "tutorial")
+		THEN
+			Notice2(here(), "the {@" + tag
+				+ "} inline tag still unsupported by PHPLint, sorry")
+			result = htmlText[i1, i2 + 1]
+
+		ELSE
+			Error2(here(), "unknown inline tag {@" + tag + "}")
+			result = htmlText[i1, i2 + 1]
+		
+		END
+
+		# Add text before inline tag:
+		b->AddString(htmlText[0,i1])
+
+		# Add expanded inline tag:
+		b->AddString(result)
+
+		# Continue parsing the remaining of htmlText:
+		htmlText = htmlText[i2 + 1, length(htmlText)]
+
+	UNTIL length(htmlText) = 0
+
+	RETURN b->ToString()
+END
+
+
+
+(*
+	HTML filtering
+*)
+
+VAR
+	tags: ARRAY OF STRING
+	eb: BUFFER
+
+FUNCTION filterValidHtmlEntities(s: STRING): STRING
+(*
+	Converts the text of a description into a proper HTML text
+
+	Implementation: the string is splitted at every "<", and the beginning
+	of every string is compared with the list tags[] of the expected
+	valid tags. Every entity is handled according to the phpDoc specs.
+
+	FIXME: implement <samp> and <var> in some way
+*)
+		
+VAR
+	(* Status of the scanner: *)
+	a: ARRAY OF STRING  # text splitted at every "<" ("chunks")
+	i: INTEGER          # index at a[] of the next chunk
+	l: STRING           # a copy of the current chunk; NIL=end
+	t: STRING           # tag of current chunk: NIL, "b>", "code>", etc.
+
+	FUNCTION nextTag()
+	(*
+		Scans the next chunk and sets l,t accordingly. For example, if
+		the current chunk is l="b>Some text\n" then t="b>".
+
+		l=NIL : end
+		t=NIL : unknown tag or invalid tag
+	*)
+
+		FUNCTION detectTag(s: STRING): STRING
+		VAR i: INTEGER  t: STRING
+		BEGIN
+			FOR i=0 TO count(tags)-1 DO
+				t = tags[i]
+				IF (length(s) >= length(t)) AND (s[0,length(t)] = t) THEN
+					# 's' just begins with 't': we found it!
+					RETURN t
+				END
+			END
+			RETURN NIL
+		END
+
+	BEGIN
+		IF i >= count(a) THEN
+			t = NIL
+			l = NIL
+			RETURN
+		END
+		l = a[i]
+		t = detectTag(l)
+		inc(i, 1)
+	END
+
+
+	FUNCTION short(s: STRING): STRING
+	VAR l: INTEGER
+	BEGIN
+		l = length(s)
+		IF l > 30 THEN
+			# FIXME: UTF-8 chars might get trunked
+			s = s[0,25] + "..."
+		END
+		RETURN StringToLiteral(s)
+	END
+
+
+	FUNCTION splitParagraphes(text: STRING): STRING
+	(*
+		Empty lines are translated into "<p>\n".
+	*)
+	VAR
+		a: ARRAY OF STRING
+		i: INTEGER
+		b: BUFFER
+	BEGIN
+		IF text = NIL THEN
+			RETURN NIL
+		END
+
+		# Quick test:
+		IF find(text, "\n") < 0 THEN
+			# No possible empty line.
+			RETURN text
+		END
+
+		# Then there are at least 2 lines: the first and the last
+		# line cannot separate nothing and then are added verbatim.
+		a = split(text, "\n")
+		b->AddString(a[0])
+		b->AddString("\n")
+		FOR i = 1 TO count(a)-2 DO
+			IF match(a[i], "^[ \t]*$") THEN
+				# Found empty line.
+				b->AddString("<p>\n")
+			ELSE
+				b->AddString(a[i])
+				b->AddString("\n")
+			END
+		END
+		b->AddString(a[count(a)-1])
+		RETURN b->ToString()
+	END
+
+
+	FUNCTION addChunk()
+	(*
+		Adds current chunk l.
+	*)
+	BEGIN
+		eb->AddString( "<" )
+		eb->AddString( t )
+		eb->AddString( splitParagraphes( l[length(t),length(l)]))
+		nextTag()
+	END
+
+	FUNCTION addBareText(text: STRING)
+	(*
+		Adds text as bare literal text.
+	*)
+	BEGIN
+		eb->AddString( splitParagraphes( textToHtml( text ) ) )
+	END
+
+	FUNCTION parseHtml()
+	(*
+		Parses the text starting from the current chunk and up to the
+		end of the text or up to the next closed "complex" tag.
+		When a complex tag (for example "<ul>") is encountered, this
+		function is called recursively to scan the content of the
+		internal tags that may contain other complex tags.
+	*)
+
+		FUNCTION isSimpleTag(): BOOLEAN
+		(*
+			"Simple" tags are those that do not allow nested, structured
+			internal tags. For example, "<b><ul>...</ul></b>" is not
+			allowed because <b> is a simple tag and it cannot contain
+			<ul>.
+			"Complex" tags are all the others.
+		*)
+		BEGIN
+			RETURN (t = "b>") OR (t = "i>") OR (t = "code>")
+				OR (t = "sub>") OR (t = "sup>")
+				OR (t = "kbd>") OR (t = "samp>") OR (t = "var>")
+		END
+
+		FUNCTION parseSimpleTag()
+		VAR q, q_end: STRING
+		BEGIN
+			q = t
+			q_end = "/" + q  # expected closing tag
+			addChunk()
+			LOOP
+				IF t = NIL THEN
+					IF l = NIL THEN
+						Error2(here(), "missing closing tag `<" + q_end + "'")
+						eb->AddString( "<" + q_end )
+						RETURN
+					ELSE
+						addBareText("<" + l)
+						nextTag()
+					END
+				ELSIF t = q_end THEN
+					addChunk()
+					RETURN
+				ELSIF isSimpleTag() THEN
+					parseSimpleTag()
+				ELSE
+					Error2(here(), "expected closing tag `<" + q_end + "' near the line `<" + short(l) + "'")
+					eb->AddString( "<" + q_end )
+					RETURN
+				END
+			END
+
+		END
+
+		FUNCTION checkEmptyAfterTag()
+		(*
+			Checks <ul> <ol> </li> tags for tailing chars,
+			for example in "<ul>xxx<li></li>yyy</ul>" detect
+			"xxx" and "yyy". Blanks are always allowed and ignored.
+			Also add the chunk to the result.
+		*)
+		BEGIN
+			IF NOT match(l, t + "[ \t\n\r]*$") THEN
+				Error2(here(), "trailing chars after tag `<" + short(l) + "'"
+				+ ": " + StringToLiteral("<" + l))
+			END
+			eb->AddString( "<" )
+			eb->AddString( t )
+			eb->AddString( "\n" )
+			nextTag()
+		END
+
+		FUNCTION parseLi()
+		(* Parse <li> chunk. *)
+		BEGIN
+			addChunk()
+			parseHtml()
+			IF t = "/li>" THEN
+				checkEmptyAfterTag()
+			ELSE
+				eb->AddString("</li>\n")
+				#Error2(here(), "missing </li>")
+			END
+		END
+
+
+		FUNCTION checkNesting()
+		VAR q, q_end: STRING
+		BEGIN
+			q = t
+			q_end = "/" + q  # expected closing tag
+			addChunk()
+			parseHtml()
+			IF t = NIL THEN
+				IF l = NIL THEN
+					Error2(here(), "missing closing tag `<" + q_end + "'")
+					eb->AddString( "<" + q_end )
+					RETURN
+				ELSE
+					addBareText("<" + l)
+					nextTag()
+				END
+			ELSIF t = q_end THEN
+				addChunk()
+				RETURN
+			ELSE
+				Error2(here(), "expected closing tag `<" + q_end + "' near the line `<" + short(l) + "'")
+				eb->AddString( "<" + q_end )
+				RETURN
+			END
+		END
+
+	BEGIN
+		LOOP
+			IF t = NIL THEN
+				IF l = NIL THEN
+					RETURN
+				ELSE
+					addBareText("<" + l)
+					nextTag()
+				END
+
+			ELSIF (t = "br>") OR (t = "/br>")
+			OR (t = "p>") OR (t = "/p>") THEN
+				# FIXME: check proper nesting and closing
+				addChunk()
+
+			ELSIF isSimpleTag() THEN
+				parseSimpleTag()
+
+			ELSIF (t = "blockquote>") OR (t = "center>") THEN
+				checkNesting()
+
+			ELSIF t = "pre>" THEN
+				eb->AddString( "<pre>" )
+				eb->AddString( textToHtml( l[length(t),length(l)] ) )
+				nextTag()
+				WHILE (t <> "/pre>") AND (l <> NIL) DO
+					eb->AddString( "&lt;" )
+					eb->AddString( textToHtml( l ) )
+					nextTag()
+				END
+				IF l = NIL THEN
+					Error2(here(), "unclosed <pre> entity")
+					eb->AddString( "</pre>\n" )
+					RETURN
+				END
+				addChunk()
+
+			ELSIF t = "ul>" THEN
+				checkEmptyAfterTag()
+				WHILE t = "li>" DO
+					parseLi()
+				END
+				IF t = "/ul>" THEN
+					addChunk()
+				ELSE
+					Error2(here(), "expected `</ul>' near or at "
+						+ short("<" + l))
+					eb->AddString( "</ul>\n" )
+				END
+
+			ELSIF t = "ol>" THEN
+				checkEmptyAfterTag()
+				WHILE t = "li>" DO
+					parseLi()
+				END
+				IF t = "/ol>" THEN
+					addChunk()
+				ELSE
+					Error2(here(), "expected `</ol>' near or at "
+						+ short("<" + l))
+					eb->AddString( "</ol>\n" )
+				END
+
+			ELSE
+				(* either a closing tag or an invalid tag *)
+				RETURN
+
+			END
+		END
+	END
+
+BEGIN
+
+	IF s <= "" THEN
+		RETURN s
+	END
+
+	IF tags = NIL THEN
+		tags = split("b> /b> i> /i> blockquote> /blockquote> center> /center> code> /code> br> kbd> /kbd> p> /p> pre> /pre> /br> sub> /sub> sup> /sup>"
+		+ " ul> /ul> ol> /ol> li> /li> samp> /samp> var> /var>", " ")
+	END
+
+	(*
+		Init scanner. Every chunk of text starts with the character that
+		follows "<" and ends at the character before the next "<" or the
+		end of the text.
+	*)
+	a = split(s, "<")
+	i = 0
+	nextTag()
+	eb->Reset()
+
+	(* The first chunk is always bare text, add it immediately: *)
+	addBareText(l)
+	nextTag()
+
+	LOOP
+		parseHtml()
+		IF l = NIL THEN
+			# Regular end of the text.
+			EXIT
+		ELSE
+			# Invalid entity, try to recover and continue:
+			Error2(here(), "unknown or unexpected HTML entity "
+				+ short("<" + l))
+			addBareText("&lt;" + l)
+			nextTag()
+		END
+	END
+
+	RETURN eb->ToString()
+END
+
+
+FUNCTION skipLWSP()
+BEGIN
+	WHILE isLWSP(c) DO
+		readCh()
+	END
+END
+
+
+VAR b: BUFFER
+
+
+FUNCTION upToEndOfLine(): STRING
+(*
+	Returns all the chars from here up to end of the line or the end
+	of the DocBlock, possibly NIL.	Skip leading LWSP.
+*)
+BEGIN
+	skipLWSP()
+	b->Reset()
+	WHILE (c <> NIL) AND (c <> "\n") DO
+		b->AddString(c)
+		readCh()
+	END
+	IF c = "\n" THEN
+		readCh()
+	END
+	RETURN b->ToString()
+END
+
+
+FUNCTION parseType(w: STRING): Type
+(*
+	Scans the string `w' looking for a type descriptor of the form:
+
+		type {"|" type}
+
+	where
+
+		type = type_name { index } | array;
+		type_name = "void" | "bool" | "boolean" | "FALSE" | "false"
+			| "int" | "float" | "double" | "real" | "number" | "string"
+			| "resource" | "mixed" | "object" | CLASS_NAME;
+		index = "[]" | "[int]" | "[string]";
+		array = "array" [ index {index} [type_name] ];
+	
+	Examples:
+
+		int
+		resource|FALSE
+		float[int][int]   the same as  array[int][int]float
+		Exception
+*)
+
+VAR
+	i: INTEGER  (* index of the next char to be examined *)
+	sym, sym_lc: STRING (* current symbol, original and lower-case *)
+
+
+	FUNCTION next_sym()
+	(*
+		Scan tokens of the type descriptor. Possible tokens are:
+		"[", "]", "|", NIL (end of the string), "anythingelse".
+		Set variables sym and sym_lc.
+	*)
+	VAR	
+		c: STRING
+		j: INTEGER
+	BEGIN
+		IF i >= length(w) THEN
+			sym = NIL
+			sym_lc = NIL
+			RETURN
+		END
+		c = w[i]
+		IF (c = "[") OR (c = "]") OR (c = "|") THEN
+			sym = c
+			sym_lc = sym
+			i = i + 1
+			RETURN
+		END
+		j = index(w, i, "[]|")
+		IF j < 0 THEN
+			sym = w[i,length(w)]
+			sym_lc = tolower(sym)
+			i = length(s)
+			RETURN
+		END
+		sym = w[i,j]
+		sym_lc = tolower(sym)
+		i = j
+	END
+
+
+	FUNCTION isKeyword(k: STRING): BOOLEAN
+	(*
+		Checks if the sym equals the keyword k. k must be in lower-case
+		letters. Warns if they match, but with different combination of uppre-
+		and lower-case letters, for example "StriNg".
+	*)
+	BEGIN
+		IF k = sym_lc THEN
+			IF k <> sym THEN
+				Error2(here(), "spelling check: expected " + k + " but found " + sym)
+			END
+			RETURN TRUE
+		ELSE
+			RETURN FALSE
+		END
+	END
+
+
+	FUNCTION ParseTypeName(): Type
+	VAR cl: Class
+	BEGIN
+		IF sym = NIL THEN
+			Error2(here(), "missing type")
+			next_sym()
+			RETURN NIL
+		ELSIF isKeyword("void") THEN
+			next_sym()
+			RETURN void_type
+		ELSIF isKeyword("bool") OR isKeyword("boolean") THEN
+			next_sym()
+			RETURN boolean_type
+		ELSIF sym_lc = "false" THEN
+			next_sym()
+			RETURN boolean_type
+		ELSIF isKeyword("int") OR isKeyword("integer") THEN
+			next_sym()
+			RETURN int_type
+		ELSIF isKeyword("float") OR isKeyword("double") OR isKeyword("real") THEN
+			next_sym()
+			RETURN float_type
+		ELSIF isKeyword("string") THEN
+			next_sym()
+			RETURN string_type
+		ELSIF isKeyword("resource") THEN
+			next_sym()
+			RETURN resource_type
+		ELSIF isKeyword("mixed") THEN
+			next_sym()
+			RETURN mixed_type
+		ELSIF isKeyword("object") THEN
+			next_sym()
+			RETURN object_type
+		ELSIF match(sym, Globals.BARE_ID_OR_QUALIFIED_NAME) THEN
+			cl = SearchClass( resolve_namespace_operator(sym) )
+			IF cl = NIL THEN
+				Error2(here(), "unknown type/class `" + sym + "'")
+				next_sym()
+				RETURN NIL
+			ELSE
+				next_sym()
+				RETURN cl[type]
+			END
+		ELSE
+			Error2(here(), "invalid type `" + sym + "'")
+			next_sym()
+			RETURN NIL
+		END
+	END
+
+
+	FUNCTION ParseArray(): Type
+	(* Parses array[]T. We enter with sym="[". *)
+	VAR t: Type
+	BEGIN
+		t = {array, mixed, NIL, NIL}
+		next_sym()
+		IF isKeyword("int") THEN
+			t[index_type] = int
+			next_sym()
+		ELSIF isKeyword("string") THEN
+			t[index_type] = string
+			next_sym()
+		END
+		IF sym <> "]" THEN
+			Error2(here(), "in array type declaration expected `[]' or `[int]' or `[string]'")
+			RETURN t
+		END
+		next_sym()
+		IF sym = "[" THEN
+			t[elem_type] = ParseArray()
+		ELSE
+			t[elem_type] = ParseTypeName()
+		END
+		RETURN t
+	END
+
+
+	FUNCTION ParseIndeces(t: Type): Type
+	(*
+		Parses T[][]. t is the type of T. We enter with sym="["
+		of the first index.
+		Returns the type or NIL if fails.
+	*)
+	VAR
+		a: Type
+	BEGIN
+		a = {array, void, NIL, NIL}
+		next_sym()
+		IF isKeyword("int") THEN
+			a[index_type] = int
+			next_sym()
+		ELSIF isKeyword("string") THEN
+			a[index_type] = string
+			next_sym()
+		ELSIF sym = "]" THEN
+			a[index_type] = mixed
+		END
+		IF sym <> "]" THEN
+			Error2(here(), "missing `]' in array type")
+			RETURN NIL
+		END
+		next_sym()
+		IF sym = "[" THEN
+			a[elem_type] = ParseIndeces(t)
+			IF a[elem_type] = NIL THEN
+				RETURN NIL
+			END
+		ELSE
+			a[elem_type] = t
+		END
+		RETURN a
+	END
+
+
+	FUNCTION next_type(): Type
+	VAR
+		t: Type
+	BEGIN
+		IF isKeyword("array") THEN
+			# Old array syntax array[][]T.
+			next_sym()
+			IF sym = "[" THEN
+				t = ParseArray()
+			ELSE
+				t = {array, mixed, mixed_type, NIL}
+			END
+
+		ELSE
+			# New type syntax T[][].
+			t = ParseTypeName()
+			IF t = NIL THEN
+				RETURN NIL
+			END
+			IF sym = "[" THEN
+				t = ParseIndeces(t)
+			END
+		END
+
+		RETURN t
+	END
+
+
+VAR res, ignore: Type
+BEGIN
+	i = 0
+	next_sym()
+	res = next_type()
+	WHILE sym = "|" DO
+		next_sym()
+		ignore = next_type()
+	END
+	IF sym <> NIL THEN
+		Error2(here(), "unknown/unexpected symbol in type: " + sym)
+	END
+	RETURN res
+END
+
+
+FUNCTION parseLineTag()
+(*
+	On entry: c = "@". On exit c=NIL or c="@".
+*)
+
+	FUNCTION check_end_of_line_tag(tag_name: STRING)
+	(*
+		Check the line tag ends here, skipping unexpected words and
+		unexpected continuation lines. Gives appropriate error message
+		about unexpected text found after the tag_name line tag.
+	*)
+	VAR
+		s: STRING
+		already_signaled: BOOLEAN
+	BEGIN
+		(* Consume trailing chars in current line. *)
+		skipLWSP()
+		s = upToEndOfLine()
+		IF s > "" THEN
+			Error2(here(), "unexpected trailing words inside `"
+				+ tag_name + "'")
+			already_signaled = TRUE
+		END
+
+		LOOP
+			skipLWSP()
+			IF c = NIL THEN
+				RETURN
+			ELSIF c = "\n" THEN
+				(* Skip empty line: *)
+				readCh()
+			ELSIF c = "@" THEN
+				(* next line tag starts here *)
+				RETURN
+			ELSE
+				IF NOT already_signaled THEN
+					Error2(here(), "unexpected trailing words inside `"
+						+ tag_name + "'")
+					already_signaled = TRUE
+				END
+				s = upToEndOfLine()
+			END
+		END
+	END
+
+
+	FUNCTION getWord(): STRING
+	(*
+		Returns the next word of the current line tag.
+
+		Skip leading LWSP. Also skips "\n" passing to the next line, but stops
+		if the next line starts with "@", which means we encountered the next
+		line tag. Return NIL if already at the end of the DocBlock or reaches
+		the beginning of a new line tag.
+	*)
+	BEGIN
+		LOOP
+			IF c = NIL THEN
+				RETURN NIL
+			ELSIF c = "\n" THEN
+				readCh()
+				skipLWSP()
+				IF c = "@" THEN
+					RETURN NIL
+				END
+			ELSIF isLWSP(c) THEN
+				skipLWSP()
+			ELSE
+				b->Reset()
+				WHILE (c <> NIL) AND (c <> "\n") AND NOT isLWSP(c) DO
+					b->AddString(c)
+					readCh()
+				END
+				RETURN textToHtml( b->ToString() )
+			END
+		END
+	END
+
+
+	FUNCTION upToNextLineTag(): STRING
+	VAR
+		res: BUFFER
+	BEGIN
+		res->AddString( upToEndOfLine() )
+		res->AddString("\n")
+
+		# parse continuation lines:
+		LOOP
+			# Try parsing another line.
+			# Scan initial LWSPs:
+			WHILE isLWSP(c) DO
+				res->AddString(c)
+				readCh()
+			END
+
+			IF (c = NIL) OR (c = "@") THEN
+				EXIT
+			END
+
+			res->AddString( upToEndOfLine() )
+			res->AddString("\n")
+		END
+		RETURN trim( res->ToString() )
+	END
+
+
+	FUNCTION getText(): STRING
+	(*
+		Bare text spans from here up to the next line tag, or the end
+		of the DocBlock. Empty lines are translated to paragraph
+		separators.
+	*)
+	BEGIN
+		RETURN textToHtml( upToNextLineTag() )
+	END
+
+
+	FUNCTION getDescr(): STRING
+	(*
+		Description spans from here up to the next line tag, or the end
+		of the DocBlock. Description may contain in-line tags and
+		DocBlock pseudo-HTML entities. Empty lines are translated to
+		paragraph separators.
+	*)
+	BEGIN
+		RETURN expandInlineTags( filterValidHtmlEntities( upToNextLineTag() ) )
+	END
+
+
+	FUNCTION parseGlobal()
+	CONST
+		ID = "[a-zA-Z_\x7F-\xFF][a-zA-Z_0-9\x7F-\xFF]*"
+	VAR
+		t: Type
+		n: STRING
+	BEGIN
+		(*
+			Parse type:
+		*)
+		n = getWord()
+		IF n <= "" THEN
+			Error2(here(), "missing type in @global")
+			n = getText()
+			RETURN
+		END
+		t = parseType(n)
+		IF t = NIL THEN
+			# unknown type; ignore declaration
+			n = getText()
+			RETURN
+		END
+		
+		(*
+			Parse name:
+		*)
+		n = getWord()
+		IF n <= "" THEN
+			Error2(here(), "missing variable name in @global")
+			n = getText()
+			RETURN
+		END
+		IF match(n, "^\\$GLOBALS\\[\"" + ID + "\"\\]$")
+		OR match(n, "^\\$GLOBALS\\['" + ID + "'\\]$") THEN
+			n = n[10,length(n)-2]
+		ELSIF match(n, "^\\$" + ID + "$") THEN
+			n = n[1,length(n)]
+		ELSE
+			Error2(here(), "invalid variable name `" + n + "' in @global")
+			check_end_of_line_tag("@global")
+			RETURN
+		END
+		check_end_of_line_tag("@global")
+		pdb[global_type] = t
+		pdb[global_name] = n
+	END
+
+
+	FUNCTION parseParam(position: INTEGER): Parameter
+	VAR p: Parameter
+		w: STRING
+	BEGIN
+		(*
+			Parse TYPE:
+		*)
+		w = getWord()
+		IF (w > "") AND (w[0] = "$") THEN
+			Error2(here(), "invalid @param declaration: expected @param TYPE $var")
+			w = getDescr()
+			RETURN NIL
+		ELSE
+			p[type] = parseType(w)
+			IF p[type] = void_type THEN
+				Error2(here(), "@param cannot be `void'")
+				p[type] = NIL
+			END
+		END
+
+		(*
+			Parse "&":
+		*)
+		skipLWSP()
+		IF c = "&" THEN
+			p[reference] = TRUE
+			readCh()
+		END
+
+		(*
+			Parse param. name:
+		*)
+		w = getWord()
+		IF w <= "" THEN
+			Error2(here(), "missing parameter name for @param no. " + (position+1))
+			w = getDescr()
+			RETURN NIL
+		ELSIF NOT match(w, "^\\$[a-zA-Z_\x7F-\xFF][a-zA-Z_0-9\x7F-\xFF]*$") THEN
+			Error2(here(), "invalid parameter name `" + w + "', expected variable name `$varname'")
+			w = getDescr()
+			RETURN NIL
+
+		ELSE
+			p[name] = w[1,length(w)]
+
+		END
+
+		(*
+			Parse description:
+		*)
+		p[descr] = getDescr()
+
+		p[used] = FALSE
+
+		RETURN p
+	END
+
+	FUNCTION ParseThrows()
+	(*
+		Parse @throws WORD [DESCR] line tag.
+	*)
+	VAR
+		w, descr: STRING
+		c: Class
+	BEGIN
+		
+		(*
+			Parse exception:
+		*)
+
+		w = getWord()
+		IF w <= "" THEN
+			Error2(here(), "missing class in @throws")
+			RETURN
+		END
+
+		c = SearchClass( resolve_namespace_operator(w) )
+		IF c = NIL THEN
+			Error2(here(), "unknown exception `" + w + "'")
+		ELSIF NOT Classes.IsExceptionClass(c) THEN
+			Error2(here(), "class `" + w + "' is not an exception")
+			c = NIL
+		END
+
+		descr = getDescr()
+
+		IF c <> NIL THEN
+			pdb[exceptions][] = c
+			IF descr > "" THEN
+				pdb[thrown_exceptions_descr][] = {c, descr}
+			END
+		END
+	END
+
+
+	FUNCTION parseUnsupportedUnimplementedLineTag(w: STRING)
+	BEGIN
+		descr->AddString("<br>" + textToHtml(w + " " + getText()) )
+	END
+
+
+VAR
+	p: Parameter
+	position: INTEGER
+	w, url: STRING
+BEGIN
+	w = getWord()
+
+	(*
+		REMEMBER: the parsing of each line tag MUST terminate with
+		a call to either check_end_of_line_tag() or getDescr() or getText()
+		in order the next symbol to be parsed be the next line
+		tag or the end of the DocBlock.
+	*)
+
+	# @abstract
+	IF w = "@abstract" THEN
+		pdb[abstract] = TRUE
+		check_end_of_line_tag("@abstract")
+
+	# @access [public|protected|private]
+	ELSIF w = "@access" THEN
+		w = getWord()
+		IF w = "private" THEN
+			pdb[private] = TRUE
+		ELSIF w = "protected" THEN
+			pdb[protected] = TRUE
+		ELSIF w = "public" THEN
+			pdb[public] = TRUE
+		ELSE
+			Error2(here(), "expected public|protected|private after @access")
+		END
+		check_end_of_line_tag("@access")
+
+	# @author TEXT
+	ELSIF w = "@author" THEN
+		descr->AddString("<@author " + getText() + ">\n")
+
+	# @copyright DESCR
+	ELSIF w = "@copyright" THEN
+		descr->AddString("<@copyright " + getDescr() + ">\n")
+
+	# @deprecated DESCR
+	ELSIF (w = "@deprecated") OR (w = "@deprec") THEN
+		descr->AddString("\n<@deprecated " + getDescr() + ">\n")
+
+	# @final
+	ELSIF w = "@final" THEN
+		pdb[final] = TRUE
+		check_end_of_line_tag("@final")
+	
+	# @global
+	ELSIF w = "@global" THEN
+		parseGlobal()
+
+	# @license WORD [TEXT]
+	ELSIF w = "@license" THEN
+		url = getWord()
+		w = getText()
+		IF length(w) = 0 THEN
+			w = url
+		END
+		descr->AddString("\n<@license <a href=\"" + url + "\">" + w + "</a>>\n")
+
+	# @link WORD [TEXT]
+	ELSIF w = "@link" THEN
+		url = getWord()
+		w = getText()
+		IF length(w) = 0 THEN
+			w = url
+		END
+		descr->AddString("\n<p><b>Link:</b> <a href=\"" + url + "\">" + w + "</a></p>\n")
+
+	# @package WORD
+	ELSIF w = "@package" THEN
+		pdb[package_tag_found] = TRUE
+		w = getWord()
+		descr->AddString("<@package " + w + ">\n")
+		check_end_of_line_tag("@package")
+
+	# @param TYPE NAME [DESCR]
+	ELSIF w = "@param" THEN
+		IF pdb = NIL THEN
+			position = 0
+		ELSE
+			position = count(pdb[params])
+		END
+		p = parseParam(position)
+		IF p <> NIL THEN
+			IF pdb = NIL THEN
+				pdb[params] = NIL
+			END
+			pdb[params][] = p
+		END
+
+	# @return TYPE DESCR
+	ELSIF w = "@return" THEN
+		pdb[return] = parseType( getWord() )
+		return_descr = getDescr()
+
+	# @see WORD
+	# FIXME: @see $var inside a class should be converted to <@see ::$var>.
+	#        Moreover, phpDoc does some guesses in the ambigous cases.
+	ELSIF w = "@see" THEN
+		descr->AddString("<@see " + getWord() + ">\n")
+		check_end_of_line_tag("@see")
+
+	# @since DESCR
+	ELSIF w = "@since" THEN
+		descr->AddString("\n<@since " + getDescr() + ">\n")
+	
+	# @static
+	ELSIF w = "@static" THEN
+		pdb[static] = TRUE
+		check_end_of_line_tag("@static")
+
+	# @throws WORD [DESCR]
+	ELSIF w = "@throws" THEN
+		ParseThrows()
+
+	# @todo DESCR
+	ELSIF w = "@todo" THEN
+		descr->AddString("\n<p>\n<b>To-do:</b>\n"
+			+ getDescr() + "\n</p>\n")
+	
+	# @var TYPE DESCR
+	ELSIF w = "@var" THEN
+		pdb[var_type] = parseType( getWord() )
+		IF pdb[var_type] = void_type THEN
+			Error2(here(), "@var cannot be `void'")
+			pdb[var_type] = NIL
+		END
+		descr->AddString( getDescr() + "\n" )
+
+	# @version DESCR
+	ELSIF w = "@version" THEN
+		w = getDescr()
+		descr->AddString("<@version " + w + ">\n")
+
+	# Unsupported tags:
+	ELSIF (w = "@example")
+	OR (w = "@category")
+	OR (w = "@example")
+	OR (w = "@exception")
+	OR (w = "@filesource")
+	OR (w = "@ignore")
+	OR (w = "@internal")
+	OR (w = "@name")
+	OR (w = "@staticvar")
+	OR (w = "@subpackage")
+	OR (w = "@tutorial")
+	OR (w = "@uses")
+	THEN
+		Notice2(here(), "unsupported line tag `" + w + "'")
+		parseUnsupportedUnimplementedLineTag(w)
+
+	ELSE
+		Error2(here(), "unknown line tag `" + w + "'")
+		parseUnsupportedUnimplementedLineTag(w)
+
+	END
+END
+
+
+FUNCTION parseShortAndLongDescr(VAR short: STRING, VAR long: STRING)
+(*
+	Parse the short and the long description up to the first @ line
+	or the end of the DocBlock. The returned short description is a
+	single line of text.
+*)
+
+	FUNCTION findPeriod(s: STRING): INTEGER
+	(*
+		Returns offset of the first period followed by a space, tabulation,
+		new line or end of the string. Return -1 if not found.
+	*)
+	VAR
+		i: INTEGER
+		next_ch: STRING
+	BEGIN
+		LOOP
+			i = index(s, i, ".")
+			IF i < 0 THEN
+				RETURN -1
+			ELSIF i = length(s) - 1 THEN
+				RETURN i
+			END
+			next_ch = s[i+1]
+			IF (next_ch = " ") OR (next_ch = "\t") OR (next_ch = "\n") THEN
+				RETURN i
+			END
+			inc(i, 1)
+		END
+	END
+
+VAR
+	i, x: INTEGER
+	b: BUFFER
+	spaces, s: STRING
+	a: ARRAY OF STRING
+
+BEGIN
+	short = NIL
+	long = NIL
+
+	# Always skip initial spaces and empty lines:
+	WHILE isLWSP(c) OR (c = "\n") DO
+		readCh()
+	END
+
+	b->Reset()
+
+	(*
+		Parse up to 3 lines to detect short description and beginning
+		of the long description. At the end of the loop we will have
+		the short description and possibly the initial part of the long
+		description. The short descr. is the first sentence terminated
+		by period, or the first non-empty line if that first sentence
+		is not found within the first 3 lines.
+	*)
+	LOOP
+		# Try parsing another line.
+		# Skip (but account for) initial LWSPs:
+		spaces = ""
+		WHILE isLWSP(c) DO
+			spaces = spaces + c
+			readCh()
+		END
+
+		IF (c = NIL) OR (c = "@") THEN
+			short = join(a, " ")
+			EXIT
+		END
+
+		s = upToEndOfLine()
+
+		IF s <= "" THEN  # found empty line
+			short = join(a, " ")
+			EXIT
+		END
+
+		s = spaces + s
+
+		x = findPeriod(s)
+
+		IF x > 0 THEN
+			short = join(a, " ") + " " + s[0,x]
+			b->AddString( s[x+1,length(s)] )
+			b->AddString( "\n" )
+			EXIT
+		END
+
+		a[] = s
+
+		IF count(a) >= 3 THEN
+			short = a[0]
+			FOR i=1 TO count(a)-1 DO
+				b->AddString( a[i] )
+				b->AddString( "\n" )
+			END
+			EXIT
+		END
+
+	END
+
+	(*
+		Scans remaining lines of the long description.
+	*)
+	LOOP
+		# Try parsing another line.
+		# Skip (but account for) initial LWSPs:
+		s = ""
+		WHILE isLWSP(c) DO
+			s = s + c
+			readCh()
+		END
+
+		IF (c = NIL) OR (c = "@") THEN
+			EXIT
+		END
+
+		s = s + upToEndOfLine()
+		b->AddString(s)
+		b->AddString("\n")
+	END
+
+	short = expandInlineTags( filterValidHtmlEntities( short ) )
+	long = expandInlineTags( filterValidHtmlEntities( b->ToString() ) )
+END
+
+
+FUNCTION ParseDocBlock(doc: STRING): ParsedDocBlock
+
+
+VAR
+	p: Parameter
+	i: INTEGER
+
+	is_template: BOOLEAN
+	(* is the current DocBlock being parsed a template? i.e. it starts
+	   with /**@+ ... *)
+
+	short, long: STRING
+
+BEGIN
+	IF NOT parse_phpdoc THEN
+		RETURN NIL
+	END
+
+	(*
+		Opening a new template?
+	*)
+	IF (length(doc) >= 8) AND (doc[0,6] = "/**#@+") THEN
+		IF template <> NIL THEN
+			Error2(here(), "missing closing /**#@-*/ for template opened in "
+			+ reference(template_where))
+		END
+		is_template = TRUE
+		template = NIL
+		template_where = here()
+	END
+
+	(*
+		Closing current template?
+	*)
+	IF doc = "/**#@-*/" THEN
+		IF template = NIL THEN
+			Error2(here(), "no previous template opened")
+		END
+		template = NIL
+	END
+
+	IF types = NIL THEN
+		types = {
+			{ "int", int_type },
+			{ "string", string_type }
+		}
+	END
+
+	(* Init scanner: *)
+	in = doc
+	IF is_template THEN
+		# Skip "#@+":
+		pos = 6
+	ELSE
+		pos = 3
+	END
+	line_n = 1
+	len = length(doc)
+	IF len <= 5 THEN
+		RETURN NIL
+	END
+	len = len - 2
+	c = " "
+	readCh()
+
+	(* Init parser: *)
+	pdb = NIL
+	return_descr = NIL
+	descr->Reset()
+
+	parseShortAndLongDescr(short, long)
+	IF (short > "") OR (long > "") THEN
+		descr->AddString(short)
+		descr->AddString("\n\n")
+		descr->AddString(long)
+	END
+
+	(*
+		Parse line tags:
+	*)
+
+	WHILE isLWSP(c) DO
+		readCh()
+	END
+
+	WHILE c = "@" DO
+			parseLineTag()
+	END
+	
+	IF c <> NIL THEN
+		HALT("expected @ in DocBlock, found " + StringToLiteral(c))
+	END
+
+	(*
+		"Parameters" section. Only those params that have a description
+		are listed.
+	*)
+	IF (pdb <> NIL) AND (pdb[params] <> NIL) THEN
+		b->Reset()
+		FOR i=0 TO count(pdb[params])-1 DO
+			p = pdb[params][i]
+			IF p[descr] > "" THEN
+				b->AddString("<tr><td valign=top><b><code>$"
+				+ p[name] + "&nbsp;&nbsp;</code></b></td> <td valign=top>"
+				+ p[descr] + "</td></tr>\n")
+			END
+		END
+		IF b->Length() > 0 THEN
+			descr->AddString("\n<p><b>Parameters:</b>\n<table>\n")
+			descr->AddString( b->ToString() )
+			descr->AddString("</table>\n</p>\n")
+		END
+	END
+
+	(*
+		"Return" section:
+	*)
+	IF return_descr > "" THEN
+		descr->AddString("\n<p><b>Return:</b> " + return_descr + "</p>\n")
+	END
+
+	IF descr->Length() > 0 THEN
+		pdb[descr] = descr->ToString()
+	END
+
+	IF pdb = NIL THEN
+		IF is_template THEN
+			Notice2(here(), "useless empty template")
+		END
+		RETURN NIL
+	END
+
+	(*
+		Check for multiple conflicting @access declarations:
+	*)
+	IF pdb[private] AND (pdb[protected] OR pdb[public])
+	OR pdb[protected] AND pdb[public] THEN
+		Error2(here(), "multiple @access declarations")
+	END
+
+	IF is_template THEN
+		template = pdb
+	END
+
+	RETURN pdb
+END
+
+
+FUNCTION SearchParam(pdb: ParsedDocBlock, name: STRING): Parameter
+VAR
+	params: ARRAY OF Parameter
+	i: INTEGER
+BEGIN
+	IF pdb = NIL THEN
+		RETURN NIL
+	END
+	params = pdb[params]
+	FOR i=0 TO count(params)-1 DO
+		IF params[i][name] = name THEN
+			RETURN params[i]
+		END
+	END
+
+	RETURN NIL
+END
+
+
+FUNCTION ReportUnusedParams(pdb: ParsedDocBlock)
+VAR
+	params: ARRAY OF Parameter
+	i: INTEGER
+BEGIN
+	IF pdb = NIL THEN
+		RETURN
+	END
+	params = pdb[params]
+	FOR i=0 TO count(params)-1 DO
+		IF NOT params[i][used] THEN
+			Error("undefined parameter `$" + params[i][name]
+			+ "' listed un DocBlock above")
+		END
+	END
+END
+
+
+END

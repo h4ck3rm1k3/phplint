@@ -1,0 +1,811 @@
+IMPLEMENTATION MODULE Proto
+
+IMPORT m2, str
+IMPORT Accounting
+IMPORT Exceptions
+IMPORT Expressions
+IMPORT Globals
+IMPORT Namespace
+IMPORT Scanner
+IMPORT Search
+IMPORT Classes
+
+
+FUNCTION ParseArgsListDecl(sign: SIGNATURE, function_or_method: STRING)
+VAR
+	a: FormalArg
+	opt_arg: BOOLEAN
+BEGIN
+	Expect(sym_x_lround, "expected '(' in " + function_or_method + " declaration")
+	ReadSym()
+
+	LOOP
+		IF sym = sym_x_rround THEN
+			EXIT
+		END
+
+		IF sym = sym_x_args THEN
+			sign[more_args] = TRUE
+			ReadSym()
+			EXIT
+		END
+
+		a = NIL
+
+		(*
+			Check `return' attribute:
+		*)
+		IF sym = sym_x_return THEN
+			a[reference_return] = TRUE
+			ReadSym()
+		END
+
+		(*
+			Parse type of the formal arg:
+		*)
+		a[type] = ParseType(FALSE)
+		IF a[type] = NIL THEN
+			Error("missing type of the argument")
+			a[type] = mixed_type
+		ELSIF a[type] = void_type THEN
+			Error("argument of type `void' not allowed")
+		END
+
+		(*
+			Parse passing method:
+		*)
+		IF sym = sym_x_bit_and THEN
+			a[reference] = TRUE
+			ReadSym()
+		ELSE
+			IF a[reference_return] THEN
+				Error("invalid `return' attribute for argument passed by value")
+				a[reference_return] = FALSE
+			END
+		END
+
+		(*
+			Parse name of the formal arg, currently ignored:
+			FIXME: check for duplicated names.
+		*)
+		Expect(sym_x_variable, "expected name of the formal argument in "
+			+ function_or_method + " declaration")
+		a[name] = s
+		ReadSym()
+
+		(*
+			Parse default value:
+		*)
+		IF sym = sym_x_assign THEN
+			IF (php_ver = php4) AND a[reference] THEN
+				Error("can't assign default value to formal argument passed by reference (PHP 5)")
+			END
+			opt_arg = TRUE
+			ReadSym()
+		ELSIF opt_arg THEN
+			Error("missing default value for argument `$" + a[name] + "'. Hint: mandatory arguments can't follow the default ones.")
+		END
+
+		sign[args][] = a
+		IF NOT opt_arg THEN
+			inc(sign[mandatory], 1)
+		END
+
+		IF sym = sym_x_comma THEN
+			ReadSym()
+			IF sym = sym_x_args THEN
+				sign[more_args] = TRUE
+				ReadSym()
+				EXIT
+			END
+
+		ELSE
+			EXIT
+
+		END
+	END
+	Expect(sym_x_rround, "expected ')' or ',' in " + function_or_method
+	+ " declaration")
+	ReadSym()
+END
+
+
+FUNCTION ForwFuncDecl(private: BOOLEAN, t: Type)
+VAR
+	sign: SIGNATURE
+	f, parent_func: Function
+BEGIN
+
+	IF t = NIL THEN
+		Error("missing or invalid return type in function prototype")
+	END
+	sign[return] = t
+	ReadSym()
+
+	IF sym = sym_x_bit_and THEN
+		sign[reference] = TRUE
+		IF php_ver = php5 THEN
+			Warning("obsolete syntax `function &func()', don't use in PHP 5")
+		END
+		ReadSym()
+	END
+
+	(*
+		Parse name:
+	*)
+
+	Expect(sym_x_identifier, "expected function name after `function'")
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	f = SearchFuncByAbsName(s, FALSE)
+	IF f = NIL THEN
+		f[name] = s
+		f[name_lower] = tolower(s)
+		f[forward] = TRUE
+		f[private] = private
+		f[decl_in] = here()
+		f[used] = 0
+		f[last_rhs] = NIL
+		f[sign] = sign
+		funcs[] = f
+	ELSE
+		Error("function `" + s + "' already declared in " + reference(f[decl_in]))
+	END
+	parent_func = curr_func
+	curr_func = f
+	inc(scope, 1)
+	ReadSym()
+
+	(*
+		Parse formal args:
+	*)
+	ParseArgsListDecl(sign, "function")
+
+	(*
+		Parse list of thrown exceptions:
+	*)
+
+	IF sym = sym_x_throws THEN
+		ParseThrows()
+	END
+
+	Expect(sym_x_semicolon, "expected `;' after function prototype")
+	ReadSym()
+
+	CleanCurrentScope()
+	inc(scope, -1)
+	curr_func = parent_func
+
+	(*
+		If the function was used before being defined, compare the old
+		guessed signature with the declared one parsed right now:
+	IF (f[guessed_sign_in] <> NIL) AND NOT SameSign(old_sign, sign) THEN
+		Error2(f[decl_in], "function `" + f[name]
+		+ "()': declared signature "
+		+ FunctionSignatureToString(sign) + " differs from signature "
+		+ FunctionSignatureToString(old_sign)
+		+ " as guessed in " + reference(f[guessed_sign_in]))
+	END
+
+	*)
+
+END
+
+
+FUNCTION ParseMethodProto(visibility: Visibility, abstract: BOOLEAN,
+	final: BOOLEAN, static: BOOLEAN, t: Type)
+VAR
+	m, old_m: Method
+	i: INTEGER
+	sign: SIGNATURE
+	this: VARIABLE
+	guess: BOOLEAN
+	is_constructor, is_destructor: BOOLEAN
+
+
+	(************
+
+	FUNCTION ParentConstructor(c: Class): Class
+	(*
+		FIXME: not used
+		Returns the parent class containing the constructor, or
+		NIL if no constructors are defined in parent classes.
+	*)
+	BEGIN
+		c = c[extends]
+		WHILE (c <> NIL) AND (c[construct] = NIL) DO
+			c = c[extends]
+		END
+		RETURN c
+	END
+
+	FUNCTION ParentDestructor(c: Class): Class
+	(*
+		FIXME: not used
+		Returns the parent class containing the destructor, or
+		NIL if no constructors are defined in parent classes.
+	*)
+	BEGIN
+		c = c[extends]
+		WHILE (c <> NIL) AND (c[destruct] = NIL) DO
+			c = c[extends]
+		END
+		RETURN c
+	END
+
+	***************)
+
+BEGIN
+	(*
+		Check and sanitize flags:
+	*)
+	IF curr_class[interface] THEN
+		abstract = TRUE
+		IF visibility <> public THEN
+			Error("interface methods must be `public'")
+			visibility = public
+		END
+		IF final THEN
+			Error("interface methods cannot be `final'")
+			final = FALSE
+		END
+
+	ELSIF curr_class[abstract] THEN
+		IF abstract THEN
+			IF visibility = private THEN
+				Error("abstract methods cannot be `private'")
+				visibility = protected
+			END
+			IF static THEN
+				Error("abstract methods cannot be static")
+				static = FALSE
+			END
+			IF final THEN
+				Error("abstract methods cannot be `final'")
+				final = FALSE
+			END
+		ELSE
+			IF final AND (visibility = private) THEN
+				Warning("a private method is implicitly `final'")
+				final = FALSE
+			END
+		END
+
+	ELSE (* regular class *)
+		IF abstract THEN
+			Error("abstract method in non-abstract class")
+			abstract = FALSE
+		END
+		IF final AND (visibility = private) THEN
+			Warning("a private method is implicitly `final'")
+			final = FALSE
+		END
+
+	END
+
+	m[forward] = TRUE
+	m[abstract] = abstract
+	m[visibility] = visibility
+	m[static] = static
+	m[final] = final
+
+	sign[return] = t
+	IF t = NIL THEN
+		Error("missing return type in method prototype -- assuming `void' and trying to continue anyway")
+		guess = TRUE
+		sign[return] = void_type
+	END
+
+	ReadSym()
+
+	(*
+		&
+	*)
+	IF sym = sym_x_bit_and THEN
+		sign[reference] = TRUE
+		IF php_ver = php5 THEN
+			Warning("obsolete syntax `function &func()', don't use in PHP 5")
+		END
+		ReadSym()
+	END
+
+	(*
+		Parse name:
+	*)
+	Expect(sym_x_identifier, "expected method name")
+	old_m = SearchClassMethod(curr_class, s, FALSE)
+	IF old_m <> NIL THEN
+		IF old_m[decl_in] <> NIL THEN
+			Error("method `" + s + "()' already defined in "
+			+ reference(old_m[decl_in]))
+		END
+
+		# Substitute this definition to the guessed or duplicated one:
+		i = 0
+		WHILE curr_class[methods][i] <> old_m DO
+			inc(i, 1)
+		END
+		curr_class[methods][i] = m
+	ELSE
+		# Add the method to the class:
+		curr_class[methods][] = m
+	END
+	m[name] = s
+	m[name_lower] = tolower(s)
+
+	m[decl_in] = here()
+	m[sign] = sign
+
+	(*
+		Check constructor and set is_constructor:
+	*)
+	IF php_ver = php4 THEN
+
+		IF m[name_lower] = "__construct" THEN
+			Warning("constructor `" + m[name]
+			+ "': this name is reserved for PHP 5 constructors")
+		END
+		IF m[name_lower] = curr_class[name_lower] THEN
+			is_constructor = TRUE
+			IF curr_class[construct] = NIL THEN
+				curr_class[construct] = m
+			ELSE
+				Error("constructor `" + m[name] +
+				"': constructor already declared as `"
+				+ curr_class[construct][name] + "'")
+			END
+		END
+
+	ELSE (* php5 *)
+
+		IF m[name_lower] = "__construct" THEN
+			is_constructor = TRUE
+
+		ELSIF m[name_lower] = curr_class[name_lower] THEN
+			is_constructor = TRUE
+			Warning("the constructor `" + m[name]
+				+ "' has the same name of the class. PHP 5 states"
+				+ " it should be called `__construct()'")
+			is_constructor = TRUE
+
+		ELSIF Namespace.inNamespace()
+		AND str.ends_with(curr_class[name_lower], "\\" + m[name_lower]) THEN
+			Warning("the method `" + m[name]
+				+ "' has the same name of the class inside a namespace: if it is intended to be a constructor, call it `__construct()' instead (PHP >= 5.3.3)")
+		END
+
+		IF is_constructor THEN
+			IF curr_class[construct] = NIL THEN
+				curr_class[construct] = m
+			ELSE
+				Error("constructor `" + m[name]
+				+ "': constructor already declared as `"
+				+ curr_class[construct][name] + "'")
+			END
+		END
+
+	END
+
+	(*
+		Check destructor:
+	*)
+	is_destructor = (php_ver = php5) AND (m[name_lower] = "__DESTRUCT")
+	IF is_destructor THEN
+		curr_class[destruct] = m
+	END
+
+	IF NOT report_unused OR is_constructor OR is_destructor OR abstract THEN
+		m[used] = 100
+	END
+
+	curr_method = m
+	inc(scope, 1)
+	ReadSym()
+
+	(*
+		Virtual declaration of the $this variable:
+	*)
+	# Hack: use "*" to prevent errors from AccountVarLHS()
+	AccountVarLHS("*", FALSE)
+	this = SearchVar("*")
+	this[name] = "this"
+	this[type] = curr_class[type]
+
+	(*
+		Parse formal args:
+	*)
+	ParseArgsListDecl(sign, "method")
+
+	IF NOT is_constructor THEN
+		# FIXME:
+		# CheckSpecialMethodSignature(m)
+
+	ELSE
+		(*
+			Check visibility/static properties and signature
+			of the constructor (since it may or may not have
+			arguments, its signature cannot be checked by
+			CheckSpecialMethodSignature()):
+		*)
+		IF m[static] THEN
+			Error("constructor `" + m[name]
+			+ "': a constructor cannot be `static'")
+			m[static] = FALSE
+		END
+		IF (sign[return] <> NIL) AND (sign[return] <> void_type) THEN
+			Error("constructor `" + m[name] + "': a constructor cannot"
+			+ " return a value. It must be declared `void'.")
+		END
+		sign[return] = void_type
+	END
+
+	(*
+		Parse list of thrown exceptions:
+	*)
+
+	IF sym = sym_x_throws THEN
+		ParseThrows()
+	END
+
+	Expect(sym_x_semicolon, "expected `;' at the end of the method prototype")
+	ReadSym()
+
+	this[used] = 100  # prevent notice "unused var. $this"
+
+	# FIXME:
+	#CheckOverriddenMethod(curr_class, m)
+
+	CleanCurrentScope()
+	inc(scope, -1)
+	curr_method = NIL
+END
+
+
+FUNCTION ParseClassConstProto()
+VAR
+	cl: Class
+	c: ClassConst
+BEGIN
+	ReadSym()
+
+	LOOP
+		Expect(sym_x_identifier, "expected constant name")
+
+		(*
+			Check multiple definitions or re-definition of inherited consts:
+		*)
+		ResolveClassConst(curr_class, s,  cl, c)
+		IF c <> NIL THEN
+			IF cl = curr_class THEN
+				Error("class constant `" + s + "' already defined in "
+				+ reference(c[decl_in]))
+			ELSIF cl[abstract] OR cl[interface] THEN
+				Error("cannot re-define the constant `"
+				+ pc(curr_class, cl) + "::" + s
+				+ "' inherited from interface or abstract class")
+			END
+		END
+
+		c = NIL
+		c[name] = s
+		c[forward] = TRUE
+		c[visibility] = public
+		c[decl_in] = here()
+		IF NOT report_unused THEN
+			c[used] = 100
+		END
+		ReadSym()
+		c[value] = NIL
+		curr_class[consts][] = c
+
+		IF sym = sym_x_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+
+	Expect(sym_x_semicolon, "missing `;'")
+	ReadSym()
+
+END
+
+
+FUNCTION ParseAttributes(
+	VAR visibility: Visibility,
+	VAR abstract: BOOLEAN,
+	VAR final: BOOLEAN,
+	VAR static: BOOLEAN,
+	VAR unchecked: BOOLEAN)
+BEGIN
+	visibility = public
+	abstract = FALSE
+	final = FALSE
+	static = FALSE
+	unchecked = FALSE
+
+	LOOP
+		IF sym = sym_x_private THEN
+			visibility = private
+			ReadSym()
+
+		ELSIF sym = sym_x_protected THEN
+			visibility = protected
+			ReadSym()
+
+		ELSIF sym = sym_x_public THEN
+			visibility = public
+			ReadSym()
+
+		ELSIF sym = sym_x_abstract THEN
+			abstract = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_x_final THEN
+			final = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_x_static THEN
+			static = TRUE
+			ReadSym()
+
+		ELSIF sym = sym_x_unchecked THEN
+			unchecked = TRUE
+			ReadSym()
+
+		ELSE
+			EXIT
+		END
+	END
+END
+
+
+FUNCTION ForwInterfaceDecl(private: BOOLEAN)
+VAR
+	c: Class
+	visibility: Visibility
+	abstract, final, static, unchecked: BOOLEAN
+	t: Type
+BEGIN
+	ReadSym()
+	Expect(sym_x_identifier, "expected interface name")
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	c = SearchClassByAbsName(s, FALSE)
+	IF c <> NIL THEN
+		#IF NOT c[forward] THEN
+			Error("class `" + s + "' already declared in "
+			+ reference(c[decl_in]))
+		#END
+		# TODO: checks
+	ELSE
+		c[name] = s
+		c[name_lower] = tolower(s)
+		c[forward] = TRUE
+		c[interface] = TRUE
+		c[type] = {object, void, NIL, c}
+		c[private] = private
+		IF NOT report_unused THEN
+			c[used] = 100
+		END
+		classes[] = c
+	END
+	c[decl_in] = here()
+	ReadSym()
+
+	IF sym = sym_x_extends THEN
+		# FIXME: to do
+		Fatal("`extends' keyword still unimplemented in interface prototype, sorry")
+	END
+
+	Expect(sym_x_lbrace, "expected '{' in interface prototype")
+	ReadSym()
+
+	curr_class = c
+	WHILE sym <> sym_x_rbrace DO
+		IF sym = sym_x_const THEN
+			ParseClassConstProto()
+		ELSE
+			ParseAttributes(visibility, abstract, final, static, unchecked)
+			IF unchecked THEN
+				Error("invalid `unchecked' attribute for method")
+			END
+			t = ParseType(FALSE)
+			ParseMethodProto(visibility, abstract, final, static, t)
+		END
+	END
+	curr_class = NIL
+
+	Expect(sym_x_rbrace, "expected `}' in interface prototype")
+	ReadSym()
+END
+
+
+FUNCTION ForwClassDecl(private: BOOLEAN, abstract: BOOLEAN, final: BOOLEAN,
+	unchecked: BOOLEAN)
+VAR
+	c, parent, if: Class
+	visibility: Visibility
+	static: BOOLEAN
+	t: Type
+BEGIN
+	ReadSym()
+	Expect(sym_x_identifier, "expected class name")
+	s = Namespace.CheckBareID(s)
+	s = Namespace.Absolute(s)
+	c = SearchClassByAbsName(s, FALSE)
+	IF c <> NIL THEN
+		#IF NOT c[forward] THEN
+			Error("class `" + s + "' already declared in "
+			+ reference(c[decl_in]))
+		#END
+		# TODO: checks
+	ELSE
+		c[name] = s
+		c[name_lower] = tolower(s)
+		c[forward] = TRUE
+		c[abstract] = abstract
+		c[final] = final
+		c[type] = {object, void, NIL, c}
+		c[private] = private
+		c[unchecked] = unchecked
+		classes[] = c
+	END
+	c[decl_in] = here()
+	ReadSym()
+
+	IF sym = sym_x_extends THEN
+		ReadSym()
+		Expect(sym_x_identifier, "expected parent class name after `extend'")
+		parent = SearchClass(s)
+		IF parent = NIL THEN
+			Error("undeclared parent class `" + s + "'")
+		ELSIF IsSubclassOf(parent, c) THEN
+			Error("class " + c[name] + " cannot extend child class "
+			+ parent[name] + ": forbidden circular reference")
+		ELSIF parent[final] THEN
+			Error("can't extend final class `" + parent[name] + "'")
+		ELSIF parent[interface] THEN
+			Error("can't extend interface class `" + parent[name] + "'")
+		ELSE
+			c[extends] = parent
+
+			# Check usage of the `unchecked' attribute:
+			IF unchecked THEN
+				IF NOT IsExceptionClass(parent) THEN
+					Error("invalid `unchecked' attribute for non-exception class "
+					+ parent[name])
+				END
+
+			ELSIF IsSubclassOf(parent, ExceptionClass) AND parent[unchecked]
+			THEN
+				Error("missing `unchecked' attribute extending unchecked exception " + parent[name])
+			END
+
+		END
+		ReadSym()
+	END
+
+	IF sym = sym_x_implements THEN
+		ReadSym()
+		LOOP
+			Expect(sym_x_identifier, "expected interface name")
+			if = SearchClass(s)
+			IF if = NIL THEN
+				Error("undeclared interface class `" + s + "'")
+			ELSIF NOT if[interface] THEN
+				Error("the class `" + s + "' isn't an interface")
+			ELSIF (php_ver = php5) AND (if[name] = "Traversable") THEN
+				Error("can't implement abstract interface `Traversable', use `Iterator' or `IteratorAggregate' instead")
+			ELSIF IsSubclassOf(c, if) THEN
+				Notice("class " + c[name]
+				+ " redundantly extends interface "
+				+ if[name] + " -- ignoring")
+			ELSE
+				c[implements][] = if
+				# FIXME: check multiple recurrence of the same class
+				# not really an error, however
+				AccountClass(if)
+				IF if[deprecated] > "" THEN
+					Warning("implementing deprecated interface `"
+					+ if[name] + "': " + if[deprecated])
+				END
+			END
+			ReadSym()
+			IF sym = sym_x_comma THEN
+				ReadSym()
+			ELSE
+				EXIT
+			END
+		END
+	END
+
+	Expect(sym_x_lbrace, "expected `{' in class prototype")
+	ReadSym()
+
+	curr_class = c
+	WHILE sym <> sym_x_rbrace DO
+		IF sym = sym_x_const THEN
+			ParseClassConstProto()
+		ELSE
+			ParseAttributes(visibility, abstract, final, static, unchecked)
+			IF unchecked THEN
+				Error("invalid `unchecked' attribute for method")
+			END
+			t = ParseType(FALSE)
+			ParseMethodProto(visibility, abstract, final, static, t)
+		END
+	END
+	curr_class = NIL
+
+	Expect(sym_x_rbrace, "expected `}' in class prototype")
+	ReadSym()
+END
+
+
+FUNCTION ParseForwardDecl()
+VAR
+	visibility: Visibility
+	abstract, final, static, unchecked: BOOLEAN
+	t: Type
+BEGIN
+	IF scope > 0 THEN
+		Error("forward declarations allowed only in global scope")
+	END
+
+	ReadSym()
+
+	ParseAttributes(visibility, abstract, final, static, unchecked)
+	t = ParseType(FALSE)
+
+	IF (curr_class = NIL) AND (scope = 0) THEN
+		(* Only function and class proto allowed here. *)
+	
+		IF sym = sym_x_function THEN
+			# FIXME: "public" should not be allowed.
+			IF (visibility = protected) OR static OR final OR abstract
+			OR unchecked THEN
+				Error("invalid attributes for function prototype")
+			END
+			ForwFuncDecl(visibility = private, t)
+
+		ELSIF sym = sym_x_interface THEN
+			IF (visibility = protected) OR static OR final OR abstract
+			OR unchecked THEN
+				Error("invalid attributes for interface prototype")
+			END
+			IF t <> NIL THEN
+				Error("invalid return type in interface prototype")
+			END
+			ForwInterfaceDecl(visibility = private)
+
+		ELSIF sym = sym_x_class THEN
+			IF (visibility = protected) OR static THEN
+				Error("invalid attributes for class prototype")
+			END
+			IF t <> NIL THEN
+				Error("invalid return type in class prototype")
+			END
+			ForwClassDecl(visibility = private, abstract, final, unchecked)
+
+		ELSE
+			Fatal("expected function, interface or class prototype")
+		END
+
+	ELSIF (curr_class <> NIL) AND (scope = 0) THEN
+		(* Only method proto allowed here. *)
+
+		IF sym <> sym_x_function THEN
+			Fatal("expected method prototype")
+		END
+
+		ParseMethodProto(visibility, abstract, final, static, t)
+	
+	ELSE
+		Fatal("forward declaration not allowed here")
+	
+	END
+
+END
+
+END

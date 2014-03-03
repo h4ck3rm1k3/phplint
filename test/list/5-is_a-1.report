@@ -1,0 +1,41 @@
+
+BEGIN parsing of 5-is_a-1.php
+1:	<?php
+2:	
+3:	/*. require_module 'standard'; .*/
+4:	
+5:	error_reporting(E_ALL | E_STRICT);
+6:	
+7:	class C1 {}
+8:	class C2 extends C1 {}
+9:	class C3 extends C2 {}
+10:	
+11:	
+12:	class W2 {
+13:		function m(C2 $obj){}
+14:	}
+==== 13: notice: guessed signature of the method `W2::m()' as public void(C2)
+==== 13: notice: variable `$obj' assigned but never used
+15:	
+16:	class W1 extends W2 {
+17:		function m(C1 $obj){}
+18:	}
+==== 17: notice: guessed signature of the method `W1::m()' as public void(C1)
+==== 17: notice: variable `$obj' assigned but never used
+19:	
+20:	class W3 extends W2 {
+21:		function m(C3 $obj){}
+22:	}
+==== 21: notice: guessed signature of the method `W3::m()' as public void(C3)
+==== 21: ERROR: `W3::m()': the signature `void(C3)' does not match the overridden method `W2::m()' declared in line 13 with signature `void(C2)': incompatible type in overriding argument no. 1
+==== 21: notice: variable `$obj' assigned but never used
+23:	
+24:	
+25:	?>
+END parsing of 5-is_a-1.php
+==== 5-is_a-1.php:9: notice: unused class `C3'
+==== 5-is_a-1.php:13: notice: unused method `W2::m()'
+==== 5-is_a-1.php:16: notice: unused class `W1'
+==== 5-is_a-1.php:20: notice: unused class `W3'
+==== ?: notice: required module `standard'
+Overall test results: 1 errors, 0 warnings.

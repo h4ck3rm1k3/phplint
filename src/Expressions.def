@@ -1,0 +1,97 @@
+DEFINITION MODULE Expressions
+
+(*
+	Handle expressions, table of items, items search.
+*)
+
+IMPORT Types
+
+TYPE MatchResult = (match_good, match_warn, match_err)
+
+FUNCTION CleanCurrentScope()
+(*
+	Remove all the vars of the current scope, typically exiting from a
+	function or method.
+*)
+
+FUNCTION ParseType(allow_type_hinting: BOOLEAN): Type
+(*
+	Parse a type declaration. If the type is missing return NIL. If the
+	type exits but it cannot be parsed succesfully, signals an error and
+	then returns NIL.
+	allow_type_hinting means we are parsing the type of a formal argument
+	of function or method and then type hinting is allowed, otherwise only
+	PHPLint meta-code is allowed.
+*)
+
+FUNCTION LhsMatchRhs(lhs: Type, rhs: Type): MatchResult
+(*
+	Check type compatibility on assignment and on function return, for
+	example:
+
+	lhs = rhs;
+	return rhs; # the lhs is the expected return type
+
+	and in general check if a type rhs is assignement-compatible to a type
+	lhs.
+*)
+
+FUNCTION ParseClassStaticAccess(class: Class): Result
+(*
+	Parse access to a class entity through the `::' operator.
+	`class' may be NIL if the class is unknown.
+	We enter with sym = sym_double_colon.
+
+	Handle:
+
+	::const
+	::$property possibly followed by [ { -> = += *= ... ++ -- instanceof
+	::method() possibly followed by ->
+
+	Return the resulting value of the sub-expression.
+*)
+
+FUNCTION ParseExit()
+(*
+	Parse the exit() and die() statement.
+*)
+
+FUNCTION CheckBoolean(where: STRING, r: Result)
+(*
+	Check the value of the EXPR inside if(), while(), etc. that requires
+	a boolean expression.
+*)
+
+FUNCTION ParseExpr(): Result
+(*
+	Parse an expression. The returned value may be:
+
+		NIL: type and value of the expr can't be determined.
+
+		{t, NIL}: type t, value unknown.
+
+		{t, v}: type t, value v.
+*)
+
+FUNCTION ParseExprList(): Result
+(*
+	Parse a list of expressions as in for(LIST;...;LIST):
+	
+	EXPR { , EXPR}
+
+	The result returned is the last expression.
+*)
+
+FUNCTION ParseStaticExpr(): Result
+(*
+	Parse a static expression.
+*)
+
+FUNCTION ParseExprOfType(t: Type): Result
+(*
+	Parse expression and return the result just like ParseExpr() does.
+	Raise error if the type cannot be determined, or if the resulting
+	type differs from t; in this case returns NIL.
+*)
+
+END

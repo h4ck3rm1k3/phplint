@@ -1,0 +1,410 @@
+IMPLEMENTATION MODULE Accounting
+
+IMPORT m2, str
+IMPORT Globals
+IMPORT Scanner
+IMPORT Search
+IMPORT MagicConstants
+
+
+FUNCTION AccountModule(decl_in: WHERE)
+VAR
+	m: STRING
+	i: INTEGER
+	pkg: Package
+BEGIN
+	IF decl_in = NIL THEN
+		# undeclared item
+		RETURN
+	END
+	m = decl_in[fn]
+	IF m = fn THEN
+		RETURN
+	END
+	FOR i=0 TO count(required_packages)-1 DO
+		pkg = required_packages[i]
+		IF pkg[fn] = m THEN
+			inc(pkg[used], 1)
+			RETURN
+		END
+	END
+END
+
+
+FUNCTION AddConst(abs_name: STRING, private: BOOLEAN, value: Result): CONSTANT
+VAR c: CONSTANT
+BEGIN
+	c[name] = abs_name
+	c[name_normalized] = Search.NormalizeConstName(abs_name)
+	c[private] = private
+	IF report_unused THEN
+		c[used] = 0
+	ELSE
+		c[used] = 100
+	END
+	c[value] = value
+	consts[] = c
+	RETURN c
+END
+
+
+FUNCTION AccountConstLHS(abs_name: STRING, private: BOOLEAN, value: Result): CONSTANT
+VAR c: CONSTANT
+BEGIN
+	c = SearchConstByAbsName(abs_name, FALSE)
+	IF c = NIL THEN
+		c = AddConst(abs_name, private, value)
+		c[decl_in] = here()
+		c[last_rhs] = here()
+		IF scope > 0 THEN
+			Warning("constant defined inside a function:"
+			+ " still constants have global scope;"
+			+ " this constant will exists only if the function is executed;"
+			+ " if the function is called once more, PHP will raise"
+			+ " a notice and the re-definition itself will be ignored")
+		END
+	ELSE
+		IF c[decl_in] <> NIL THEN
+			Error("constant `" + abs_name + "' already declared in "
+			+ reference(c[decl_in]) )
+		ELSE
+			Error("constant `" + abs_name + "' declared after use in "
+			+ reference(c[last_rhs]))
+		END
+	END
+	RETURN c
+END
+
+
+FUNCTION AccountConstRHS(name: STRING): Result
+VAR c: CONSTANT
+BEGIN
+	c = SearchConst(name, TRUE)
+	IF c = NIL THEN
+		Error("undeclared constant `" + name + "'")
+		# FIXME: if unqualified goes in global NS; if qualified or absolute
+		# might pollute the real existing NSs.
+		c = AddConst(name, FALSE, NIL)
+		c[used] = 1
+		c[last_rhs] = here()
+		RETURN NIL
+	ELSE
+		IF c[private] AND (c[decl_in] <> NIL) AND (fn <> c[decl_in][fn]) THEN
+			Error("access forbidden to private constant `" + name + "' declared in "
+			+ reference(c[decl_in]))
+		END
+		IF c[deprecated] > "" THEN
+			Warning("using deprecated constant `" + name + "': "
+			+ c[deprecated])
+		END
+		inc(c[used], 1)
+		c[last_rhs] = here()
+		AccountModule(c[decl_in])
+		RETURN MagicConstants.Resolve(c)
+	END
+END
+
+
+FUNCTION AccountGlobalVar(name: STRING)
+(*
+	Insert "global $name;" into vars[] so that it may be handled
+	just like a local variable.
+*)
+VAR
+	v, g: VARIABLE
+BEGIN
+	v = SearchVar(name)
+	IF v = NIL THEN
+		(* No collisions in local scope - good. *)
+		g = SearchVarInScope(name, 0)
+		IF g = NIL THEN
+			Warning("global `$" + name
+			+ "': variable still not found in global scope."
+			+ " Hint: declare this variable in global scope assigning it"
+			+ " a value.")
+			v[type] = NIL
+			v[private] = FALSE
+		ELSE
+			IF g[private] AND (fn <> g[decl_in][fn]) THEN
+				Error("access forbidden to private variable `$" + name
+				+ "' declared in " + reference(g[decl_in]))
+			END
+			v[type] = g[type]
+			v[private] = g[private]
+		END
+		v[name] = name
+		v[decl_in] = here() # FIXME: or g[decl_in]?
+		v[scope] = scope
+		v[global] = TRUE
+		v[last_lhs] = NIL
+		IF report_unused THEN
+			v[used] = 0
+		ELSE
+			v[used] = 100
+		END
+		v[assigned] = TRUE
+		vars[vars_n] = v
+		inc(vars_n, 1)
+	ELSIF v[scope] = -1 THEN
+		Error("global $" + name + ": this variable is a superglobal")
+	ELSE
+		Error("global $" + name + ": declaration shadows local variable "
+		+ "or formal argument with the same name")
+	END
+END
+
+
+FUNCTION AccountVarLHS2(v: VARIABLE)
+VAR g: VARIABLE
+BEGIN
+	IF v[private] AND (v[decl_in] <> NIL) AND  (fn <> v[decl_in][fn]) THEN
+		Error("access forbidden to private variable `$" + v[name]
+		+ "' declared in " + reference(v[decl_in]))
+	END
+
+	v[last_lhs] = here()
+
+	v[assigned] = TRUE
+
+	AccountModule(v[decl_in])
+
+	IF v[global] THEN
+		g = SearchVarInScope(v[name], 0)
+		IF g <> NIL THEN
+			g[last_lhs] = here()
+			AccountModule(g[decl_in])
+		END
+	END
+
+	IF v[deprecated] > "" THEN
+		Warning("using deprecated variable `$" + v[name] + "': "
+		+ v[deprecated])
+	END
+
+	(*
+		Check assignment to "$this"
+	*)
+	IF v[name] <> "this" THEN
+		RETURN
+	END
+	IF curr_method = NIL THEN
+		Warning("using of the variable name `$this' outside of any class method")
+	ELSIF curr_method[static] THEN
+		Error("using variable `$this' inside static method `"
+		+ curr_method[name] + "'")
+	ELSE (* non-static method *)
+		Error("assignment forbidden to `$this'")
+	END
+
+END
+
+
+FUNCTION AccountVarLHS(name: STRING, private: BOOLEAN)
+(*
+	Add/account the variable NAME as a LHS to the list vars[], current scope.
+*)
+VAR
+	v: VARIABLE
+BEGIN
+	v = SearchVar(name)
+	IF v = NIL THEN
+		v[name] = name
+		IF private AND (scope > 0) THEN
+			Error("useless `private' qualifier for local variable")
+			v[private] = FALSE
+		ELSE
+			v[private] = private
+		END
+		v[decl_in] = here()
+		v[scope] = scope
+		v[global] = FALSE
+		IF report_unused THEN
+			v[used] = 0
+		ELSE
+			v[used] = 100
+		END
+		vars[vars_n] = v
+		inc(vars_n, 1)
+	ELSIF private THEN
+		IF scope = 0 THEN
+			Error("invalid `private' qualifier: variable already set as public in " + reference(v[decl_in]))
+		ELSE
+			Error("useless `private' qualifier for local variable")
+		END
+	END
+	AccountVarLHS2(v)
+END
+
+
+FUNCTION AccountVarRHS2(v: VARIABLE)
+(*
+	Increment usage counter of v.
+*)
+VAR g: VARIABLE
+BEGIN
+	IF NOT v[assigned] THEN
+		Error("variable $" + v[name] + " might not have been assigned")
+		v[assigned] = TRUE  # avoid multiple errors
+	END
+	inc(v[used], 1)
+	AccountModule(v[decl_in])
+	IF v[global] THEN
+		g = SearchVarInScope(v[name], 0)
+		IF g <> NIL THEN
+			inc(g[used], 1)
+			AccountModule(g[decl_in])
+		END
+	END
+
+	IF v[private] AND (fn <> v[decl_in][fn]) THEN
+		Error("access forbidden to private variable `$" + v[name]
+		+ "' declared in " + reference(v[decl_in]))
+	END
+
+	IF v[deprecated] > "" THEN
+		Warning("using deprecated variable `$" + v[name] + "': "
+		+ v[deprecated])
+	END
+
+	(*
+		Check "$this" usage
+	*)
+	IF v[name] <> "this" THEN
+		RETURN
+	END
+	IF curr_method = NIL THEN
+		Error("using variable `$this' outside of any class method")
+	ELSIF curr_method[static] THEN
+		Error("using variable `$this' inside static method `"
+		+ curr_method[name] + "'")
+	END
+END
+
+
+FUNCTION AccountVarRHS(name: STRING)
+(*
+	Account usage of the variable. If does not exist in vars[], raise an
+	error and then add a dummy variable to the list because in some places
+	in the source we assume that an accounted RHS variable always exists
+	after this function.
+*)
+VAR v: VARIABLE
+BEGIN
+	v = SearchVar(name)
+	IF v = NIL THEN
+		Error("variable `$" + name + "' has not been assigned")
+		AccountVarLHS(name, FALSE)
+		v = SearchVar(name)
+	END
+	AccountVarRHS2(v)
+END
+
+
+FUNCTION AccountFuncCall(name: STRING): Function
+VAR f: Function
+BEGIN
+	f = SearchFunc(name, TRUE)
+	IF f = NIL THEN
+		f[name] = name
+		f[name_lower] = tolower(name)
+		f[decl_in] = NIL
+		f[used] = 1
+		f[last_rhs] = here()
+		f[sign] = NIL
+		funcs[] = f
+	ELSE
+		IF f[private] AND (fn <> f[decl_in][fn]) THEN
+			Error("access forbidden to private function `" + name
+			+ "' declared in " + reference(f[decl_in]))
+		END
+		IF f[deprecated] > "" THEN
+			Warning("using deprecated function `" + name + "': "
+			+ f[deprecated])
+		END
+		inc(f[used], 1)
+		AccountModule(f[decl_in])
+	END
+	RETURN f
+END
+
+
+FUNCTION AccountClass(class: Class)
+BEGIN
+	IF class <> curr_class THEN
+		IF class[private] AND (class[decl_in][fn] <> fn) THEN
+			Error("access forbidden to private class `" + class[name]
+			+ "' declared in " + reference(class[decl_in]))
+		END
+		inc(class[used], 1)
+		AccountModule(class[decl_in])
+	END
+END
+
+
+FUNCTION AccountClassConst(class: Class, c: ClassConst)
+BEGIN
+	IF curr_class = class THEN
+		IF c[visibility] = private THEN
+			inc(c[used], 1)
+		ELSE
+			c[used_inside] = TRUE
+		END
+	ELSE
+		AccountClass(class)
+		inc(c[used], 1)
+		IF c[deprecated] > "" THEN
+			Warning("using deprecated class constant `" + class[name] + "::"
+			+ c[name] + "': " + c[deprecated])
+		ELSIF class[deprecated] > "" THEN
+			Warning("using class constant `" + class[name] + "::"
+			+ c[name] + "' from deprecated class: " + class[deprecated])
+		END
+	END
+END
+
+
+FUNCTION AccountClassProperty(class: Class, p: Property)
+BEGIN
+	IF curr_class = class THEN
+		IF p[visibility] = private THEN
+			inc(p[used], 1)
+		ELSE
+			p[used_inside] = TRUE
+		END
+	ELSE
+		AccountClass(class)
+		inc(p[used], 1)
+		IF p[deprecated] > "" THEN
+			Warning("using deprecated property `" + class[name] + "::$"
+			+ p[name] + "': " + p[deprecated])
+		ELSIF p[static] AND (class[deprecated] > "") THEN
+			Warning("using static property `" + class[name] + "::$"
+			+ p[name] + "' from deprecated class: " + class[deprecated])
+		END
+	END
+END
+
+
+FUNCTION AccountClassMethod(class: Class, m: Method)
+BEGIN
+	IF curr_class = class THEN
+		IF m[visibility] = private THEN
+			inc(m[used], 1)
+		ELSE
+			m[used_inside] = TRUE
+		END
+	ELSE
+		AccountClass(class)
+		inc(m[used], 1)
+		IF m[deprecated] > "" THEN
+			Warning("using deprecated method " + mn(class,m) + ": "
+			+ m[deprecated])
+		ELSIF m[static] AND (class[deprecated] > "") THEN
+			Warning("using static method " + mn(class,m)
+			+ " from deprecated class: " + class[deprecated])
+		END
+	END
+END
+
+
+END

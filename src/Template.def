@@ -1,0 +1,32 @@
+DEFINITION MODULE Template
+
+IMPORT Types
+
+FUNCTION ParseClassDeclTemplate(): ARRAY OF Class
+(*
+	Parse class declaration template part:
+	class HashMap /*. <K implements Hashable; E> .*/ ...
+	On entry sym = sym_x_lt.
+	Parameters:
+	class_name: FQN of the template class.
+	Return: Parsed surrogate classes. The names of the surrogate
+	classes (K and E in the example above) takes the current namespace
+	to build a FQN. It is responsability of the client to "mangle"
+	these names in some way to avoid collisions with surrogate classes
+	in the same namespace. The following function does just this.
+*)
+
+
+FUNCTION MangleNamesOfSurrogateClasses(main_class: Class,
+	surrogates: ARRAY OF Class)
+(*
+	Mangles the names of the surrogate classes to avoid collisions
+	with other surrogate classes in the same namespace. For example:
+	class HashMap /*. <K implements Hashable; E> .*/ ...
+	the surrogate classes are K,E in the same namespace of HashMap,
+	that is some\ns\K and some\ns\E; these names are changed
+	appending "@HashMap", so that the names becomes
+	some\ns\K@HashMap and some\ns\E@HashMap respectively.
+*)
+
+END

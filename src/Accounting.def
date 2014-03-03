@@ -1,0 +1,53 @@
+DEFINITION MODULE Accounting
+
+IMPORT Types
+
+VAR
+	report_unused: BOOLEAN
+
+FUNCTION AccountModule(decl_in: WHERE)
+
+FUNCTION AccountConstLHS(abs_name: STRING, private: BOOLEAN, value: Result)
+	: CONSTANT
+(*
+	Register the fully qualified name as new constant.
+	Returns the new registered constant.
+	If already existing, gives error and return this constant.
+*)
+
+FUNCTION AccountConstRHS(name: STRING): Result
+(*
+	Returns the value of the constant. Also resolves magic constants
+	__XXXX__ returning a dynamically generated result. Returns NIL if the
+	constant is not defined: in this case an error is displayed and a dummy
+	constants of unknown type and value is defined.
+*)
+
+FUNCTION AccountGlobalVar(name: STRING)
+(*
+	Insert "global $name;" into vars[].
+*)
+
+FUNCTION AccountVarLHS(name: STRING, private: BOOLEAN)
+
+FUNCTION AccountVarLHS2(v: VARIABLE)
+
+FUNCTION AccountVarRHS(name: STRING)
+(*
+	Account usage of the variable. If does not exist in vars[], raise a
+	warning and add to the list.
+*)
+
+FUNCTION AccountVarRHS2(v: VARIABLE)
+(*
+	Increment usage counter of v.
+*)
+
+FUNCTION AccountFuncCall(name: STRING): Function
+
+FUNCTION AccountClass(class: Class)
+FUNCTION AccountClassConst(class: Class, c: ClassConst)
+FUNCTION AccountClassProperty(class: Class, p: Property)
+FUNCTION AccountClassMethod(class: Class, m: Method)
+
+END

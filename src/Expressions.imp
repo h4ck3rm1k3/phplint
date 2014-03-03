@@ -1,0 +1,3049 @@
+IMPLEMENTATION MODULE Expressions
+
+IMPORT Accounting
+IMPORT Classes
+IMPORT Errors
+IMPORT Exceptions
+IMPORT Globals
+IMPORT Operators
+IMPORT Scanner
+IMPORT Search
+IMPORT Types
+IMPORT Typecast
+IMPORT m2
+IMPORT str
+
+
+FUNCTION map_namespace_operator_into_id()
+(*
+	Resolves the sym_namespace operator into a bare sym_identifier.
+*)
+BEGIN
+	IF php_ver = php4 THEN
+		Fatal("using reserved keyword `namespace' (PHP 5)")
+	END
+	ReadSym()
+	Expect(sym_identifier, "expected identifier")
+	IF s[0] <> "\\" THEN
+		Fatal("expected path after namespace operator")
+	END
+	IF curr_package[namespace_current] <> NIL THEN
+		s = "\\" + curr_package[namespace_current] + s
+	END
+END
+
+
+FUNCTION map_x_namespace_operator_into_id()
+(*
+	Resolves the sym_x_namespace operator into a bare sym_x_identifier.
+*)
+BEGIN
+	IF php_ver = php4 THEN
+		Fatal("using reserved keyword `namespace' (PHP 5)")
+	END
+	ReadSym()
+	Expect(sym_x_identifier, "expected meta-code identifier")
+	IF s[0] <> "\\" THEN
+		Fatal("expected path after namespace operator")
+	END
+	IF curr_package[namespace_current] <> NIL THEN
+		s = "\\" + curr_package[namespace_current] + s
+	END
+END
+
+
+FUNCTION CleanCurrentScope()
+VAR
+	i: INTEGER
+	v: VARIABLE
+BEGIN
+	i = vars_n - 1
+	WHILE (i >= 0) AND (vars[i][scope] = scope) DO
+		v = vars[i]
+		IF NOT v[global] AND (v[last_lhs] <> NIL) AND (v[used] = 0) THEN
+			Notice2(v[last_lhs], "variable `$" + v[name]
+			+ "' assigned but never used")
+		ELSIF v[global] AND (v[last_lhs] = NIL) AND (v[used] = 0) THEN
+			Notice("in the last function, variable `$" + v[name]
+			+ "' declared global but not used")
+		END
+		vars[i] = NIL
+		inc(i, -1)
+	END
+	vars_n = i + 1
+END
+
+
+(*
+	CLASSES
+*)
+
+
+FUNCTION ResolveClassProperty(class: Class, static: BOOLEAN, id: STRING,
+	VAR P: Class, VAR p: Property)
+(*
+	Resolve an access to the property ID of the class CLASS using
+	a static access (class_name::property_name) or a dynamic access
+	($object->property_name). Returns the resolved class/property, or both
+	NIL if not found.
+*)
+BEGIN
+	SearchClassProperty(class, id,   P, p)
+	IF p = NIL THEN
+		Error("property `" + class[name] + "::$" + id
+		+ "' does not exist or not visible")
+		RETURN
+	END
+	AccountClassProperty(P, p)
+
+	# Check visibility:
+	SWITCH p[visibility] DO
+
+	CASE public:
+		# ok
+
+	CASE protected:
+		IF (curr_class = NIL) OR NOT IsSubclassOf(curr_class, P) THEN
+			Error("access forbidden to protected property `" + pc(class, P)
+			+ "::$" + p[name] + "'")
+		END
+
+	CASE private:
+		# PHP4: SearchClassProperty() returns private properties
+		# also if we are not inside its class, so this code is required:
+		IF curr_class <> P THEN
+			Error("access forbidden to private property `" + pc(class, P)
+			+ "::$" + p[name] + "'")
+		END
+
+	END
+
+	# Check p[static]:
+	IF static THEN
+		IF NOT p[static] THEN
+			Error("static access to non-static property `" + pc(class, P)
+			+ "::$" + p[name] + "'")
+		END
+	ELSE
+		IF p[static] THEN
+			Error("non-static access to static property `" + pc(class, P)
+			+ "::$" + p[name] + "'")
+		END
+	END
+END
+
+
+$ RECORD * Expressions_ParseExpr();
+
+
+FUNCTION SkipFuncCall()
+VAR r: Result
+BEGIN
+	ReadSym()
+	IF sym = sym_rround THEN
+		ReadSym()
+		RETURN
+	END
+	LOOP
+		r = ParseExpr()
+		IF sym = sym_comma THEN
+			ReadSym()
+		ELSIF sym = sym_rround THEN
+			ReadSym()
+			RETURN
+		END
+	END
+END
+
+
+FUNCTION DereferenceClassMethod(class: Class, static: BOOLEAN, id: STRING,
+	VAR res_class: Class, VAR res_method: Method)
+(*
+	Resolve a call to the method ID of the class CLASS using a static access
+	(class_name::ID) or a dynamic access ($object->ID). Returns the resolved
+	class/method, or both NIL if not found.
+*)
+VAR
+	M: Class
+	m: Method
+BEGIN
+
+	ResolveClassMethod(class, id,   M, m)
+	res_class = M
+	res_method = m
+	IF m = NIL THEN
+		Error("the method " + class[name] + "::" + id + "() does not exist")
+		RETURN
+	ELSE
+		AccountClassMethod(M, m)
+		Errors.RaiseErrors(m[errors])
+		Exceptions.ThrowExceptions(m[exceptions])
+	END
+
+	# Check direct call to a constructor:
+	IF (m = M[construct])   # direct call to a constructor
+	AND (
+		(curr_class = NIL)  # not inside a class
+		OR (curr_method <> curr_class[construct])  # not inside a constructor
+		OR NOT IsSubclassOf(curr_class, M) # not the constr. of a derived class
+	) THEN
+		Error("the method " + mn(class,m) + " is a class "
+		+ "constructor, it can be called explicity only inside the constructor "
+		+ "of an extending class")
+	END
+
+	# Remember call to the parent constructor from the overridding one:
+	IF (m = M[construct])
+	AND (curr_class <> NIL)
+	AND (curr_method = curr_class[construct])
+	THEN
+		curr_class[parent_constructor_called] = TRUE
+	END
+
+	# Check direct call to a destructor:
+	IF (m = M[destruct])   # direct call to a destructor
+	AND (
+		(curr_class = NIL)  # not inside a class
+		OR (curr_method <> curr_class[destruct])  # not inside a destructor
+		OR NOT IsSubclassOf(curr_class, M) # not the destr. of a derived class
+	) THEN
+		Error("the method " + mn(class,m) + " is a class "
+		+ "destructor, it can be called explicity only inside the constructor "
+		+ "of an extending class")
+	END
+
+	# Remember call to the parent destructor from the overridding one:
+	IF (m = M[destruct])
+	AND (curr_class <> NIL)
+	AND (curr_method = curr_class[destruct])
+	THEN
+		curr_class[parent_destructor_called] = TRUE
+	END
+
+	# Check visibility:
+	SWITCH m[visibility] DO
+	CASE public: # ok
+	CASE protected:
+		IF (curr_class = NIL) OR NOT IsSubclassOf(curr_class, M) THEN
+			Error("access forbidden to protected method " + pc(class, M)
+			+ "::" + m[name])
+		END
+	CASE private:
+		IF curr_class <> M THEN
+			Error("access forbidden to private method " + pc(class, M)
+			+ "::" + m[name])
+		END
+	END
+
+	# Check static:
+	IF static THEN
+		IF m[static] THEN
+			IF m[abstract] THEN
+				Error("cannot call abstract static method " + mn(M,m))
+			END
+		ELSE
+			IF (curr_method <> NIL) AND NOT curr_method[static]
+			AND IsSubclassOf(curr_class, M) THEN
+				# (parent class)::
+			ELSE
+				Error("static access to non-static method " + pc(class, M)
+				+ "::" + m[name])
+			END
+		END
+	ELSE
+		IF m[static] THEN
+			Error("non-static access to static method " + pc(class, M)
+			+ "::" + m[name])
+		END
+	END
+
+END
+
+
+FUNCTION ParseType(allow_type_hinting: BOOLEAN): Type
+(*
+	Parses a type. May trigger class autoloading, if enabled.
+
+		type = T { index } | "array" [ index {index} T ];
+	
+	BUG: void[] should be forbidden.
+
+	Parameters:
+	allow_type_hinting: set to true while parsing formal arguments of function
+	or method. The first symbol may then be either "array" or the name of a
+	class in PHP code, the rest, if any, must still be PHPLint meta-code.
+	Example:
+	function f(array/*.[int]string.*/ $a){}
+
+	Return: the type so parsed, possibly NIL on error.
+*)
+
+	FUNCTION ParseTypeName(allow_type_hinting: BOOLEAN): Type
+	(*
+		Parses T=void, mixed, any basic type or class name.
+		Returns the type or NIL on error.
+	*)
+	VAR class: Class
+	BEGIN
+		IF php_ver = php4 THEN
+			allow_type_hinting = FALSE
+		END
+
+		IF sym = sym_namespace THEN
+			map_namespace_operator_into_id()
+		ELSIF sym = sym_x_namespace THEN
+			map_x_namespace_operator_into_id()
+		END
+
+		SWITCH sym DO
+		CASE sym_x_void:     ReadSym() RETURN void_type
+		CASE sym_x_boolean:  ReadSym() RETURN boolean_type
+		CASE sym_x_int:      ReadSym() RETURN int_type
+		CASE sym_x_float:    ReadSym() RETURN float_type
+		CASE sym_x_string:   ReadSym() RETURN string_type
+		CASE sym_x_mixed:    ReadSym() RETURN mixed_type
+		CASE sym_x_resource: ReadSym() RETURN resource_type
+		CASE sym_x_object:   ReadSym() RETURN object_type
+		CASE sym_object:
+			Error("`object' keyword not allowed as type, allowed only as typecast `(object)'")
+			IF NOT allow_type_hinting THEN
+				RETURN NIL
+			END
+			ReadSym()
+			RETURN object_type
+		CASE sym_x_identifier:
+			class = SearchClass(s)
+			IF class = NIL THEN
+				Error("undefined identifier `" + s + "'")
+				ReadSym()
+				RETURN NIL
+			ELSE
+				AccountClass(class)
+				ReadSym()
+				RETURN class[type]
+			END
+		CASE sym_identifier:
+			IF NOT allow_type_hinting THEN
+				RETURN NIL
+			END
+			class = SearchClass(s)
+			IF class = NIL THEN
+				Error("undefined identifier `" + s + "'")
+				ReadSym()
+				RETURN NIL
+			ELSE
+				ReadSym()
+				RETURN class[type]
+			END
+		CASE sym_self, sym_x_self:
+			IF (sym = sym_self) AND NOT allow_type_hinting THEN
+				RETURN NIL
+			END
+			IF curr_class = NIL THEN
+				Error("`self': not inside a class")
+				RETURN NIL
+			END
+			ReadSym()
+			RETURN curr_class[type]
+		CASE sym_parent, sym_x_parent:
+			IF (sym = sym_parent) AND NOT allow_type_hinting THEN
+				RETURN NIL
+			END
+			IF curr_class = NIL THEN
+				Error("`parent': not inside a class")
+				RETURN NIL
+			END
+			IF curr_class[extends] = NIL THEN
+				Error("`parent': no parent class")
+				RETURN NIL
+			END
+			ReadSym()
+			RETURN curr_class[extends][type]
+		ELSE
+			RETURN NIL
+		END
+	END
+
+
+	FUNCTION ParseArray(): Type
+	(*
+		Parses array[][]T. We enter with sym="[".
+		Returns the type, possibly NIL if fails.
+	*)
+	VAR
+		a: Type
+	BEGIN
+		ReadSym()
+		a = {array, mixed, NIL, NIL}
+		IF sym = sym_x_int THEN
+			ReadSym()
+			a[index_type] = int
+		ELSIF sym = sym_x_string THEN
+			ReadSym()
+			a[index_type] = string
+		ELSIF sym = sym_x_rsquare THEN
+			a[index_type] = mixed
+		ELSE
+			Error("expected `[]' or `[int]' or `[string]'")
+			RETURN NIL
+		END
+		Expect(sym_x_rsquare, "expected `]'")
+		ReadSym()
+		IF sym = sym_x_lsquare THEN
+			a[elem_type] = ParseArray()
+			IF a[elem_type] = NIL THEN
+				RETURN NIL
+			END
+		ELSE
+			a[elem_type] = ParseTypeName(FALSE)
+			IF a[elem_type] = NIL THEN
+				a[elem_type] = mixed_type
+			END
+		END
+		RETURN a
+	END
+
+
+	FUNCTION ParseIndeces(t: Type): Type
+	(*
+		Parses T[][]. t is the type of T. We enter with sym="["
+		of the first index.
+		Returns the type, possibly NIL if fails.
+	*)
+	VAR
+		a: Type
+	BEGIN
+		a = {array, void, NIL, NIL}
+		ReadSym()
+		IF sym = sym_x_int THEN
+			a[index_type] = int
+			ReadSym()
+		ELSIF sym = sym_x_string THEN
+			a[index_type] = string
+			ReadSym()
+		ELSIF sym = sym_x_rsquare THEN
+			a[index_type] = mixed
+		END
+		Expect(sym_x_rsquare, "expected `]'")
+		ReadSym()
+		IF sym = sym_x_lsquare THEN
+			a[elem_type] = ParseIndeces(t)
+			IF a[elem_type] = NIL THEN
+				RETURN NIL
+			END
+		ELSE
+			a[elem_type] = t
+		END
+		RETURN a
+	END
+
+
+VAR
+	t: Type
+BEGIN
+	IF (sym = sym_x_array) OR (sym = sym_array) THEN
+		# Old type syntax array[][]T:
+		IF (sym = sym_array) AND NOT allow_type_hinting THEN
+			RETURN NIL
+		END
+		ReadSym()
+		IF sym <> sym_x_lsquare THEN
+			# array --> array[]mixed
+			RETURN {array, mixed, mixed_type, NIL}
+		END
+		RETURN ParseArray()
+	ELSE
+		# New type syntax T[][]:
+		t = ParseTypeName(allow_type_hinting)
+		IF t = NIL THEN
+			RETURN NIL
+		END
+		IF sym = sym_x_lsquare THEN
+			t = ParseIndeces(t)
+		END
+		RETURN t
+	END
+END
+
+
+
+FUNCTION LhsMatchRhs(lhs: Type, rhs: Type): MatchResult
+
+	FUNCTION MatchArray(li: BaseType, le: Type, ri: BaseType, re: Type)
+		:MatchResult
+	VAR idx: MatchResult
+	BEGIN
+		# Match indexes:
+		idx = match_good
+		SWITCH li DO
+		CASE void:
+		CASE int:
+			SWITCH ri DO
+			CASE void: idx = match_warn
+			CASE int: idx = match_good
+			CASE string: RETURN match_err
+			CASE mixed: RETURN match_err
+			END
+		CASE string:
+			SWITCH ri DO
+			CASE void: idx = match_warn
+			CASE int: RETURN match_err
+			CASE string: idx = match_good
+			CASE mixed: RETURN match_err
+			END
+		CASE mixed:
+			idx = match_good
+		END
+
+		# Match types of the elements:
+		IF le = NIL THEN
+			RETURN max(idx, match_good)
+		ELSIF re = NIL THEN
+			RETURN max(idx, match_warn)
+		ELSE
+			RETURN max(idx, LhsMatchRhs(le, re))
+		END
+	END
+
+BEGIN
+	IF lhs = NIL THEN
+		IF (rhs <> NIL) AND (rhs[basetype] = void) THEN
+			RETURN match_err
+		ELSE
+			RETURN match_warn
+		END
+	END
+	IF rhs = NIL THEN
+		IF (lhs <> NIL) AND (lhs[basetype] = void) THEN
+			RETURN match_err
+		ELSE
+			RETURN match_warn
+		END
+	END
+	SWITCH lhs[basetype] DO
+	CASE null:
+		SWITCH rhs[basetype] DO
+		CASE null: RETURN match_good
+		CASE string, array, mixed, resource, object: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE void: RETURN match_err
+	CASE boolean:
+		SWITCH rhs[basetype] DO
+		CASE boolean: RETURN match_good
+		CASE mixed: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE int:
+		SWITCH rhs[basetype] DO
+		CASE int: RETURN match_good
+		CASE mixed: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE float:
+		SWITCH rhs[basetype] DO
+		CASE int, float: RETURN match_good
+		CASE mixed: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE string:
+		SWITCH rhs[basetype] DO
+		CASE null, string: RETURN match_good
+		CASE mixed: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE array:
+		SWITCH rhs[basetype] DO
+		CASE null: RETURN match_good
+		CASE mixed: RETURN match_warn
+		CASE array: RETURN MatchArray(lhs[index_type], lhs[elem_type],
+			rhs[index_type], rhs[elem_type])
+		ELSE RETURN match_err
+		END
+	CASE mixed:
+		IF rhs[basetype] = void THEN
+			RETURN match_err
+		ELSE
+			RETURN match_good
+		END
+	CASE resource:
+		SWITCH rhs[basetype] DO
+		CASE null, resource: RETURN match_good
+		CASE mixed: RETURN match_warn
+		ELSE RETURN match_err
+		END
+	CASE object:
+		SWITCH rhs[basetype] DO
+		CASE null: RETURN match_good
+		CASE mixed: RETURN match_warn
+		CASE object:
+			IF lhs[class] = NIL THEN
+				RETURN match_good
+			ELSIF rhs[class] = NIL THEN
+				RETURN match_warn
+			ELSIF IsSubclassOf(rhs[class], lhs[class]) THEN
+				RETURN match_good
+			ELSE
+				RETURN match_err
+			END
+		ELSE RETURN match_err
+		END
+	END
+	RETURN match_good
+END
+
+
+$ RECORD *
+$ Expressions_ParseClassMethodCall(RECORD *, int, STRING *);
+
+FUNCTION DereferenceLHS(expect: Type, VAR found: Type)
+(*
+	expect: expected type for the LHS; NIL=unknown
+	found: type of the sub-expr being dereferenced; if NIL it is
+		   still unknown and must be guessed if possible.
+
+	It handles:
+
+	[
+	->
+*)
+VAR
+	r: Result
+	t, unk: Type
+	id: STRING
+	cl: Class
+	p: Property
+BEGIN
+
+	# [...
+	IF sym = sym_lsquare THEN
+
+		IF found = NIL THEN # guess structure of the array
+			found = {array, void, NIL, NIL}
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				found[index_type] = int
+				found[elem_type] = expect
+				ReadSym()
+				RETURN
+			END
+			r = ParseExpr()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the index")
+			ELSIF r[type] = int_type THEN
+				found[index_type] = int
+			ELSIF r[type] = string_type THEN
+				found[index_type] = string
+			ELSE
+				Error("invalid array index of type " + TypeToString(r[type]))
+			END
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			DereferenceLHS(expect, found[elem_type])
+
+		ELSIF found[basetype] = array THEN
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				SWITCH found[index_type] DO
+				CASE void:
+					Warning("`[]' operator applied to an array of undefined index type")
+				CASE int:
+				CASE string:
+					Error("applying the `[]' operator to array "
+					+ "with index of type string")
+				CASE mixed:
+					Error("applying the `[]' operator to array "
+					+ "whose index can be either int and string")
+				END
+				ReadSym()
+				found = found[elem_type]
+				SWITCH LhsMatchRhs(found, expect) DO
+				CASE match_good:
+				CASE match_warn:
+					Warning("found " + TypeToString(found)
+					+ ", expected " + TypeToString(expect))
+				CASE match_err:
+					Warning("found " + TypeToString(found)
+					+ ", expected " + TypeToString(expect))
+				END
+				RETURN
+			ELSE
+				r = ParseExpr()
+				IF r = NIL THEN
+					#Warning("can't determine the type of the index")
+				ELSIF r[type] = int_type THEN
+					IF found[index_type] = string THEN
+						Error("invalid index of type int, expected string")
+					END
+				ELSIF r[type] = string_type THEN
+					IF found[index_type] = int THEN
+						Error("invalid index of type string, expected int")
+					END
+				ELSE
+					Error("invalid array index of type " + TypeToString(r[type]))
+				END
+				Expect(sym_rsquare, "expected `]'")
+				ReadSym()
+				DereferenceLHS(expect, found[elem_type])
+			END
+
+		ELSE
+			Warning("can't check usage of `[' applied to a value of type "
+			+ TypeToString(found))
+			# Skip:
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				ReadSym()
+				RETURN
+			END
+			r = ParseExpr()
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			t = NIL
+			DereferenceLHS(expect, t)
+
+		END
+
+	ELSIF sym = sym_arrow THEN
+		IF found = NIL THEN
+			Warning("`->' operator applied to a value of type unknown")
+		ELSIF found[basetype] <> object THEN
+			Error("`->' operator applied to a value of type "
+			+ TypeToString(found))
+		ELSIF found[class] = NIL THEN
+			Error("`->' operator applied to an object of unknown class")
+		END
+		IF (found <> NIL) AND (found[class] <> NIL) THEN
+			ReadSym()
+			IF sym = sym_identifier THEN
+				# Ok
+			ELSIF sym = sym_variable THEN
+				Error("expected property name or method name after `->'. Variable-name properties/methods are not supported by PHPLint.")
+				s = "UNKNOWN_" + s
+			ELSE
+				Fatal("expected property name or method name after `->'")
+			END
+			id = s
+			ReadSym()
+			IF sym = sym_lround THEN
+				cl = found[class]
+$				Expressions_t = Expressions_ParseClassMethodCall(Expressions_cl, FALSE, Expressions_id);
+				IF (php_ver = php4) AND (sym = sym_arrow) THEN
+					Error("cannot dereference object returned by method."
+					+ " That's a limitation of PHP 4.")
+				END
+			ELSE
+				ResolveClassProperty(found[class], FALSE, id,   cl, p)
+				IF p = NIL THEN
+					t = NIL
+				ELSE
+					t = p[type]
+				END
+			END
+			DereferenceLHS(expect, t)
+
+		ELSE (* skip -> dereferencing *)
+			ReadSym()
+			IF sym = sym_variable THEN
+				Error("expected property name or method name after `->'. Variable-name properties/methods are not supported by PHPLint.")
+			ELSE
+				Expect(sym_identifier,
+					"expected property name or method name after `->'")
+			END
+			ReadSym()
+			IF sym = sym_lround THEN
+				SkipFuncCall()
+				IF (php_ver = php4) AND (sym = sym_arrow) THEN
+					Error("cannot dereference object returned by method."
+					+ " That's a limitation of the PHP 4.")
+				END
+			END
+			DereferenceLHS(expect, unk)
+		END
+
+	ELSIF found = NIL THEN # guess
+		found = expect
+	ELSIF expect = NIL THEN
+		# keep found type
+	ELSE
+		SWITCH LhsMatchRhs(found, expect) DO
+		CASE match_good:
+		CASE match_warn:
+			Warning("invalid type " + TypeToString(expect)
+			+ " assigned to " + TypeToString(found))
+		CASE match_err:
+			Warning("invalid type " + TypeToString(expect)
+			+ " assigned to " + TypeToString(found))
+		END
+	END
+
+END
+
+
+FUNCTION ParseLHS(expect: Type)
+(*
+	Used only for actual args passed by reference, list() and ++$var...
+	expect: expected type for the LHS; NIL=unknown
+	Deal with:
+
+	$v
+	$v[...
+	$v->...
+	CLASS::$property
+	CLASS::$property[...
+	CLASS::$property->...
+	self::...  (PHP 5 only)
+	parent::...
+*)
+VAR
+	v_name: STRING
+	v: VARIABLE
+	cl, res_cl: Class
+	res_p: Property
+	t: Type
+BEGIN
+	IF sym = sym_namespace THEN
+		map_namespace_operator_into_id()
+	END
+
+	# $v...
+	IF sym = sym_variable THEN
+		v_name = s
+		v = SearchVar(v_name)
+		ReadSym()
+
+		# $v[... or $v->...
+		IF (sym = sym_lsquare) OR (sym = sym_arrow) THEN
+			IF v = NIL THEN
+				AccountVarLHS(v_name, FALSE)
+				v = SearchVar(v_name)
+			ELSE
+				AccountVarRHS2(v)
+			END
+
+		ELSE
+			IF v = NIL THEN
+				AccountVarLHS(v_name, FALSE)
+				v = SearchVar(v_name)
+			ELSE
+				AccountVarLHS2(v)
+			END
+		END
+
+		DereferenceLHS(expect, v[type])
+
+	# CLASS::
+	ELSIF sym = sym_identifier THEN
+		cl = SearchClass(s)
+		IF cl = NIL THEN
+			Fatal("invalid syntax in LHS. Undeclared class `" + s + "'?")
+		END
+		ReadSym()
+		Expect(sym_double_colon, "expected `::'")
+		ReadSym()
+		Expect(sym_variable, "expected property")
+		ResolveClassProperty(cl, TRUE, s, res_cl, res_p)
+		IF res_p = NIL THEN
+			ReadSym()
+			DereferenceLHS(expect, (* dummy *) t)
+		ELSE
+			ReadSym()
+			DereferenceLHS(expect, res_p[type])
+		END
+
+	# self::
+	ELSIF sym = sym_self THEN
+		IF php_ver = php4 THEN
+			Error("invalid `self::' (PHP 5)")
+		END
+		cl = curr_class
+		IF cl = NIL THEN
+			Fatal("`self::': not inside a class")
+		END
+		ReadSym()
+		Expect(sym_double_colon, "expected `::'")
+		ReadSym()
+		Expect(sym_variable, "expected property")
+		ResolveClassProperty(cl, TRUE, s, res_cl, res_p)
+		IF res_p = NIL THEN
+			ReadSym()
+			DereferenceLHS(expect, (* dummy *) t)
+		ELSE
+			ReadSym()
+			DereferenceLHS(expect, res_p[type])
+		END
+
+	# parent::
+	ELSIF sym = sym_parent THEN
+		IF php_ver = php4 THEN
+			Error("invalid `parent::' (PHP 5)")
+		END
+		cl = curr_class
+		IF cl = NIL THEN
+			Fatal("`parent::': not inside a class")
+		END
+		cl = cl[extends]
+		IF cl = NIL THEN
+			Fatal("`parent::': no parent class")
+		END
+		ReadSym()
+		Expect(sym_double_colon, "expected `::'")
+		ReadSym()
+		Expect(sym_variable, "expected class property")
+		ResolveClassProperty(cl, TRUE, s, res_cl, res_p)
+		IF res_p = NIL THEN
+			ReadSym()
+			DereferenceLHS(expect, (* dummy *) t)
+		ELSE
+			ReadSym()
+			DereferenceLHS(expect, res_p[type])
+		END
+
+	ELSE
+		Fatal("invalid syntax in LHS")
+
+	END
+END
+
+
+FUNCTION ParseArgsListCall(guess: BOOLEAN, n: STRING, sign: SIGNATURE, decl_in: WHERE)
+(*
+	Parse actual args. of a function or method. n is the name of the
+	function or method in human readable form. guess is TRUE if the
+	func/method is still unknown and sign[args] must be guessed.
+*)
+
+	FUNCTION CheckActualArgument(n: STRING, i: INTEGER, a: FormalArg, r: Result)
+	(*
+		Check if the actual argument (an expression that return r) is
+		assignment-compatible with the formal argument no. i.
+	*)
+
+		FUNCTION base(): STRING
+		BEGIN
+			RETURN "calling `" + n + "()' declared in " + reference(decl_in) + ", argument no. "
+			+ (i+1) + ": "
+		END
+
+	VAR
+		b: Type # type of the actual argument
+	BEGIN
+		IF a[type] = NIL THEN
+			#Notice(base() + "can't check the type of the actual argument because the type of the formal argument `$" + a[name] + "' is unknown")
+			RETURN
+		END
+
+		IF r = NIL THEN
+			#Warning(base() + "can't determine the type of the actual argument")
+			RETURN
+		END
+
+		b = r[type]
+
+		SWITCH LhsMatchRhs(a[type], b) DO
+		CASE match_good:
+		CASE match_warn:
+			Warning(base() + "found type `" + TypeToString(b) + "', required type `"
+			+ TypeToString(a[type]) + "'")
+		CASE match_err:
+			Error(base() + "found type `" + TypeToString(b) + "', required type `"
+			+ TypeToString(a[type]) + "'")
+		END
+	END
+
+VAR
+	i: INTEGER
+	r: Result
+	a: FormalArg
+	v: VARIABLE
+BEGIN
+	ReadSym() # Skip '('
+
+	IF sym = sym_rround THEN
+		ReadSym()
+		IF NOT guess AND (sign[mandatory] > 0) THEN
+			Error("`" + n + "()' declared in " + reference(decl_in) + " requires arguments")
+		END
+		RETURN
+	END
+	i = 0
+	LOOP
+		IF guess THEN
+			r = ParseExpr()
+			a = NIL
+			a[name] = "?"
+			a[reference] = FALSE
+			IF r = NIL THEN
+				a[type] = NIL
+			ELSE
+				a[type] = r[type]
+			END
+			sign[args][] = a
+			inc(sign[mandatory], 1)
+		ELSIF i < count(sign[args]) THEN
+			a = sign[args][i]
+			IF a[reference] THEN
+				IF a[reference_return] THEN
+					ParseLHS(a[type])
+				ELSE
+					(* `return by reference' argument: check the var be
+					assigned: *)
+					IF sym = sym_variable THEN
+						v = SearchVar(s)
+						IF (v = NIL) OR NOT v[assigned] THEN
+							Error("invalid actual argument $" + s
+							+ " passed by reference: the variable might not have been assigned")
+						END
+					(*
+					ELSE
+						The other cases are always ok since may refer to a
+						property (always initialized) or are otherwise checked
+						by ParseLHS:
+						self::...
+						parent:...
+
+						FIXME: The only case that we cannot check here are
+						elements of an array, that may be unassigned and can be
+						checked only at runtime:
+						$a[1234]
+					*)
+					END
+					ParseLHS(a[type])
+				END
+			ELSE
+				r = ParseExpr()
+				CheckActualArgument(n, i, a, r)
+			END
+		ELSE
+			IF (i = count(sign[args])) AND NOT sign[more_args] THEN
+				Error("`" + n + "()' declared in " + reference(decl_in) + ": too many arguments")
+			END
+			r = ParseExpr()
+		END
+		IF sym = sym_comma THEN
+			ReadSym()
+			inc(i, 1)
+		ELSE
+			EXIT
+		END
+	END
+	IF guess THEN
+		Expect(sym_rround, "expected ')'  or ',' in argument list of unknown `"
+		+ n + "()'")
+		ReadSym()
+	ELSE
+		IF sym = sym_rround THEN
+			IF i+1 < sign[mandatory] THEN
+				Error("`" + n + "()' declared in " + reference(decl_in) + " requires more arguments")
+			END
+			ReadSym()
+		ELSE
+			UnexpectedSymbol()
+		END
+	END
+END
+
+
+FUNCTION ParseClassMethodCall(class: Class, static: BOOLEAN, name: STRING): Type
+(*
+	Parse method call.	If the class isn't declared (class=NIL), create one.
+	If the method isn't declared, guess the signature; arguments
+	are guessed from the expressions giving the actual arguments.
+	static is TRUE for "CLASS::f()", FALSE for "$VAR->f()".
+
+	Returns the type of the returned value.
+
+	NOTE: we enter with sym = sym_lround.
+*)
+VAR
+	m: Method
+	sign: SIGNATURE
+	c2: Class
+BEGIN
+	IF class = NIL THEN
+		SkipFuncCall()
+		RETURN NIL
+	END
+
+	DereferenceClassMethod(class, static, name,   c2, m)
+
+	IF m = NIL THEN
+		sign[return] = NIL
+		m[name] = name
+		m[name_lower] = tolower(name)
+		m[visibility] = public
+		m[static] = static
+		m[sign] = sign
+		m[decl_in] = NIL
+		m[guessed_sign_in] = here()
+		m[used] = 1
+
+		ParseArgsListCall(TRUE, class[name] + "::" + name, sign, m[decl_in])
+		Notice("guessed signature of the method `" + class[name] + "::"
+		+ name + "()' as " + MethodSignatureToString(m))
+		
+		class[methods][] = m
+
+	ELSE
+		IF m[sign] = NIL THEN
+			# Set a default signature:
+			sign = {
+				NIL, # unknown return type
+				FALSE, # return by value
+				0,     # unknown no. of mandatory args
+				NIL, # no fixed args
+				FALSE # no var. args
+			}
+			m[sign] = sign
+		ELSE
+			sign = m[sign]
+		END
+
+		ParseArgsListCall(FALSE, pc(class, c2) + "::" + m[name], sign, m[decl_in])
+	END
+
+	RETURN sign[return]
+END
+
+
+FUNCTION IsAssignOp(sym: SYMBOL): BOOLEAN
+BEGIN
+	RETURN (sym = sym_assign) OR (sym = sym_plus_assign)
+	OR (sym = sym_minus_assign) OR (sym = sym_times_assign)
+	OR (sym = sym_div_assign) OR (sym = sym_period_assign)
+	OR (sym = sym_mod_assign) OR (sym = sym_bit_and_assign)
+	OR (sym = sym_bit_or_assign) OR (sym = sym_bit_xor_assign)
+	OR (sym = sym_lshift_assign) OR (sym = sym_rshift_assign)
+END
+
+
+FUNCTION Dereference(VAR t: Type): Type
+(*
+	Dereference a RHS. Note that "$a" might be followed by "=" so actually
+	becoming a LHS: this function take care of this.  The name of this
+	function is really misleading, since it handle so many things:
+
+	[] = expr
+	[expr] dereference
+	{expr}
+	-> (property|method) dereference
+	= expr
+	+= expr
+	-= expr
+	*= expr
+	/= expr
+	|= expr
+	^= expr
+	&= expr
+	<<= expr
+	>>= expr
+	instanceof id
+	++
+	--
+
+	t is the LHS of the operator; if NIL, try to guess its definition and sets
+	t accordingly. Returns the resulting final type of the sub-expression.
+*)
+
+
+	FUNCTION DereferenceArray(VAR t: Type): Type
+	(*
+		On entry sym = [
+		t = type of the array; NIL=guess the type
+	*)
+	VAR
+		r: Result
+		c: Class
+		m: Method
+	BEGIN
+		IF t = NIL THEN # guess structure of the array
+			t = {array, void, NIL, NIL}
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				t[index_type] = int
+				ReadSym()
+				Expect(sym_assign, "required `=' after the operator `[]'")
+				RETURN Dereference(t[elem_type])
+			END
+			# [expr...
+			r = ParseExpr()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the index")
+			ELSIF r[type] = int_type THEN
+				t[index_type] = int
+			ELSIF r[type] = string_type THEN
+				t[index_type] = string
+			ELSE
+				Error("invalid array index of type " + TypeToString(r[type]))
+			END
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			RETURN Dereference(t[elem_type])
+
+		ELSIF t[basetype] = string THEN
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				Error("undefined last element `[]' operator for a value of type string")
+				ReadSym()
+				RETURN string_type
+			END
+			r = ParseExpr()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the index")
+			ELSIF r[type] = int_type THEN
+			ELSE
+				Error("invalid array index of type " + TypeToString(r[type]))
+			END
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			RETURN string_type
+
+		ELSIF t[basetype] = array THEN
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				IF t[index_type] = void THEN
+					Warning("applying the `[]' operator to array "
+					+ "of undefined index type")
+				ELSIF t[index_type] = string THEN
+					Error("applying the `[]' operator to array "
+					+ "with index of type string")
+				END
+				ReadSym()
+				Expect(sym_assign, "required `=' after the operator `[]'")
+				RETURN Dereference(t[elem_type])
+			END
+			r = ParseExpr()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the index")
+			ELSIF r[type] = int_type THEN
+				IF t[index_type] = string THEN
+					Error("invalid index of type int, expected string")
+				END
+			ELSIF r[type] = string_type THEN
+				IF t[index_type] = int THEN
+					Error("invalid index of type string, expected int")
+				END
+			ELSE
+				Error("invalid array index of type " + TypeToString(r[type]))
+			END
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			RETURN Dereference(t[elem_type])
+
+		ELSIF (t[basetype] = object)
+		AND IsSubclassOf(t[class], ArrayAccessClass) THEN
+			# using ArrayAccess to object
+			ReadSym()
+			r = ParseExpr()
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+
+			# Resulting type is the return type of the offsetGet() method:
+			Classes.ResolveClassMethod(t[class], "offsetGet", c, m)
+			RETURN Dereference( m[sign][return] )
+
+		ELSE
+			IF (t[basetype] = object) AND (php_ver = php5) THEN
+				Error("`[' operator not applicable to object without implementing `ArrayAccess'")
+			ELSIF t[basetype] = mixed THEN
+				Warning("can't check usage of `[' applied to a value of type mixed")
+			ELSE
+				Error("`[' operator not applicable to a value of type "
+				+ TypeToString(t))
+			END
+			ReadSym()
+			IF sym = sym_rsquare THEN # ...[]
+				ReadSym()
+				Expect(sym_assign, "required `=' after the operator `[]'")
+				t = {array, void, NIL, NIL}
+				RETURN Dereference(t)
+			END
+			r = ParseExpr()
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			RETURN Dereference(t) # FIXME: pass another var., not t
+
+		END
+	END
+
+
+VAR
+	id: STRING
+	class: Class
+	p: Property
+	r: Result
+	unk, t2: Type
+	op: SYMBOL
+	left_inval: BOOLEAN
+	v: VARIABLE
+BEGIN
+	IF sym = sym_lsquare THEN
+		RETURN DereferenceArray(t)
+
+	ELSIF sym = sym_lbrace THEN
+		IF (t = NIL) OR (t[basetype] <> string) THEN
+			Error("`{' operator applied to a value of type "
+			+ TypeToString(t) + ". Expected a string.")
+		ELSE
+			Warning("using deprecated character selector operator `{'. Support for this operator deprecated since PHP 5.1. Use `[' instead.")
+		END
+		ReadSym()
+		r = ParseExpr()
+		IF r = NIL THEN
+			#Warning("can't determine the type of the index of the "
+			#+ "character selector {EXPR}")
+		ELSIF r[type] <> int_type THEN
+			Error("invalid character selector {EXPR} of type "
+			+ TypeToString(r[type]))
+		END
+		Expect(sym_rbrace, "expected closing '}' in character selector")
+		ReadSym()
+		RETURN string_type
+
+	ELSIF sym = sym_arrow THEN
+		IF t = NIL THEN
+			Warning("`->' operator applied to a value of type unknown")
+		ELSIF t[basetype] <> object THEN
+			Error("`->' operator applied to a value of type "
+			+ TypeToString(t))
+		ELSIF t[class] = NIL THEN
+			Error("`->' operator applied to an object of unknown class")
+		END
+		IF (t = NIL) OR (t[basetype] <> object) OR (t[class] = NIL) THEN
+			ReadSym()
+			Expect(sym_identifier,
+				"expected property name or method name after `->'")
+			ReadSym()
+			IF sym = sym_lround THEN
+				SkipFuncCall()
+				IF (php_ver = php4) AND (sym = sym_arrow) THEN
+					Error("cannot dereference object returned by method."
+					+ " That's a limitation of the PHP 4.")
+				END
+			END
+			RETURN Dereference(unk)
+		ELSE
+			ReadSym()
+			IF sym = sym_identifier THEN
+				# Ok
+			ELSIF sym = sym_variable THEN
+				Error("expected property name or method name after `->'")
+				s = "UNKNOWN"
+			ELSE
+				Fatal("expected property name or method name after `->'")
+			END
+			id = s
+			ReadSym()
+			IF sym = sym_lround THEN
+				t2 = ParseClassMethodCall(t[class], FALSE, id)
+				IF (php_ver = php4) AND (sym = sym_arrow) THEN
+					Error("cannot dereference object returned by method."
+					+ " That's a limitation of the PHP 4.")
+				END
+			ELSE
+				ResolveClassProperty(t[class], FALSE, id,   class, p)
+				IF p = NIL THEN
+					t2 = NIL
+				ELSE
+					t2 = p[type]
+				END
+			END
+			RETURN Dereference(t2)
+		END
+
+	ELSIF IsAssignOp(sym) THEN
+		op = sym
+		IF t <> NIL THEN
+
+			(*
+				Preliminary check of the LHS:
+			*)
+			SWITCH op DO
+			CASE sym_plus_assign, sym_minus_assign, sym_times_assign:
+				IF (t <> int_type) AND (t <> float_type) THEN
+					Error("invalid LHS type " + TypeToString(t)
+					+ " for the operator" + " += -= *=")
+					left_inval = TRUE
+				END
+			CASE sym_div_assign:
+				IF t <> float_type THEN
+					Error("invalid LHS type " + TypeToString(t)
+					+ " for the operator" + " /=, required float")
+					left_inval = TRUE
+				END
+			CASE sym_period_assign:
+				IF (t = string_type) OR IsObjectConvertibleToString(t) THEN
+					# Ok
+				ELSE
+					Error("invalid LHS type " + TypeToString(t)
+					+ " for the operator" + " .=, required string")
+					left_inval = TRUE
+				END
+			CASE sym_mod_assign, sym_bit_and_assign, sym_bit_or_assign,
+				sym_bit_xor_assign, sym_lshift_assign, sym_rshift_assign:
+				IF t <> int_type THEN
+					Error("invalid LHS type " + TypeToString(t)
+					+ " for the operator %= &= |= ^= <<= >>=, required int")
+					left_inval = TRUE
+				END
+			ELSE
+			END
+		END
+		ReadSym()
+
+		(*
+			Parse RHS of the operator:
+		*)
+		r = ParseExpr()
+		IF r = NIL THEN
+			#Warning("can't detect expression type")
+			RETURN NIL
+		END
+
+		(*
+			Preliminary check of the RHS:
+		*)
+		t2 = r[type]
+		SWITCH op DO
+		CASE sym_plus_assign, sym_minus_assign, sym_times_assign:
+			IF (t2 <> int_type) AND (t2 <> float_type) THEN
+				Error("invalid RHS type " + TypeToString(t2)
+				+ " for the operator" + " += -= *=")
+				left_inval = TRUE
+			END
+		CASE sym_div_assign:
+			IF (t2 <> int_type) AND (t2 <> float_type) THEN
+				Error("invalid RHS type " + TypeToString(t2)
+				+ " for the operator" + " /=, required float")
+				left_inval = TRUE
+			END
+		CASE sym_period_assign:
+			IF NOT ( (t2 = string_type) OR IsObjectConvertibleToString(t2) ) THEN
+				Error("invalid RHS type " + TypeToString(t2)
+				+ " for the operator" + " .=, required string")
+				left_inval = TRUE
+			END
+		CASE sym_mod_assign, sym_bit_and_assign, sym_bit_or_assign,
+			sym_bit_xor_assign, sym_lshift_assign, sym_rshift_assign:
+			IF t2 <> int_type THEN
+				Error("invalid RHS type " + TypeToString(t2)
+				+ " for the operator %= &= |= ^= <<= >>=, required int")
+				left_inval = TRUE
+			END
+		ELSE
+		END
+
+		(*
+			Compatibility check between LHS and RHS types:
+		*)
+		IF t = NIL THEN
+			t = t2
+			RETURN t2
+		END
+
+		IF op = sym_assign THEN
+			SWITCH LhsMatchRhs(t, t2) DO
+			CASE match_good:
+			CASE match_warn:
+				Warning("cannot assign a value of type " + TypeToString(t2)
+				+ " to a variable of type " + TypeToString(t))
+			CASE match_err:
+				Error("cannot assign a value of type " + TypeToString(t2)
+				+ " to a variable of type " + TypeToString(t))
+			END
+			RETURN t
+		END
+
+		IF (t = int_type) AND (t2 = float_type) THEN
+			Error("can't assign float to int in assignment operator")
+		END
+		RETURN t
+		
+	ELSIF sym = sym_instanceof THEN
+		IF php_ver = php4 THEN
+			Error("invalid operator `instanceof' (PHP 5). Hint: use `is_a()'.")
+		END
+		IF (t <> NIL) AND (t[basetype] <> object)
+		AND (t[basetype] <> mixed) THEN
+			Error("the left side of `instanceof' is of type "
+			+ TypeToString(t) + ", expected object or mixed")
+		END
+		ReadSym()
+		IF sym = sym_namespace THEN
+			map_namespace_operator_into_id()
+		END
+		IF sym = sym_identifier THEN
+			IF SearchClass(s) = NIL THEN
+				Warning("class `" + s + "' (still) undefined")
+			END
+		ELSIF sym = sym_self THEN
+			IF curr_class = NIL THEN
+				Error("`self' undefined outside class body")
+			END
+		ELSIF sym = sym_parent THEN
+			IF curr_class = NIL THEN
+				Error("`parent' undefined outside class body")
+			ELSIF curr_class[extends] = NIL THEN
+				Error("current class has no parent")
+			END
+		ELSIF sym = sym_variable THEN
+			v = SearchVar(s)
+			IF (v = NIL) THEN
+				Fatal("unknown variable `$" + s + "' after `instanceof'")
+			END
+			IF (v[type][basetype] <> string) AND (v[type][basetype] <> object) THEN
+				Fatal("variable after `instanceof' must be string or object, "
+				+ TypeToString(v[type]) + " found for `$" + s + "'")
+			END
+		ELSE
+			Fatal("expected class name or variable, found symbol " + SymToName(sym))
+		END
+		ReadSym()
+		RETURN boolean_type
+
+	ELSIF sym = sym_incr THEN
+		IF (t <> NIL) AND (t <> int_type) THEN
+			Error("`++' applied to " + TypeToString(t))
+		END
+		ReadSym()
+		RETURN int_type
+
+	ELSIF sym = sym_decr THEN
+		IF (t <> NIL) AND (t <> int_type) THEN
+			Error("`--' applied to " + TypeToString(t))
+		END
+		ReadSym()
+		RETURN int_type
+
+	ELSE
+		RETURN t
+	END
+END
+
+
+FUNCTION ParseFuncCall(func_name: STRING, inside_expr: BOOLEAN): Type
+(*
+	If the function isn't declared, guess the signature: the return type is
+	void if NOT inside_expr, mixed if inside_expr; the type of the formal
+	arguments are guessed from the expressions giving the actual arguments.
+
+	Returns the type of the returned value.
+
+	NOTE: we enter with sym = sym_lround, already checked..
+
+	FIXME: actually inside_expr isn't used, since it is always TRUE.
+*)
+VAR
+	guess: BOOLEAN
+	f: Function
+	sign: SIGNATURE
+	return_type: Type
+BEGIN
+
+	f = AccountFuncCall(func_name)
+
+	IF f[decl_in] = NIL THEN
+		# Undeclared function -- guess signature:
+		IF f[sign] = NIL THEN
+			Warning("function `" + func_name
+			+ "()' (still) not declared. Guessing signature from its usage."
+			+ " Hint: it's better to declare the functions before their usage.")
+			guess = TRUE
+			IF inside_expr THEN
+				sign[return] = mixed_type
+			ELSE
+				sign[return] = void_type
+			END
+			f[sign] = sign
+			f[guessed_sign_in] = here()
+			return_type = sign[return]
+		ELSE
+			return_type = f[sign][return]
+		END
+
+	ELSIF f[name] = "cast" THEN
+		# It's the cast() magic function:
+		RETURN Typecast.EvaluateCastCall()
+
+	ELSE
+		# Known function.
+		return_type = f[sign][return]
+	END
+
+	Errors.RaiseErrors(f[errors])
+	Exceptions.ThrowExceptions(f[exceptions])
+
+	ParseArgsListCall(guess, f[name], f[sign], f[decl_in])
+
+	RETURN return_type
+END
+
+
+# Required by ParseArray():
+$  RECORD * Expressions_ParseStaticExpr();
+
+
+FUNCTION ParseArray(static: BOOLEAN): Result
+(*
+	Status on entry: sym = sym_lround
+*)
+VAR r, k, e: Result
+BEGIN
+	# Initial default result:
+	r = {{array, void, NIL, NIL}, NIL}
+
+	# Guess the value:
+	ReadSym()
+	IF sym = sym_rround THEN
+		ReadSym()
+		# Empty array, can't guess type.
+		r[type][index_type] = mixed
+		r[type][elem_type] = mixed_type
+		# Set the value so that caller may then allow formal typecast:
+		r[value] = "array()"
+		RETURN r
+	END
+	r[value] = "array(...)"
+
+	# Guess the structure from the first element:
+	IF static THEN
+		k = ParseStaticExpr()
+	ELSE
+		k = ParseExpr()
+	END
+	IF sym = sym_rarrow THEN
+		IF k = NIL THEN
+			#Warning("can't detect the type of the key")
+		ELSIF k[type] = int_type THEN
+			r[type][index_type] = int
+		ELSIF k[type] = string_type THEN
+			r[type][index_type] = string
+		ELSE
+			Error("invalid key of type " + TypeToString(k[type]))
+		END
+		ReadSym()
+		IF static THEN
+			e = ParseStaticExpr()
+		ELSE
+			e = ParseExpr()
+		END
+	ELSE
+		r[type][index_type] = int
+		e = k
+	END
+	IF e = NIL THEN
+		#Error("can't detect the type of the array element")
+	ELSE
+		r[type][elem_type] = e[type]
+	END
+
+	# Parse next elements, comparing the key/elem types with
+	# those already scanned:
+	WHILE sym = sym_comma DO
+		ReadSym()
+
+		IF sym = sym_rround THEN
+			#Warning("missing array element after `,'")
+			ReadSym()
+			RETURN r
+		END
+
+		IF static THEN
+			k = ParseStaticExpr()
+		ELSE
+			k = ParseExpr()
+		END
+		IF sym = sym_rarrow THEN  #  ..., k => e, ...
+			IF k = NIL THEN
+				#Warning("can't detect the type of the key")
+			ELSIF k[type] = int_type THEN
+				IF r[type][index_type] = string THEN
+					Warning("mixing keys of different types in array")
+					r[type][index_type] = mixed
+				END
+			ELSIF k[type] = string_type THEN
+				IF r[type][index_type] = int THEN
+					Warning("mixing keys of different types in array")
+					r[type][index_type] = mixed
+				END
+			ELSE
+				Error("invalid array key of type " + TypeToString(k[type]))
+			END
+			ReadSym()
+			IF static THEN
+				e = ParseStaticExpr()
+			ELSE
+				e = ParseExpr()
+			END
+		ELSE
+			# No key provided: that means the index type must be
+			# either int or mixed:
+			IF r[type][index_type] = string THEN
+				Warning("mixing keys of different types in array")
+				r[type][index_type] = mixed
+			END
+			e = k
+		END
+		IF e = NIL THEN
+			#Warning("can't detect the type of the element")
+		ELSIF LhsMatchRhs(r[type][elem_type], e[type]) <> match_good THEN
+			Warning("mixing elements of different types in array: found "
+			+ TypeToString(e[type])
+			+ ", expected " + TypeToString(r[type][elem_type]))
+			r[type][elem_type] = mixed_type
+		END
+	END
+
+	Expect(sym_rround, "expected `)'")
+	ReadSym()
+	RETURN r
+END
+
+
+FUNCTION ParseDoubleQuotedStringWithEmbeddedVars(staticExpr: BOOLEAN): Result
+(*
+	Parse double quoted literal string, possibly with embedded variables.
+*)
+VAR r: Result  err: BOOLEAN
+BEGIN
+	r = {string_type, s}
+	ReadSym()
+	WHILE sym = sym_embedded_variable DO
+		IF staticExpr AND NOT err THEN
+			Error("variables forbidden in static expression")
+			err = TRUE
+		END
+		# Embedded vars found, cannot determine the resulting value:
+		r[value] = NIL
+		AccountVarRHS(s)
+		ReadSym()
+		IF sym = sym_continuing_double_quoted_string THEN
+			ReadSym()
+		END
+	END
+	RETURN r
+END
+
+
+FUNCTION ParseList(): Result
+VAR
+	r: Result
+	t: Type
+BEGIN
+	ReadSym()
+	Expect(sym_lround, "expected '(' after 'list'")
+	LOOP
+		ReadSym()
+		IF sym = sym_variable THEN
+			t = NIL
+			ParseLHS(t)
+			# FIXME: assign the type to v
+		END
+		IF sym = sym_comma THEN
+			(* more elements in list *)
+		ELSIF sym = sym_rround THEN
+			ReadSym()
+			EXIT
+		ELSE
+			Fatal("expected variable name or closing ')' inside list()")
+		END
+	END
+	Expect(sym_assign, "expected '=' after list()")
+	ReadSym()
+	r = ParseExpr()
+	IF r = NIL THEN
+		Warning("unknown type assigned to the list()")
+	ELSIF r[type][basetype] <> array THEN
+		Error("invalid value assigned to list(): " + TypeToString(r[type]))
+	END
+	RETURN {{array, void, NIL, NIL}, NIL} # FIXME: which return type?
+END
+
+
+FUNCTION ParseClassStaticAccess(class: Class): Result
+(*
+	Parse access to a class entity through the `::' operator.
+	`class' may be NIL if the class is unknown.
+	We enter with sym = sym_double_colon.
+
+	Handle:
+
+	::const
+	::$property possibly followed by [ { -> = += *= ... ++ -- instanceof
+	::method() possibly followed by ->
+
+	Return the resulting value of the sub-expression.
+*)
+VAR
+	id: STRING
+	c: ClassConst
+	c2: Class
+	p: Property
+	t: Type
+BEGIN
+	ReadSym()
+
+	IF sym = sym_variable THEN # a property
+		IF class <> NIL THEN
+			ResolveClassProperty(class, TRUE, s, c2, p)
+		END
+		ReadSym()
+		IF (sym = sym_lsquare)
+		OR (sym = sym_lbrace)
+		OR (sym = sym_arrow)
+		OR (sym = sym_incr)
+		OR (sym = sym_decr)
+		OR (sym = sym_instanceof)
+		OR IsAssignOp(sym) THEN
+			IF p = NIL THEN
+				t = Dereference(t)
+			ELSE
+				t = Dereference(p[type])
+			END
+		ELSIF p <> NIL THEN
+			t = p[type]
+		END
+		IF t = NIL THEN
+			RETURN NIL
+		ELSE
+			RETURN {t, NIL}
+		END
+
+	ELSIF sym = sym_identifier THEN
+		id = s
+		ReadSym()
+		IF sym = sym_lround THEN # a method
+			IF class = NIL THEN
+				SkipFuncCall()
+				t = NIL
+			ELSE
+				t = ParseClassMethodCall(class, TRUE, id)
+			END
+			IF sym = sym_arrow THEN
+				IF php_ver = php4 THEN
+					Error("cannot dereference object returned by method")
+				END
+				t = Dereference(t)
+			END
+			IF t = NIL THEN
+				RETURN NIL
+			ELSE
+				RETURN {t, NIL}
+			END
+
+		ELSE # a constant
+			IF class = NIL THEN
+				RETURN NIL
+			ELSE
+				ResolveClassConst(class, id,  c2, c)
+				IF c = NIL THEN
+					Error("constant `" + class[name] + "::" + id
+					+ "' does not exist")
+					RETURN NIL
+				ELSE
+					AccountClassConst(c2, c)
+					IF (c[visibility] = private) AND (curr_class <> c2) THEN
+						Error("access forbidden to private constant `"
+						+ pc(class, c2) + "::" + id + "'")
+					ELSIF (c[visibility] = protected) AND (NOT IsSubclassOf(curr_class, c2)) THEN
+						Error("access forbidden to protected constant `"
+						+ pc(class, c2) + "::" + id + "'")
+					END
+					RETURN c[value]
+				END
+			END
+		END
+
+	ELSE
+		Fatal("expected class item after `::', found " + SymToName(sym))
+	END
+END
+
+
+FUNCTION ParseSelf(): Result
+BEGIN
+	ReadSym()
+	Expect(sym_double_colon, "expected `::' after `self'")
+	IF php_ver = php4 THEN
+		Error("invalid `self::' (PHP 5)")
+	END
+	IF curr_class = NIL THEN
+		Fatal("invalid `self::': not inside a class")
+	ELSE
+		RETURN ParseClassStaticAccess(curr_class)
+	END
+END
+
+
+FUNCTION ParseStatic(): Result
+BEGIN
+	ReadSym()
+	Expect(sym_double_colon, "expected `::' after `static'")
+	IF php_ver = php4 THEN
+		Error("invalid `static::' (PHP 5)")
+	END
+	IF curr_class = NIL THEN
+		Fatal("invalid `static::': not inside a class")
+	ELSE
+		RETURN ParseClassStaticAccess(curr_class)
+	END
+END
+
+
+FUNCTION ParseParent(): Result
+VAR
+	parent: Class
+BEGIN
+	ReadSym()
+	Expect(sym_double_colon, "expected `::' after `parent'")
+	IF curr_class = NIL THEN
+		parent = NIL
+		Error("invalid `parent::': not inside a class")
+	ELSE
+		parent = curr_class[extends]
+		IF parent = NIL THEN
+			Error("invalid `parent::': class `" + curr_class[name]
+			+ "' do not has a parent")
+		END
+	END
+	RETURN ParseClassStaticAccess(parent)
+END
+
+
+FUNCTION ParseExit()
+(*
+	"exit()" isn't a function, but a statement. The logical place for
+	this FUNCTION should be ParseInstruction(). However, so many people
+	are used to write things like
+
+		(something that can fail) or exit("msg");
+
+	that I'm forced to allow the use of exit() as a function inside exprs.
+*)
+VAR r: Result
+BEGIN
+	ReadSym()
+	IF sym = sym_lround THEN
+		ReadSym()
+		IF sym <> sym_rround THEN
+			r = ParseExpr()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the expression")
+			ELSIF (r[type] <> int_type) AND (r[type] <> string_type) THEN
+				Error("the exit status must be int or string")
+			END
+			# FIXME: check the int value in [0,254]
+		END
+		Expect(sym_rround, "expected `)'")
+		ReadSym()
+	END
+END
+
+
+FUNCTION CheckBoolean(where: STRING, r: Result)
+BEGIN
+	IF r = NIL THEN
+		#Warning(where + ": can't determine the type of the expression."
+		#+ " Expected boolean.")
+		RETURN
+	END
+	SWITCH r[type][basetype] DO
+	CASE boolean: RETURN
+	CASE int:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ "an integer value. Remember that 0 evaluates to FALSE, and "
+		+ "any other integer value evaluates to TRUE.")
+	CASE float:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ "a float value. Remember that 0.0 evaluates to FALSE and any other "
+		+ "value evaluates to TRUE.")
+	CASE string:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ "a string value. Remember that the empty string \"\", the string "
+		+ "\"0\" and the NULL string all evaluate to FALSE and any other "
+		+ "string evaluates to TRUE.")
+	CASE array:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ TypeToString(r[type]) + ". Remember that an array with zero elements "
+		+ "evaluates to FALSE, and an array with one or more elements "
+		+ "evaluates to TRUE.")
+	CASE mixed:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ "a mixed value")
+	CASE resource:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ "a resource. Remember that a resource evaluates always to TRUE, so "
+		+ "that this expression is useless. Remember too that some functions, "
+		+ "formally declared to return a resource, might return the boolean "
+		+ "value FALSE on error; if this is the case, rewrite as (EXPR) !== FALSE.")
+	CASE object:
+		Error(where + ": expected expression of the type boolean, but found "
+		+ TypeToString(r[type])
+		+ ". Remember that an object evaluates to FALSE if it has no "
+		+ "properties, and evaluates to TRUE if it has at least a property.")
+	ELSE
+		Error(where + ": invalid type " + TypeToString(r[type])
+		+ ", expected expression of type boolean")
+	END
+END
+
+
+FUNCTION ParseExpr(): Result
+
+
+	FUNCTION ParseVarRHS(): Type
+	(*
+		Parse $v ...
+	*)
+
+		FUNCTION DereferenceGLOBALS(): STRING
+		VAR r: Result  n: STRING
+		BEGIN
+			ReadSym()
+			r = ParseExpr()
+			Expect(sym_rsquare, "expected `]'")
+			ReadSym()
+			IF r = NIL THEN
+				Warning("can't parse the name of the global variable")
+				RETURN NIL
+			ELSIF r[type] <> string_type THEN
+				Error("$GLOBALS[?]: required string, found "
+				+ TypeToString(r[type]))
+				RETURN NIL
+			END
+			n = r[value]
+			IF n = NIL THEN
+				Warning("$GLOBALS[?]: undetermined variable name")
+				RETURN NIL
+			ELSIF length(n) = 0 THEN
+				Warning("$GLOBALS['']: invalid empty string")
+				RETURN NIL
+			ELSIF NOT match(n, ID) THEN
+				Error("$GLOBALS['" + n + "']: invalid name, can't be a variable!")
+				RETURN NIL
+			END
+			RETURN n
+		END
+
+	VAR
+		id: STRING
+		v: VARIABLE
+		t: Type
+	BEGIN
+		id = s
+		ReadSym()
+
+		# Handling of $GLOBALS[...
+		IF (id = "GLOBALS") AND (sym = sym_lsquare) THEN
+			id = DereferenceGLOBALS()
+			IF id = NIL THEN
+				v = NIL
+				id = "UNDETERMINED_GLOBAL_VAR" # FIXME
+			ELSE
+				v = SearchVarInScope(id, 0)
+				IF (v = NIL) AND (scope > 0) THEN
+					Warning("$GLOBALS['" + id + "']: undefined global variable")
+					id = "UNDEFINED_GLOBAL_VAR_" + id # FIXME
+					# FIXME: define this global var.
+				END
+			END
+		ELSE
+			v = SearchVar(id)
+		END
+
+		# Now: v=NIL: undef. var. of name id
+		#      v<>NIL: var. of name id
+
+		
+		# Catch common error "$v()":
+		IF sym = sym_lround THEN
+			Error("invalid variable-name function (PHPLint restriction)")
+			SkipFuncCall()
+			RETURN NIL
+
+		# Handling of  $v[...
+		ELSIF sym = sym_lsquare THEN
+			# FIXME: Dereference() should be made aware if the expected
+			# array is assigned or not, so that only the appropriate
+			# expr be allowed.
+			IF v = NIL THEN
+				# Array does not exist: it must be a LHS:
+				# $a[?][?] = ...
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+				RETURN Dereference(v[type])
+			ELSIF NOT v[assigned] THEN
+				# Array exists, but not assigned: it must be a LHS:
+				# $a[?][?] = ...
+				AccountVarLHS2(v)
+				RETURN Dereference(v[type])
+			ELSE
+				# Array already assigned: it may be LHS or LHS and RHS:
+				# $a[?][?] = ...  (LHS)
+				# $a[?][?] += ... (or -= *= /= etc.) (LHS and RHS)
+				# $a[?][?]->...   (RHS)
+				# $a[?]{?}        (RHS)
+				AccountVarRHS2(v)
+				RETURN Dereference(v[type])
+			END
+
+		# Handling of  $v{...  $v->...
+		ELSIF (sym = sym_lbrace) OR (sym = sym_arrow) THEN
+			IF v = NIL THEN
+				Error("using unassigned variable `$" + id + "'")
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+			ELSE
+				AccountVarRHS2(v)
+			END
+			RETURN Dereference(v[type])
+
+		# Handling of  $v=...
+		ELSIF sym = sym_assign THEN
+			IF v = NIL THEN
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+				v[assigned] = FALSE
+			ELSE
+				AccountVarLHS2(v)
+			END
+			t = Dereference(v[type])
+			v[assigned] = TRUE
+			RETURN t
+
+		# Handling of  $v+=... $v*=...  $v^=...
+		ELSIF IsAssignOp(sym) THEN
+			IF v = NIL THEN
+				Error("using unassigned variable `$" + id + "'")
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+			ELSE
+				AccountVarRHS2(v)
+			END
+			RETURN Dereference(v[type])
+
+		# Handling of $v++ $v--
+		ELSIF (sym = sym_incr) OR (sym = sym_decr) THEN
+			IF v = NIL THEN
+				Error("using unassigned variable `$" + id + "'")
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+				v[type] = int_type
+			ELSE
+				AccountVarRHS2(v)
+			END
+			RETURN Dereference(v[type])
+
+		# Handle $v instanceof ...
+		ELSIF sym = sym_instanceof THEN
+			IF v = NIL THEN
+				Error("using unassigned variable `$" + id + "'")
+				AccountVarLHS(id, FALSE)
+				v = SearchVar(id)
+			ELSE
+				AccountVarRHS2(v)
+			END
+			RETURN Dereference(v[type])
+
+		# Handle $v (already known)
+		ELSIF v <> NIL THEN
+			AccountVarRHS2(v)
+			RETURN v[type]
+
+		# Handle $v (unknown)
+		ELSE
+			AccountVarRHS(id)
+			v = SearchVar(id)
+			RETURN v[type]
+
+		END
+
+	END
+
+
+	FUNCTION ParseTerm(): Result
+
+		FUNCTION ParseIsset()
+		BEGIN
+			ReadSym()
+			Expect(sym_lround, "expected `(' after `isset'")
+			LOOP
+				ReadSym()
+				ParseLHS(NIL)
+				IF sym = sym_comma THEN
+					(* more elements in list *)
+				ELSIF sym = sym_rround THEN
+					ReadSym()
+					RETURN
+				ELSE
+					Fatal("expected variable name or closing ')' after isset() args, found " + SymToName(sym))
+				END
+			END
+		END
+
+
+		FUNCTION ParseNew(): Result
+		VAR
+			class: Class
+			C: Class
+			c: Method
+			r: Result
+			here_: WHERE
+		BEGIN
+			ReadSym()
+
+			IF sym = sym_namespace THEN
+				map_namespace_operator_into_id()
+			END
+
+			IF sym = sym_identifier THEN
+				class = SearchClass(s)
+				IF class = NIL THEN
+					Error("unknown class `" + s + "'")
+					ReadSym()
+					IF sym = sym_lround THEN
+						SkipFuncCall()
+					END
+					RETURN NIL
+				END
+
+			ELSIF sym = sym_self THEN
+				class = curr_class
+				IF class = NIL THEN
+					Fatal("`self': not inside a class")
+				END
+
+			ELSIF sym = sym_static THEN
+				class = curr_class
+				IF class = NIL THEN
+					Fatal("`static': not inside a class")
+				END
+				Error("`new static' is not supported by PHPLint")
+
+			ELSIF sym = sym_parent THEN
+				IF curr_class = NIL THEN
+					Fatal("`parent': we are not inside a class")
+				END
+				class = curr_class[extends]
+				IF class = NIL THEN
+					Fatal("`parent': no parent class")
+					# FIXME: stdClass is the parent of every class
+				END
+
+			ELSIF sym = sym_variable THEN
+				Error("expected static class name after `new', variable class name not allowed (PHPLint restriction)")
+				ReadSym()
+				IF sym = sym_lround THEN
+					SkipFuncCall()
+				END
+				RETURN NIL
+			ELSE
+				Fatal("expected class name or `self', `static' or `parent' after `new'")
+			END
+
+			IF class[abstract] AND (sym <> sym_static) THEN
+				Error("cannot instantiate abstract class `" + s + "'")
+			END
+
+			IF class[interface] THEN
+				Error("cannot instantiate interface class `" + s + "'")
+			END
+
+			IF class[deprecated] > "" THEN
+				Warning("instantiating object from deprecated class `"
+				+ class[name] + "': " + class[deprecated])
+			END
+
+			AccountClass(class)
+
+			(*
+				Search the constructor of `class'; mark as invoked the default
+				or inherited constructor of any extended class, so we may
+				detect if any actual constructor gets parsed only after its
+				usage:
+			*)
+			C = class
+			here_ = here()
+			LOOP
+				C[constructor_last_used_here] = here_
+				IF C[construct] <> NIL THEN
+					EXIT
+				END
+				C = C[extends]
+				IF C = NIL THEN
+					EXIT
+				END
+			END
+
+			IF C = NIL THEN # no constructor for this class
+				(* Invoke default constructor void(): *)
+				AccountClass(class)
+				ReadSym()
+				IF sym = sym_lround THEN
+					ReadSym()
+					IF sym <> sym_rround THEN
+						Error("Expected `)', found " + SymToName(sym)
+						+ ". The class `" + class[name]
+						+ "' do not has a constructor, so no arguments are"
+						+ " required")
+						# skip unexpected args and continue:
+						LOOP
+							r = ParseExpr()
+							IF sym = sym_comma THEN
+								ReadSym()
+							ELSE
+								EXIT
+							END
+						END
+					END
+					Expect(sym_rround, "expected `)'")
+					ReadSym()
+				END
+
+			ELSE # there is a constructor for this class
+				c = C[construct]
+				IF (c[visibility] = private) AND (curr_class <> C) THEN
+					Error("the constructor of the class `" + C[name]
+					+ "' is private")
+				END
+				IF (c[visibility] = protected)
+				AND NOT IsSubclassOf(curr_class, C) THEN
+					Error("the constructor of the class `" + C[name]
+					+ "' is protected")
+				END
+				ReadSym()
+				IF sym = sym_lround THEN
+					ParseArgsListCall(FALSE, pc(class, C) + "::" + c[name],
+						c[sign], c[decl_in])
+				ELSIF c[sign][mandatory] > 0 THEN
+					Error("missing required arguments for constructor "
+					+ pc(class, C) + "::" + c[name] + " declared in "
+					+ reference(c[decl_in]))
+				ELSE
+					Notice("missing parentheses after class name. Although "
+					+ "the constructor " + pc(class, C) + "::" + c[name]
+					+ " has no mandatory arguments, it's a good habit"
+					+ " to provide these parentheses.")
+				END
+
+				Errors.RaiseErrors(c[errors])
+				Exceptions.ThrowExceptions(c[exceptions])
+
+			END
+			RETURN {class[type], NIL}
+		END
+
+
+		FUNCTION ParseClone(): Result
+		VAR
+			r: Result
+			C: Class
+			m: Method
+		BEGIN
+			ReadSym()
+			r = ParseTerm()
+			IF r = NIL THEN
+				#Warning("cannot determine the type of the argument of `clone'")
+			ELSIF r[type][basetype] = object THEN
+				# Account for usage of method __clone():
+				C = r[type][class]
+				IF C <> NIL THEN
+					ResolveClassMethod(C, "__clone",  C, m)
+					IF m <> NIL THEN
+						AccountClassMethod(C, m)
+					END
+				END
+
+			ELSE
+				Error("invalid type " + TypeToString(r[type]) + " for `clone'")
+				r = NIL
+
+			END
+			RETURN r
+		END
+
+
+	VAR
+		id: STRING
+		r: Result
+		t: Type
+		class: Class
+		forced_typecast: BOOLEAN
+	BEGIN
+		IF sym = sym_namespace THEN
+			map_namespace_operator_into_id()
+		END
+
+		SWITCH sym DO
+
+		CASE sym_null:
+			r = {null_type, "NULL"}
+			ReadSym()
+
+		CASE sym_false:
+			r = {boolean_type, false_value}
+			ReadSym()
+
+		CASE sym_true:
+			r = {boolean_type, true_value}
+			ReadSym()
+
+		CASE sym_lit_int:
+			r = {int_type, s}
+			ReadSym()
+
+		CASE sym_lit_float:
+			r = {float_type, s}
+			ReadSym()
+
+		CASE sym_single_quoted_string:
+			r = {string_type, s}
+			ReadSym()
+
+		CASE sym_double_quoted_string:
+			r = ParseDoubleQuotedStringWithEmbeddedVars(FALSE)
+
+		CASE sym_here_doc:
+			r = ParseDoubleQuotedStringWithEmbeddedVars(FALSE)
+
+		CASE sym_bit_and:
+			ReadSym()
+			r = ParseTerm()
+
+		CASE sym_variable:
+			t = ParseVarRHS()
+			IF t = NIL THEN
+				r = NIL
+			ELSE
+				r = {t, NIL}
+			END
+
+		CASE sym_identifier:
+			id = s
+			ReadSym()
+			IF sym = sym_lround THEN # function call
+				t = ParseFuncCall(id, TRUE)
+				IF sym = sym_arrow THEN
+					IF php_ver = php4 THEN
+						Error("cannot dereference object returned by function")
+					END
+					t = Dereference(t)
+				END
+				IF t = NIL THEN
+					r = NIL
+				ELSE
+					r = {t, NIL}
+				END
+
+			ELSIF sym = sym_double_colon THEN # static access to class
+				class = SearchClass(id)
+				IF class = NIL THEN
+					Error("unknown class `" + id + "'")
+				END
+				RETURN ParseClassStaticAccess(class)
+
+			ELSE # constant
+				r = AccountConstRHS(id)
+			END
+
+		CASE sym_exit:
+			Error("`exit()' (aka `die()') isn't a function, it is a statement. Trying to continue anyway, but probably the result of the expression will be of the wrong type.")
+			ParseExit()
+			r = NIL
+
+		CASE sym_self:
+			r = ParseSelf()
+
+		CASE sym_static:
+			r = ParseStatic()
+
+		CASE sym_parent:
+			r = ParseParent()
+
+		CASE sym_new:
+			r = ParseNew()
+
+		CASE sym_clone:
+			r = ParseClone()
+
+		CASE sym_isset:
+			ParseIsset()
+			r = {boolean_type, NIL}
+
+		CASE sym_array:
+			ReadSym()
+			Expect(sym_lround, "expected `(' after `array'")
+			r = ParseArray(FALSE)
+
+		CASE sym_list:
+			r = ParseList()
+
+		CASE sym_lround:
+			# Sub-expression or typecast operator.
+			ReadSym()
+			SWITCH sym DO
+
+			CASE sym_boolean:
+				ReadSym()
+				Expect(sym_rround, "expected closing `)' in typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = EvalValueConversion(r, boolean_type)
+			
+			CASE sym_int:
+				ReadSym()
+				Expect(sym_rround, "expected closing `)' in typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = EvalValueConversion(r, int_type)
+			
+			CASE sym_float:
+				ReadSym()
+				Expect(sym_rround, "expected closing `)' in typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = EvalValueConversion(r, float_type)
+			
+			CASE sym_string:
+				ReadSym()
+				Expect(sym_rround, "expected closing `)' in typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = EvalValueConversion(r, string_type)
+			
+			CASE sym_array:
+				# FIXME: it might be an expression
+				ReadSym()
+				Expect(sym_rround, "expected closing `)' in typecast")
+				Error("forbidden `(array)' typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = { {array, void, NIL, NIL}, NIL }
+			
+			CASE sym_object:
+				ReadSym()
+				Expect(sym_rround, "expected `)' after typecast")
+				Error("forbidden `(object)' typecast")
+				ReadSym()
+				r = ParseTerm()
+				r = { object_type, NIL }
+
+			ELSE # Sub-expression:
+				r = ParseExpr()
+				Expect(sym_rround, "missing `)'")
+				ReadSym()
+			END
+
+		CASE sym_x_lround:
+			(* Formal typecast. *)
+			forced_typecast = FALSE
+			ReadSym()
+			IF (sym = sym_x_identifier) AND (s = "__phplint_forced_typecast__") THEN
+				forced_typecast = TRUE
+				ReadSym()
+			END
+			t = ParseType(FALSE)
+			Expect(sym_x_rround, "expected closing `)' in formal typecast")
+			ReadSym()
+			r = ParseTerm()
+			(*
+				Under PHP 5, only formal typecast on empty array() and NULL
+				allowed in non-static expressions. An exception when the
+				special keyword "__phplint_forced_typecast__" precedes the
+				actual type, required to implements the magic methods of the
+				TypeXxx classes of the stdlib.
+			*)
+			IF (php_ver = php5) AND (r <> NIL) AND NOT forced_typecast THEN
+				IF (r[type][basetype] = array) AND (r[value] = "array()")
+				OR (r[type] = null_type) AND (r[value] = "NULL") THEN
+					# ok
+				ELSE
+					Error("formal typecast in non-static expression allowed only if applied to NULL or empty array array(). Hint: have a look at the PHPLint magic function cast().")
+				END
+			END
+			r = EvalTypeConversion(r, t)
+
+		ELSE
+			UnexpectedSymbol()
+
+		END
+
+		RETURN r
+
+	END
+
+
+	FUNCTION e18(): Result
+	VAR
+		r: Result
+	BEGIN
+		IF (sym = sym_incr) OR (sym = sym_decr) THEN
+			ReadSym()
+			ParseLHS(int_type)
+			r = {int_type, NIL}
+		ELSE
+			r = ParseTerm()
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e17(): Result
+	# Unary operators.
+	VAR r: Result
+	BEGIN
+		IF sym = sym_not THEN
+			ReadSym()
+			r = EvalNot( e17() )
+		ELSIF sym = sym_plus THEN
+			ReadSym()
+			r = EvalUnaryPlusMinus(FALSE, e17())
+		ELSIF sym = sym_minus THEN
+			ReadSym()
+			r = EvalUnaryPlusMinus(TRUE, e17())
+		ELSIF sym = sym_bit_not THEN
+			ReadSym()
+			r = EvalBitNot( e17() )
+		ELSIF sym = sym_at THEN
+			Errors.EnteringSilencer()
+			ReadSym()
+			r = e17()
+			Errors.ExitingSilencer()
+		ELSE
+			r = e18()
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e16(): Result
+	VAR r, t: Result  op: SYMBOL
+	BEGIN
+		r = e17()
+		WHILE (sym = sym_times) OR (sym = sym_div) OR (sym = sym_mod) DO
+			op = sym
+			ReadSym()
+			t = e17()
+			SWITCH op DO
+			CASE sym_times: r = EvalMult(r, t)
+			CASE sym_div:   r = EvalDiv(r, t)
+			CASE sym_mod:   r = EvalMod(r, t)
+			END
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e15(): Result
+	VAR r, q: Result  op: SYMBOL
+	BEGIN
+		r = e16()
+		WHILE (sym = sym_plus) OR (sym = sym_minus) OR (sym = sym_period) DO
+			op = sym
+			ReadSym()
+			q = e16()
+			SWITCH op DO
+			CASE sym_plus:   r = EvalPlus(r, q)
+			CASE sym_minus:  r = EvalMinus(r, q)
+			CASE sym_period: r = EvalPeriod(r, q)
+			END
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e14(): Result
+	VAR r, t: Result  op: SYMBOL
+	BEGIN
+		r = e15()
+		WHILE (sym = sym_lshift) OR (sym = sym_rshift) DO
+			op = sym
+			ReadSym()
+			t = e15()
+			IF op = sym_lshift THEN
+				r = EvalLShift(r, t)
+			ELSE
+				r = EvalRShift(r, t)
+			END
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e13(): Result
+	VAR r: Result  n: STRING
+	BEGIN
+		r = e14()
+		SWITCH sym DO
+		CASE sym_lt:  n = "<"
+		CASE sym_le:  n = "<="
+		CASE sym_gt:  n = ">"
+		CASE sym_ge:  n = ">="
+		ELSE RETURN r
+		END
+		ReadSym()
+		RETURN EvalCmp(n, r, e14())
+	END
+
+
+	FUNCTION e12(): Result
+	VAR r: Result
+	BEGIN
+		r = e13()
+		SWITCH sym DO
+
+		CASE sym_eq:
+			ReadSym()
+			RETURN EvalEq("==", r, e13())
+
+		CASE sym_ne:
+			ReadSym()
+			RETURN EvalEq("!=", r, e13())
+
+		CASE sym_eeq, sym_nee:
+			IF r = NIL THEN
+				#Notice("can't determine the type of the expression")
+			ELSIF r[type] = void_type THEN
+				Error("invalid operand of the type void")
+			END
+			ReadSym()
+			IF r = NIL THEN
+				#Notice("can't determine the type of the expression")
+			ELSIF r[type] = void_type THEN
+				Error("invalid operand of the type void")
+			END
+			r = e13()
+			RETURN {boolean_type, NIL}
+
+		ELSE
+			RETURN r
+		END
+	END
+
+
+	FUNCTION e11(): Result
+	VAR r: Result
+	BEGIN
+		r = e12()
+		WHILE sym = sym_bit_and DO
+			ReadSym()
+			r = EvalBitAnd(r, e12())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e10(): Result
+	VAR r: Result
+	BEGIN
+		r = e11()
+		WHILE sym = sym_bit_xor DO
+			ReadSym()
+			r = EvalBitXor(r, e11())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e9(): Result
+	VAR r: Result
+	BEGIN
+		r = e10()
+		WHILE sym = sym_bit_or DO
+			ReadSym()
+			r = EvalBitOr(r, e10())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e8(): Result
+	VAR r: Result
+	BEGIN
+		r = e9()
+		WHILE sym = sym_and DO
+			ReadSym()
+			r = EvalAnd("&&", r, e9())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e7(): Result
+	VAR r: Result
+	BEGIN
+		r = e8()
+		WHILE sym = sym_or DO
+			ReadSym()
+			r = EvalOr("||", r, e8())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e6(): Result
+	VAR r, a, b: Result  t: Type
+	BEGIN
+
+		IF sym = sym_print THEN
+			ReadSym()
+			r = e6()
+			IF r = NIL THEN
+				#Warning("can't determine the type of the expression")
+			ELSE
+				t = r[type]
+				IF (t = int_type) OR (t = float_type) OR (t = string_type)
+					OR IsObjectConvertibleToString(t)
+				THEN
+					# Ok.
+				ELSIF t = boolean_type THEN
+					Notice("found boolean value: remember that FALSE gets rendered as empty string \"\" while TRUE gets rendered as \"1\"")
+				ELSE
+					Error("found argument of the type " + TypeToString(t)
+					+ ". The arguments of the `print' function must be of"
+					+ " type int, float, string.")
+				END
+			END
+			RETURN {int_type, "1"}
+		END
+
+		r = e7()
+		WHILE sym = sym_question DO
+			CheckBoolean("EXPR ? ...:...", r)
+			ReadSym()
+			IF sym = sym_colon THEN
+				Fatal("unsupported short ternary operator ?:")
+			END
+			a = ParseExpr()
+			Expect(sym_colon, "expected `:'")
+			ReadSym()
+			b = ParseExpr()
+			IF (a <> NIL) AND (b <> NIL) AND NOT SameType(a[type], b[type]) THEN
+				Error("`...? EXPR1 : EXPR2': type mismatch: EXPR1 is "
+				+ TypeToString(a[type]) + ", EXPR2 is "
+				+ TypeToString(b[type]))
+			END
+			r = a
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e5(): Result
+	VAR r: Result
+	BEGIN
+		r = e6()
+		IF IsAssignOp(sym) THEN
+			Error("invalid left hand side in assignment. Hint: you might want to use the comparison operators `==' or `==='.")
+			ReadSym()
+			r = e6() # recursive call because they are right-associative
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e4(): Result
+	VAR r: Result
+	BEGIN
+		r = e5()
+		WHILE sym = sym_and2 DO
+			ReadSym()
+			r = EvalAnd("and", r, e5())
+		END
+		RETURN r
+	END
+
+
+	FUNCTION e3(): Result
+	VAR r: Result
+	BEGIN
+		r = e4()
+		WHILE sym = sym_xor DO
+			ReadSym()
+			r = EvalXor(r, e4())
+		END
+		RETURN r
+	END
+
+
+VAR r: Result
+BEGIN
+	r = e3()
+	WHILE sym = sym_or2 DO
+		ReadSym()
+		r = EvalOr("or", r, e3())
+	END
+	RETURN r
+END
+
+
+FUNCTION ParseExprList(): Result
+VAR r: Result
+BEGIN
+	LOOP
+		r = ParseExpr()
+		IF sym <> sym_comma THEN
+			RETURN r
+		END
+		ReadSym()
+	END
+END
+
+
+FUNCTION ParseStaticExpr(): Result
+
+	FUNCTION ParseStaticExpr_ClassConst(cl: Class): Result
+	BEGIN
+		# FIXME: it must be a constant; ParseClassStaticAccess() allows also
+		# for vars and methods!
+		RETURN ParseClassStaticAccess(cl)
+	END
+
+VAR
+	sign: BOOLEAN
+	r: Result
+	id: STRING
+	class, parent: Class
+	t: Type
+BEGIN
+	IF sym = sym_namespace THEN
+		map_namespace_operator_into_id()
+	END
+
+	IF sym = sym_null THEN
+		r = {null_type, "NULL"}
+		#Warning("missing type for NULL constant")
+		ReadSym()
+
+	ELSIF sym = sym_false THEN
+		r = {boolean_type, false_value}
+		ReadSym()
+
+	ELSIF sym = sym_true THEN
+		r = {boolean_type, true_value}
+		ReadSym()
+
+	ELSIF (sym = sym_plus) OR (sym = sym_minus) THEN
+		IF sym = sym_minus THEN
+			sign = TRUE
+		END
+		ReadSym()
+		r = ParseStaticExpr()
+		IF r <> NIL THEN
+			IF r[type] = int_type THEN
+				IF sign THEN
+					r = {int_type, itos( - stoi(r[value]) )}
+				END
+			ELSIF r[type] = float_type THEN
+				IF sign THEN
+					r = {float_type, rtos( - stor(r[value]) )}
+				END
+			ELSE
+				Error("unary minus on non numeric value")
+			END
+		END
+
+	ELSIF sym = sym_lit_int THEN
+		r = {int_type, s}
+		ReadSym()
+
+	ELSIF sym = sym_lit_float THEN
+		r = {float_type, s}
+		ReadSym()
+
+	ELSIF sym = sym_single_quoted_string THEN
+		r = {string_type, s}
+		ReadSym()
+
+	ELSIF sym = sym_double_quoted_string THEN
+		r = ParseDoubleQuotedStringWithEmbeddedVars(TRUE)
+
+	ELSIF sym = sym_here_doc THEN
+		r = ParseDoubleQuotedStringWithEmbeddedVars(TRUE)
+
+	ELSIF sym = sym_identifier THEN
+		id = s
+		ReadSym()
+		IF sym = sym_double_colon THEN
+			class = SearchClass(id)
+			IF class = NIL THEN
+				Error("unknown class `" + id + "'")
+			END
+			r = ParseStaticExpr_ClassConst(class)
+
+		ELSE
+			r = AccountConstRHS(id)
+
+		END
+
+	ELSIF sym = sym_self THEN
+		IF php_ver = php4 THEN
+			Error("invalid `self::' (PHP 5)")
+		END
+		IF curr_class = NIL THEN
+			Fatal("`self::': not inside a class")
+		END
+		ReadSym()
+		Expect(sym_double_colon, "expected `::'")
+		r = ParseStaticExpr_ClassConst(curr_class)
+
+	ELSIF sym = sym_parent THEN
+		IF php_ver = php4 THEN
+			Error("invalid `parent::' (PHP 5)")
+		END
+		IF curr_class = NIL THEN
+			parent = NIL
+			Error("`parent::': not inside a class")
+			r = NIL
+		ELSE
+			parent = curr_class[extends]
+			IF parent = NIL THEN
+				Error("invalid `parent::': class `" + curr_class[name]
+				+ "' do not has a parent")
+			END
+			ReadSym()
+			Expect(sym_double_colon, "expected `::'")
+			r = ParseStaticExpr_ClassConst(parent)
+		END
+
+	ELSIF sym = sym_array THEN
+		ReadSym()
+		IF sym <> sym_lround THEN
+			Fatal("expected `(' after `array'")
+		END
+		r = ParseArray(TRUE)
+
+	ELSIF sym = sym_x_lround THEN
+		(* Formal typecast. *)
+		ReadSym()
+		t = ParseType(FALSE)
+		Expect(sym_x_rround, "expected closing `)' in formal typecast")
+		ReadSym()
+		r = ParseStaticExpr()
+		r = EvalTypeConversion(r, t)
+
+	ELSE
+		Fatal("invalid static expression -- expected string, constant or static array")
+
+	END
+
+	RETURN r
+END
+
+
+FUNCTION ParseExprOfType(t: Type): Result
+VAR  r: Result
+BEGIN
+	r = ParseExpr()
+	IF r = NIL THEN
+		RETURN NIL
+	ELSIF SameType(t, r[type]) THEN
+		RETURN r
+	ELSE
+		Error("found expression of the type `" + TypeToString(r[type])
+		+ "', expected type `" + TypeToString(t) + "'")
+		RETURN NIL
+	END
+END
+
+END

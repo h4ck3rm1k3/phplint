@@ -1,0 +1,248 @@
+IMPLEMENTATION MODULE Errors
+
+IMPORT Classes
+IMPORT Exceptions
+IMPORT Globals
+IMPORT Scanner
+IMPORT Search
+IMPORT m2
+
+VAR
+	errors: ARRAY OF RECORD
+		name: STRING
+		code: INTEGER
+		user: BOOLEAN  # this err can be raised by user's code?
+	END
+
+	handle_error: INTEGER
+	(* Nesting level of the error's silencer "@" operator. *)
+
+	(*
+		Errors to exceptions pragma:
+	*)
+
+	error_throws_exception: Class
+	(* Argument of the /*. pragma 'error_throws_exception' 'EXCEPTION'; .*/
+	   If NIL, no mapping. *)
+
+	first_error_source_found: WHERE
+	(*
+		First error source found in user's code, be it silenced with @
+		or not. The error_throws_exception pragma can be applied only
+		if there are not error sources detected before in user's code,
+		that is only if this variable is NIL. This variable just serves
+		only to make useful the error message.
+	*)
+
+
+FUNCTION init()
+BEGIN
+	IF errors <> NIL THEN
+		RETURN
+	END
+	errors = {
+		{"E_ERROR", 1, FALSE},
+		{"E_WARNING", 2, FALSE},
+		{"E_PARSE", 4, FALSE},
+		{"E_NOTICE", 8, FALSE},
+		{"E_CORE_ERROR", 16, FALSE},
+		{"E_CORE_WARNING", 32, FALSE},
+		{"E_COMPILE_ERROR", 64, FALSE},
+		{"E_COMPILE_WARNING", 128, FALSE},
+		{"E_USER_ERROR", 256, TRUE},
+		{"E_USER_WARNING", 512, TRUE},
+		{"E_USER_NOTICE", 1024, TRUE},
+		{"E_STRICT", 2048, FALSE},
+		{"E_RECOVERABLE_ERROR", 4096, FALSE},
+		{"E_DEPRECATED", 8192, FALSE},
+		{"E_USER_DEPRECATED", 16384, TRUE}
+	}
+END
+
+
+FUNCTION SearchByCode(code: INTEGER): INTEGER
+VAR
+	i: INTEGER
+BEGIN
+	init()
+	FOR i = 0 TO count(errors)-1 DO
+		IF errors[i][code] = code THEN
+			RETURN i
+		END
+	END
+	RETURN -1
+END
+
+
+FUNCTION NameToCode(name: STRING): INTEGER
+VAR
+	i: INTEGER
+BEGIN
+	init()
+	FOR i = 0 TO count(errors)-1 DO
+		IF errors[i][name] = name THEN
+			RETURN errors[i][code]
+		END
+	END
+	RETURN -1
+END
+
+
+FUNCTION CodeToName(code: INTEGER): STRING
+VAR
+	i: INTEGER
+BEGIN
+	i = SearchByCode(code)
+	IF i >= 0 THEN
+		RETURN errors[i][name]
+	ELSE
+		RETURN NIL
+	END
+END
+
+
+FUNCTION ErrorsSetToNames(set: INTEGER): ARRAY OF STRING
+VAR
+	i: INTEGER
+	a: ARRAY OF STRING
+BEGIN
+	init()
+	FOR i = 0 TO count(errors)-1 DO
+		IF errors[i][code] & set <> 0 THEN
+			a[] = errors[i][name]
+			set = set & ~ errors[i][code]
+		END
+	END
+	IF set <> 0 THEN
+		a[] = "FIXME_UNKNOWN_ERROR_" + set
+	END
+	RETURN a
+END
+
+
+FUNCTION ErrorsSetToString(set: INTEGER): STRING
+VAR
+	a: ARRAY OF STRING
+	i: INTEGER
+	s: STRING
+BEGIN
+	a = ErrorsSetToNames(set)
+	FOR i = 0 TO count(a)-1 DO
+		IF s <> NIL THEN
+			s = s + ", "
+		END
+		s = s + a[i]
+	END
+	RETURN s
+END
+
+
+FUNCTION IsUserError(code: INTEGER): BOOLEAN
+VAR
+	i: INTEGER
+BEGIN
+	i = SearchByCode(code)
+	IF i >= 0 THEN
+		RETURN errors[i][user]
+	ELSE
+		RETURN FALSE
+	END
+END
+
+
+FUNCTION RaiseErrors(set: INTEGER)
+BEGIN
+	IF set = 0 THEN
+		RETURN
+	END
+	
+	IF error_throws_exception = NIL THEN
+		# Classic error handling.
+
+		IF (first_error_source_found = NIL)
+		AND NOT curr_package[module] THEN
+			first_error_source_found = Scanner.here()
+		END
+
+		IF (error_throws_exception = NIL) AND (handle_error > 0) THEN
+			# Silenced.
+			RETURN
+		END
+
+		IF print_notices THEN
+			Notice("unhandled error(s): " + ErrorsSetToString(set))
+		END
+
+		# Accounting errors raised in current func/method:
+		IF curr_func <> NIL THEN
+			curr_func[errors] = curr_func[errors] | set
+		ELSIF curr_method <> NIL THEN
+			curr_method[errors] = curr_method[errors] | set
+		ELSE
+			CurrPackageNotLibrary("Might raise unchecked error(s) in "
+				+ reference(here()) + ".")
+		END
+	
+	ELSIF curr_package[module] THEN
+		# Silently throw error as exception.
+		Exceptions.AddExceptions({error_throws_exception})
+	
+	ELSE
+		# Throw error as exception, also performing signature check.
+		Exceptions.ThrowExceptions({error_throws_exception})
+	
+	END
+END
+
+
+FUNCTION ParseErrorThrowsExceptionPragma(where: WHERE, a: ARRAY OF STRING)
+VAR
+	c: Class
+BEGIN
+	IF count(a) <> 2 THEN
+		Error2(where, "expected 1 argument for pragma error_throws_exception")
+		RETURN
+	END
+	IF error_throws_exception <> NIL THEN
+		Error2(where, "pragma already set before")
+		RETURN
+	END
+	IF first_error_source_found <> NIL THEN
+		Error2(where, "error mapping into exception cannot be applied here"
+			+ " because an error source was already encountered"
+			+ " in source code before, the first one seen in "
+			+ reference(first_error_source_found))
+	END
+	IF NOT match(a[1], Globals.BARE_ID_OR_QUALIFIED_NAME) THEN
+		Error2(where, "invalid class name: " + a[1])
+		RETURN
+	END
+	c = SearchClass(a[1])
+	IF c = NIL THEN
+		Error2(where, "unknown class `" + a[1] + "'")
+		RETURN
+	END
+	IF NOT IsExceptionClass(c) THEN
+		Error2(where, "class `" + a[1] + "' is not an exception")
+		RETURN
+	END
+	error_throws_exception = c
+END
+
+
+FUNCTION EnteringSilencer()
+BEGIN
+	handle_error = handle_error + 1
+	IF error_throws_exception <> NIL THEN
+		Error("errors mapping into exception is in effect, the silencer operator `@' cannot be used anymore")
+	END
+END
+
+
+FUNCTION ExitingSilencer()
+BEGIN
+	handle_error = handle_error - 1
+END
+
+
+END

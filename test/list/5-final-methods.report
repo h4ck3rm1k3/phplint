@@ -1,0 +1,98 @@
+
+BEGIN parsing of 5-final-methods.php
+1:	<?php
+2:	
+3:	# interface methods (and then, constructors too) cannot be `final':
+4:	
+5:	interface aa {
+6:		final /*. void .*/ function __construct();
+
+		final /*. void .*/ function __construct();
+	         \_ HERE
+==== 6: ERROR: invalid `final' attribute for abstract method
+7:		final /*. void .*/ function m();
+
+		final /*. void .*/ function m();
+	         \_ HERE
+==== 7: ERROR: invalid `final' attribute for abstract method
+8:	}
+9:	
+10:	# the same for interface proto:
+11:	
+12:	/*. forward
+13:	interface aa2 {
+14:		final void function __construct();
+
+		final void function __construct();
+	                       \_ HERE
+==== 14: ERROR: interface methods cannot be `final'
+15:		final void function m();
+
+		final void function m();
+	                       \_ HERE
+==== 15: ERROR: interface methods cannot be `final'
+16:	}
+17:	.*/
+18:	
+19:	
+20:	# abstract methods (and the, constructors too) cannot be `final':
+21:	
+22:	abstract class bb {
+23:		abstract final /*. void .*/ function __construct();
+
+		abstract final /*. void .*/ function __construct();
+	                                        \_ HERE
+==== 23: ERROR: abstract methods cannot be `final'
+24:		abstract final /*. void .*/ function m();
+
+		abstract final /*. void .*/ function m();
+	                                        \_ HERE
+==== 24: ERROR: abstract methods cannot be `final'
+25:	}
+26:	
+27:	# the same for abstract class proto:
+28:	
+29:	/*. forward
+30:	abstract class bb2 {
+31:		abstract final void function __construct();
+
+		abstract final void function __construct();
+	                                \_ HERE
+==== 31: ERROR: abstract methods cannot be `final'
+32:		abstract final void function m();
+
+		abstract final void function m();
+	                                \_ HERE
+==== 32: ERROR: abstract methods cannot be `final'
+33:	}
+34:	.*/
+35:	
+36:	
+37:	# concrete methods (and then, constructors too) can be `final':
+38:	
+39:	class cc {
+40:		final /*. void .*/ function __construct(){}
+41:		final /*. void .*/ function m(){}
+42:	}
+43:	
+44:	# the same for concrete methods:
+45:	
+46:	/*. forward
+47:	class cc2 {
+48:		final void function __construct();
+49:		final void function m();
+50:	}
+51:	.*/
+52:	
+53:	?>
+==== 54: ERROR: missing class `aa2' declared forward in line 13
+==== 54: ERROR: missing class `bb2' declared forward in line 30
+==== 54: ERROR: missing class `cc2' declared forward in line 47
+END parsing of 5-final-methods.php
+==== 5-final-methods.php:5: notice: unused class `aa'
+==== 5-final-methods.php:13: notice: unused class `aa2'
+==== 5-final-methods.php:22: notice: unused class `bb'
+==== 5-final-methods.php:30: notice: unused class `bb2'
+==== 5-final-methods.php:39: notice: unused class `cc'
+==== 5-final-methods.php:47: notice: unused class `cc2'
+Overall test results: 11 errors, 0 warnings.

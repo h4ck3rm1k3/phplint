@@ -1,0 +1,32 @@
+IMPLEMENTATION MODULE Tokens
+
+# This file was generated automatically by ../utils/make-tokens-module -- do not edit
+
+IMPORT str
+
+VAR tokens: ARRAY OF STRING
+
+FUNCTION Init()
+BEGIN
+	IF tokens <> NIL THEN
+		RETURN
+	END
+	tokens = split(
+"eof unknown unimplemented_keyword text open_tag open_tag_with_echo close_tag define function declare lbrace rbrace lround rround lsquare rsquare comma semicolon colon double_colon variable for foreach as while if else elseif return identifier question assign rarrow single_quoted_string double_quoted_string embedded_variable continuing_double_quoted_string here_doc lit_int lit_float plus minus times div eq eeq ne nee gt "
++ "ge lt le incr decr not or or2 and and2 at period arrow global null boolean false true int float string array object bit_or bit_and mod period_assign plus_assign minus_assign times_assign div_assign mod_assign bit_and_assign bit_or_assign bit_xor_assign lshift_assign rshift_assign lshift rshift bit_xor xor bit_not abstract interface class extends implements const var public "
++ "private protected static final self parent new clone instanceof list switch case break default exit echo print trigger_error do try catch throw continue isset include include_once require require_once namespace use goto x_require_module x_single_quoted_string x_semicolon x_colon x_comma x_assign x_forward x_function x_class x_extends x_implements x_const x_interface x_unchecked x_void x_boolean x_int x_float x_string "
++ "x_array x_mixed x_resource x_object x_identifier x_variable x_bit_and x_args x_lround x_rround x_lsquare x_rsquare x_lbrace x_rbrace x_pragma x_if_php_ver_4 x_if_php_ver_5 x_else x_end_if_php_ver x_missing_break x_missing_default x_public x_protected x_private x_abstract x_static x_final x_self x_parent x_throws x_return x_namespace x_lt x_gt x_doc x_docBlock ", " ")
+END
+
+FUNCTION CodeToName(code: INTEGER): STRING
+BEGIN
+	Init()
+	IF (code >= 0) AND (code < count(tokens)-1) THEN
+		RETURN "sym_" + tokens[code]
+	ELSE
+		RETURN "sym_" + code
+	END
+END
+
+END
+

@@ -1,0 +1,64 @@
+IMPLEMENTATION MODULE MagicConstants
+
+IMPORT Globals
+IMPORT Scanner
+IMPORT FileName
+
+FUNCTION Resolve(c: CONSTANT): Result
+VAR
+	name: STRING
+BEGIN
+	name = c[name]
+	IF (length(name) < 3) OR (name[0] <> "_") OR (name[1] <> "_") THEN
+		RETURN c[value]
+	END
+
+	IF (php_ver = php5) AND (name = "__DIR__") THEN
+		RETURN {string_type, FileName.Dirname(curr_package[fn])}
+	
+	ELSIF name = "__FILE__" THEN
+		RETURN {string_type, curr_package[fn]}
+	
+	ELSIF name = "__LINE__" THEN
+		RETURN {int_type, itos(Scanner.here()[line_n])}
+	
+	ELSIF (php_ver = php5) AND (name = "__NAMESPACE__") THEN
+		RETURN {string_type, "" + curr_package[namespace_current]}
+	
+	ELSIF name = "__FUNCTION__" THEN
+		IF curr_func = NIL THEN
+			RETURN {string_type, ""}
+		ELSE
+			IF php_ver = php4 THEN
+				RETURN {string_type, curr_func[name_lower]}
+			ELSE
+				RETURN {string_type, curr_func[name]}
+			END
+		END
+	
+	ELSIF name = "__CLASS__" THEN
+		IF curr_class = NIL THEN
+			RETURN {string_type, ""}
+		ELSE
+			IF php_ver = php4 THEN
+				RETURN {string_type, curr_class[name_lower]}
+			ELSE
+				RETURN {string_type, curr_class[name]}
+			END
+		END
+	
+	ELSIF (php_ver = php5) AND (name = "__METHOD__") THEN
+		IF curr_method = NIL THEN
+			RETURN {string_type, ""}
+		ELSE
+			RETURN {string_type, curr_method[name]}
+		END
+	
+	ELSE
+		RETURN c[value]
+	
+	END
+
+END
+
+END

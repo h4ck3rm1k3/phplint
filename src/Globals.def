@@ -1,0 +1,114 @@
+DEFINITION MODULE Globals
+(*
+	Global constants, global variables and general utilities.
+*)
+
+IMPORT Types
+
+CONST
+	# Regexps for match(s, REGEX):
+	# Note that "\x7F" (ASCII DEL) isn't allowed in IDs under PHPLint.
+	ID = "^[a-zA-Z_\x80-\xFF][a-zA-Z_0-9\x80-\xFF]*$"
+	ID_FIRST_CHAR = "^[a-zA-Z_\x80-\xFF]$"
+	ID_CHAR = "^[a-zA-Z_0-9\x80-\xFF]$"
+	BARE_ID_OR_QUALIFIED_NAME = "^\\\\?[_a-zA-Z\x80-\xff]+(\\\\[_0-9a-zA-Z\x80-\xff]+)*$"
+
+
+VAR
+	DEBUG: BOOLEAN
+
+	php_ver: PHP_VERSION
+
+	(*
+		Most used types pre-allocated by phplint.mod:
+	*)
+
+	null_type, void_type, boolean_type, int_type, float_type,
+	string_type, mixed_type, function_type, object_type,
+	resource_type: Type
+
+	(*
+		Collect packages, constants, global variables, functions
+		and classes parsed up there:
+	*)
+
+	required_packages: ARRAY OF Package
+	(* packages included with require_module ... and required_once ... *)
+
+	curr_package: Package
+	(* pkg currently being parsed *)
+
+	consts: ARRAY OF CONSTANT
+
+	vars_n: INTEGER (* next available entry in vars *)
+	vars: ARRAY OF VARIABLE
+
+	funcs: ARRAY OF Function
+
+	classes: ARRAY OF Class
+
+
+	(*
+		State of the parser:
+	*)
+
+	scope: INTEGER
+	(* Incremented entering a function/method, and decremented on
+	exit. Functions may be nested, but PHP support only 2 scopes:
+	global and local. So, if scope=0 we are in the global scope,
+	else if scope>0 we are in the local scope. *)
+
+	curr_func: Function
+	(* the function we are parsing right now *)
+
+	curr_class: Class
+	(* the class we are parsing right now *)
+
+	curr_method: Method
+	(* the method we are parsing right now *)
+
+	recursive_parsing: BOOLEAN
+	(* follows require_module and require_once directives *)
+
+	loop_level: INTEGER
+	(* loop nesting level of for(), foreach(), while(), do...while(),
+	switch(){}. Needed to check 'break' and 'continue' usage. *)
+
+
+	(*
+		Autoload pragma:
+	*)
+
+	autoload_function: Function
+	(* The __autoload() function; NIL=still not found. *)
+
+	autoload_prepend, autoload_separator, autoload_append: STRING
+	(* Arguments of the /*. pragma 'autoload' ... .*/ meta-code. *)
+
+	try_block_nesting_level: INTEGER
+	(* nesting level of the try{} instruction - incremented entering try{}
+	and decremented exiting *)
+
+	exceptions: ThrownExceptions
+	(* exceptions thrown inside a try{} block are collected here,
+	see ThrowException() *)
+
+
+
+
+
+FUNCTION CurrPackageNotLibrary(descr: STRING)
+(*
+	Marks current package as not-library. Occurrences of this function
+	in this module explains when a package cannot be a library:
+	- file contains leading text
+	- <?= at global scope
+	- raises error in code at global scope
+	- throws unchecked exception at global scope
+	- other (see code below)
+
+	Set curr_package[library] to FALSE and add the description to
+	curr_package[why_not_library].
+*)
+
+END

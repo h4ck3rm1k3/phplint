@@ -1,0 +1,12 @@
+DEFINITION MODULE MagicConstants
+
+IMPORT Types
+
+FUNCTION Resolve(c: CONSTANT): Result
+(*
+	Check if c is a magic constant __XXX__ and then dynamically
+	determinates its value based on the current state of the scanner and of
+	the parser. If not a magic constant, returns c[value].
+*)
+
+END

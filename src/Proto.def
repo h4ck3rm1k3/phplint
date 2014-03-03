@@ -1,0 +1,5 @@
+DEFINITION MODULE Proto
+
+FUNCTION ParseForwardDecl()
+
+END

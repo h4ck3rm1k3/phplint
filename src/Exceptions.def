@@ -1,0 +1,46 @@
+DEFINITION MODULE Exceptions
+
+IMPORT Types, Globals
+
+FUNCTION AddExceptionToSet(exception: Class, VAR exceptions: ThrownExceptions)
+(*
+	Add the exception to the set. Duplicated entries are not added.
+*)
+
+FUNCTION AddException(exception: Class)
+(*
+	Add an exception to the current function/method, or the current list of
+	exceptions if inside the try{} block (see the `exceptions' variable).
+	Duplicated entries are not added.
+	Use for: "throws" statement, "throw" statement.
+	No user feedback.
+*)
+
+FUNCTION AddExceptions(exceptions: ThrownExceptions)
+(*
+	Just like AddException() but applied to a set of exceptions.
+*)
+
+FUNCTION ThrowExceptions(exceptions: ThrownExceptions)
+(*
+	Just like AddExceptions(), but provides feedback to the user.
+	Use for: exceptions generated calling functions and methods.
+	Raises a Warning at global scope outside try{}, Notice otherwise.
+	Accounts for an exception thrown in the current context of the parser.
+*)
+
+FUNCTION ParseThrows()
+(*
+	Parse the meta-code `throws' list of thown exceptions for a function
+	or method. Adds the exceptions to the current function or method.
+*)
+
+FUNCTION RemoveExceptionFromSet(caught_exception: Class,
+	VAR thrown_exceptions: ThrownExceptions): BOOLEAN
+(*
+	Remove the exception from the list of thrown exceptions.
+	Remove also any entry that is an extension of the given exception.
+	Returns TRUE if at least an entry is removed.
+*)
+
+END

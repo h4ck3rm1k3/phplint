@@ -1,0 +1,291 @@
+
+BEGIN parsing of 5-exceptions.php
+1:	<?php
+2:	
+3:	/*. require_module 'standard'; .*/
+4:	
+5:	class NotAnException {}
+6:	class AException extends Exception {}
+7:	class BException extends AException {}
+8:	class CException extends BException {}
+9:	
+10:	throw new NotAnException();
+
+	throw new NotAnException();
+	                           \_ HERE
+==== 10: ERROR: the class `NotAnException' isn't an extension of the `Exception' class
+11:	
+12:	function f1()
+
+	function f1()
+	        \_ HERE
+==== 12: ERROR: unreachable statement
+13:	/*. throws AException, BException .*/
+14:	{ }
+15:	
+16:	
+17:	function test_good()
+==== 12: notice: guessed signature of the function `f1()' as void()
+18:	# More specialized exceptions should be cought first.
+19:	{
+20:		try { f1(); }
+
+		try { f1(); }
+	             \_ HERE
+==== 20: notice: here generating exception(s) BException, AException
+21:		catch( BException $e ){}
+22:		catch( AException $e ){}
+==== 21: notice: caught exception variable `$e' assigned but never used
+23:	}
+==== 22: notice: caught exception variable `$e' assigned but never used
+24:	
+25:	function test_wrong_order()
+==== 17: notice: guessed signature of the function `test_good()' as void()
+26:	# More general (i.e. parent) exceptions hides the more specialized ones.
+27:	{
+28:		try { f1(); }
+
+		try { f1(); }
+	             \_ HERE
+==== 28: notice: here generating exception(s) BException, AException
+29:		catch( AException $e ){}
+30:		catch( BException $e ){}  # this branch never used
+==== 29: notice: caught exception variable `$e' assigned but never used
+
+		catch( BException $e ){}  # this branch never used
+	                      \_ HERE
+==== 30: ERROR: exception `BException' not thrown or already caught
+31:	}
+==== 30: notice: caught exception variable `$e' assigned but never used
+32:	
+33:	function test_catch_all()
+==== 25: notice: guessed signature of the function `test_wrong_order()' as void()
+34:	# Lazy programmers prefers to catch Exception.
+35:	{
+36:		try { f1(); }
+
+		try { f1(); }
+	             \_ HERE
+==== 36: notice: here generating exception(s) BException, AException
+37:		catch( Exception $e ){}
+38:	}
+==== 37: notice: caught exception variable `$e' assigned but never used
+39:	
+40:	function test_catch_partial()
+==== 33: notice: guessed signature of the function `test_catch_all()' as void()
+41:	# Uncought exceptions are exported by the func/method.
+42:	{
+43:		try { f1(); }
+
+		try { f1(); }
+	             \_ HERE
+==== 43: notice: here generating exception(s) BException, AException
+44:		catch( BException $e ){}
+45:	}
+==== 44: notice: caught exception variable `$e' assigned but never used
+
+	}
+	 \_ HERE
+==== 45: notice: here generating exception(s) AException
+
+	}
+	 \_ HERE
+==== 45: ERROR: exception(s) must be caught or declared to be thrown: AException
+46:	
+47:	class C1 {
+==== 40: notice: guessed signature of the function `test_catch_partial()' as void()
+48:		public function m() /*. throws BException .*/{}
+49:	}
+==== 48: notice: guessed signature of the method `C1::m()' as public void()
+50:	
+51:	class C2 extends C1 {
+52:		public function m() /*. throws BException .*/{}
+53:	}
+==== 52: notice: guessed signature of the method `C2::m()' as public void()
+54:	
+55:	class C3 extends C1 {
+56:		public function m(){}
+57:	}
+==== 56: notice: guessed signature of the method `C3::m()' as public void()
+58:	
+59:	class C4 extends C1 {
+60:		public function m() /*. throws AException, BException, CException .*/{}
+61:	}
+==== 60: notice: guessed signature of the method `C4::m()' as public void()
+==== 60: ERROR: `C4::m()': more exceptions thrown than declared in overridden method `C1::m()' declared in line 48: AException
+62:	
+63:	interface I1 {
+64:		public function m() /*. throws BException .*/ ;
+65:	}
+==== 64: notice: guessed signature of the method `I1::m()' as public void()
+66:	
+67:	class CI1 implements I1 {
+68:		public function m() /*. throws BException .*/{}
+69:	}
+==== 68: notice: guessed signature of the method `CI1::m()' as public void()
+70:	
+71:	class CI2 implements I1 {
+72:		public function m(){}
+73:	}
+==== 72: notice: guessed signature of the method `CI2::m()' as public void()
+74:	
+75:	class CI3 implements I1 {
+76:		public function m() /*. throws AException, BException, CException .*/{}
+77:	}
+==== 76: notice: guessed signature of the method `CI3::m()' as public void()
+==== 76: ERROR: `CI3::m()': more exceptions thrown than declared in implemented method `I1::m()' declared in line 64: AException
+78:	
+79:	/*. forward void function f2() throws BException, CException; .*/
+80:	
+81:	/*. void .*/ function f2()
+
+	/*. void .*/ function f2()
+	                        \_ HERE
+==== 81: notice: function `f2()' declared forward in line 79 but never used before implementation
+82:	/*. throws AException, BException .*/
+83:	{
+==== 81: ERROR: function `f2()' throws more exceptions than those listed in the prototype declared in line 79: AException
+84:	}
+85:	
+86:	class C5 {
+87:		/*.
+88:			forward void function m() throws BException, CException;
+89:			forward void function n() throws BException, CException;
+90:		.*/
+91:	
+92:		public function m()
+93:		/*. throws BException .*/
+94:		{}
+95:	
+96:		public function n()
+==== 92: notice: guessed signature of the method `C5::m()' as public void()
+97:		/*. throws AException, BException .*/
+98:		{}
+==== 96: ERROR: method `n()' throws more exceptions than those listed in the prototype declared in line 89: AException
+99:	}
+==== 96: notice: guessed signature of the method `C5::n()' as public void()
+100:	
+101:	
+102:	# Guessed functions cannot throw exceptions:
+103:	# Ok:
+104:	guessed_func();
+
+	guessed_func();
+	             \_ HERE
+==== 104: Warning: function `guessed_func()' (still) not declared. Guessing signature from its usage. Hint: it's better to declare the functions before their usage.
+105:	function guessed_func(){}
+106:	# BAD:
+107:	guessed_func2();
+==== 105: notice: guessed signature of the function `guessed_func()' as void()
+==== 105: ERROR: function `guessed_func()': declared signature void() differs from signature mixed() as guessed in line 104
+
+	guessed_func2();
+	              \_ HERE
+==== 107: Warning: function `guessed_func2()' (still) not declared. Guessing signature from its usage. Hint: it's better to declare the functions before their usage.
+108:	function guessed_func2(){ throw new Exception(); }
+
+	function guessed_func2(){ throw new Exception(); }
+	                                                \_ HERE
+==== 108: notice: here generating exception(s) Exception
+
+	function guessed_func2(){ throw new Exception(); }
+	                                                \_ HERE
+==== 108: ERROR: exception(s) must be caught or declared to be thrown: Exception
+109:	guessed_func3();
+==== 108: notice: guessed signature of the function `guessed_func2()' as void()
+==== 108: ERROR: function `guessed_func2()': declared signature void() differs from signature mixed() as guessed in line 107
+
+	guessed_func3();
+	              \_ HERE
+==== 109: Warning: function `guessed_func3()' (still) not declared. Guessing signature from its usage. Hint: it's better to declare the functions before their usage.
+110:	function guessed_func3()/*. throws Exception .*/{ throw new Exception(); }
+==== 110: ERROR: function `guessed_func3()' already guessed in line 109 cannot throw unexpected exception(s): Exception
+
+	function guessed_func3()/*. throws Exception .*/{ throw new Exception(); }
+	                                                                        \_ HERE
+==== 110: notice: here generating exception(s) Exception
+111:	
+112:	
+113:	# Guessed methods cannot throw exceptions:
+114:	class CheckExceptionsInGuessedMethods {
+==== 110: notice: guessed signature of the function `guessed_func3()' as void()
+==== 110: ERROR: function `guessed_func3()': declared signature void() differs from signature mixed() as guessed in line 109
+115:	
+116:		function m1(){
+117:			$this->m2();
+
+			$this->m2();
+	                  \_ HERE
+==== 117: ERROR: the method CheckExceptionsInGuessedMethods::m2() does not exist
+
+			$this->m2();
+	                    \_ HERE
+==== 117: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m2()' as public unknown()
+118:			$this->m3();
+
+			$this->m3();
+	                  \_ HERE
+==== 118: ERROR: the method CheckExceptionsInGuessedMethods::m3() does not exist
+
+			$this->m3();
+	                    \_ HERE
+==== 118: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m3()' as public unknown()
+119:			$this->m4();
+
+			$this->m4();
+	                  \_ HERE
+==== 119: ERROR: the method CheckExceptionsInGuessedMethods::m4() does not exist
+
+			$this->m4();
+	                    \_ HERE
+==== 119: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m4()' as public unknown()
+120:		}
+121:	
+122:		# Ok:
+123:		function m2(){}
+==== 116: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m1()' as public void()
+124:	
+125:		# BAD:
+126:		function m3(){ throw new Exception(); }
+==== 123: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m2()' as public void()
+==== 123: ERROR: method `CheckExceptionsInGuessedMethods::m2()' with signature `public void()' does not match the signature `public unknown()' as guessed in line 117
+
+		function m3(){ throw new Exception(); }
+	                                         \_ HERE
+==== 126: notice: here generating exception(s) Exception
+
+		function m3(){ throw new Exception(); }
+	                                         \_ HERE
+==== 126: ERROR: exception(s) must be caught or declared to be thrown: Exception
+127:		function m4() /*. throws Exception .*/ { throw new Exception(); }
+==== 126: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m3()' as public void()
+==== 126: ERROR: method `CheckExceptionsInGuessedMethods::m3()' with signature `public void()' does not match the signature `public unknown()' as guessed in line 118
+==== 127: ERROR: method `m4()' already guessed in line 119 cannot throw unexpected exception(s): Exception
+
+		function m4() /*. throws Exception .*/ { throw new Exception(); }
+	                                                                   \_ HERE
+==== 127: notice: here generating exception(s) Exception
+128:	}
+==== 127: notice: guessed signature of the method `CheckExceptionsInGuessedMethods::m4()' as public void()
+==== 127: ERROR: method `CheckExceptionsInGuessedMethods::m4()' with signature `public void()' does not match the signature `public unknown()' as guessed in line 119
+129:	
+130:	
+131:	?>
+END parsing of 5-exceptions.php
+==== 5-exceptions.php:17: notice: unused function `test_good()'
+==== 5-exceptions.php:25: notice: unused function `test_wrong_order()'
+==== 5-exceptions.php:33: notice: unused function `test_catch_all()'
+==== 5-exceptions.php:40: notice: unused function `test_catch_partial()'
+==== 5-exceptions.php:81: notice: unused function `f2()'
+==== 5-exceptions.php:8: notice: unused class `CException'
+==== 5-exceptions.php:48: notice: unused method `C1::m()'
+==== 5-exceptions.php:51: notice: unused class `C2'
+==== 5-exceptions.php:55: notice: unused class `C3'
+==== 5-exceptions.php:59: notice: unused class `C4'
+==== 5-exceptions.php:67: notice: unused class `CI1'
+==== 5-exceptions.php:71: notice: unused class `CI2'
+==== 5-exceptions.php:75: notice: unused class `CI3'
+==== 5-exceptions.php:86: notice: unused class `C5'
+==== 5-exceptions.php:114: notice: unused class `CheckExceptionsInGuessedMethods'
+==== ?: notice: required module `standard'
+Overall test results: 21 errors, 3 warnings.

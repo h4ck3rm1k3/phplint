@@ -1,0 +1,29 @@
+
+BEGIN parsing of 5-spl-Traversable-3.php
+1:	<?php
+2:	
+3:		/*. require_module 'spl'; .*/
+4:	
+5:		interface Test1 extends Iterator, IteratorAggregate {
+6:		}
+7:	
+8:		class Test2 implements Test1 {
+
+		class Test2 implements Test1 {
+	                                  \_ HERE
+==== 8: ERROR: can't implement both `Iterator' and `IteratorAggregate'
+9:		}
+10:	
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `Iterator::rewind()'
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `Iterator::valid()'
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `Iterator::key()'
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `Iterator::current()'
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `Iterator::next()'
+==== 8: ERROR: in class `Test2': missing implementation of the abstract method `IteratorAggregate::getIterator()'
+END parsing of 5-spl-Traversable-3.php
+==== 5-spl-Traversable-3.php:8: notice: unused class `Test2'
+==== ?: notice: required module `spl'
+==== ?: notice: required module `simplexml'
+==== ?: notice: required module `dom'
+==== ?: notice: required module `standard'
+Overall test results: 7 errors, 0 warnings.

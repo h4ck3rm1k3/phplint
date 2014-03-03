@@ -1,0 +1,277 @@
+#!/bin/bash
+
+# Performs comparison between reports generated on list/*.php
+#
+# Syntax:
+#
+#    $0 [batch]
+#
+# In batch mode, only displays the result of each test and
+# exit with 0 on success or 1 on failure if one or more
+# tests show differences.
+#
+# Every test file inside list/*.php must begin either with "4" if
+# PHP 4 source, or "5" if PHP 5 source. The extension .php is
+# mandatory.
+# For each *.php file, a corresponding *.report file is
+# generated. If the report already exists, compare with the
+# new report *.report.new for differences. In interactive mode
+# displays differences and allows to accept or reject changes;
+# on reject, the new report is deleted; on accept, the new
+# report replaces the old one.
+#
+# To add new tests, symply add a file 4-testname.php to the
+# "list" directory and run "$0": the generated report for the
+# new test is displayed and asks for confirmation.
+#
+# If X Window available, try to use graphical programs "mousepad"
+# (text editor) and "tkdiff" (diff program), otherwise stick with
+# "less" and "diff".
+
+if [ "x$1" = "xbatch" ]; then
+	mode=batch
+	# exit on a diff or missing report
+else
+	mode=interactive
+	# ask to the user what to do
+fi
+
+function realpath()
+{
+	if [ -d "$1" ]; then
+		(cd -- "$1" && pwd)
+	elif [ -f "$1" ]; then
+		(cd -- $(dirname -- "$1") && echo $(pwd)/$(basename -- $1))
+	else
+		echo "$1: file/directory not found"
+		exit 1
+	fi
+}
+
+
+# Show differences between $1 and $2 files.
+function show_diff()
+{
+	# Choose your preferred graphical diff program:
+	if [ -n "$DISPLAY" ] && hash tkdiff 2>/dev/null; then
+		tkdiff $1 $2 &
+	else
+		# Split long lines for side-by-side view:
+		COLS=$(tput cols)
+		W=$(expr \( $COLS - 3 \) / 2)
+		a=$1.folded
+		b=$2.folded
+		expand -t 4 $1 | fold -b -w $W > $a
+		expand -t 4 $2 | fold -b -w $W > $b
+		diff -y -t -W $(tput cols) $a $b | less
+		rm $a $b
+	fi
+}
+
+
+# Displays a text file $1, read only.
+function show_text()
+{
+	# Choose your preferred graphical text program:
+	if [ -n "$DISPLAY" ] && hash mousepad 2>/dev/null; then
+		mousepad $1 &
+	else
+		less $1
+	fi
+}
+
+
+# Set PHPLint program
+phplint_program=$(realpath ../src/phplint)
+
+# Set PHPLint command
+cmd="$phplint_program --no-print-file-name --print-path relative --modules-path $(realpath ../modules) --print-source --print-context --tab-size 4"
+
+# Set dir. where tests are stored
+list=$(realpath list)
+
+found_diff=0
+
+
+function generate_report()
+# Arguments: $1=PHP version, $2=source file, $3=report file
+{
+	$cmd --php-version $1 $2 &> $3
+}
+
+
+function interactive_found_diff_in_report()
+# Arguments: $1=PHP version, $2=source, $3=old report, $4=new report
+{
+	local src old_report new_report
+
+	php_ver=$1
+	src=$2
+	old_report=$3
+	new_report=$4
+
+	show_diff $old_report $new_report
+
+	while true; do
+
+		echo "$2: report differ"
+		echo -n "Confirm differences? [confirm/reject/repeat/stop] "
+		read
+		case $REPLY in
+			confirm)
+				echo "New report confirmed."
+				mv $new_report $old_report
+				return
+				;;
+			reject)
+				echo "Report rejected, test failed."
+				rm $new_report
+				found_diff=1
+				return
+				;;
+			repeat)
+				echo "$src: repeating test"
+				generate_report $php_ver $src $new_report
+				if diff -q $old_report $new_report; then
+					echo "$src: no differences"
+					sleep 1
+					return
+				else
+					show_diff $old_report $new_report
+				fi
+				;;
+			stop)
+				echo "Report rejected. Stopping."
+				rm $new_report
+				exit 1
+				;;
+			*)
+				echo "Invalid reply."
+				;;
+		esac
+	
+	done
+}
+
+
+function interactive_create_report()
+# Arguments: $1=PHP version, $2=source, $3=old report, $4=new report
+# Create the new_report then, if confirmed, copy it in the old_report.
+{
+	local php_ver src old_report new_report
+
+	php_ver=$1
+	src=$2
+	old_report=$3
+	new_report=$4
+
+	generate_report $php_ver $src $new_report
+
+	$view_text_program $new_report &
+
+	while true; do
+
+		echo "$src: report generated."
+		echo -n "Keep new report? [confirm/reject/repeat/stop] "
+		read
+
+		case $REPLY in
+			confirm)
+				echo "Report confirmed."
+				mv $new_report $old_report
+				return
+				;;
+			reject)
+				echo "Report rejected."
+				rm $new_report
+				found_diff=1
+				return
+				;;
+			repeat)
+				echo "Repeating."
+				generate_report $php_ver $src $new_report
+				show_text $new_report
+				;;
+			stop)
+				echo "Report rejected. Stopping."
+				exit 1
+				;;
+			*)
+				echo "Invalid reply."
+				;;
+		esac
+	done
+}
+
+
+function run()
+# Arguments: $1=PHP version, $2=PHP src
+{
+	local src old_report new_report
+
+	php_ver=$1
+	src=$2
+	base=$(basename $src .php)
+	old_report=$base.report
+	new_report=$base.new.report
+
+	if [ -f $old_report ]; then
+
+		# Report exits -- generate the new one and compare.
+
+		generate_report $php_ver $src $new_report
+
+		if diff -q $old_report $new_report; then
+			printf "    %-50s no differences\n" $src
+			rm $new_report
+			return
+
+		else
+			if [ $mode = batch ]; then
+				rm $new_report
+				printf "    %-50s DIFFERENCES FOUND\n" $src
+				found_diff=1
+				return
+			else
+				interactive_found_diff_in_report $php_ver $src $old_report $new_report
+			fi
+		fi
+
+	else
+
+		# Report does not exist.
+
+		if [ $mode = batch ]; then
+			echo "**** ERROR: Missing report for test $src."
+			echo "You must first run tests interactively with './run-tests'."
+			exit 1
+
+		else
+			interactive_create_report $php_ver $src $old_report $new_report
+		fi
+
+
+	fi
+}
+
+
+
+cd $list || exit 1
+
+echo "Running tests:"
+
+for f in $(ls 4-*.php); do
+	run 4 $f
+done
+for f in $(ls 5-*.php); do
+	run 5 $f
+done
+
+echo -n "Test result: "
+if [ $found_diff -eq 0 ]; then
+	echo "all the tests passed."
+	exit 0
+else
+	echo "FOUND DIFFERENCES."
+	echo 1
+fi

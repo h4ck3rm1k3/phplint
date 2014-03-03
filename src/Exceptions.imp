@@ -1,0 +1,166 @@
+IMPLEMENTATION MODULE Exceptions
+
+IMPORT Classes
+IMPORT Globals
+IMPORT Scanner
+IMPORT Search
+
+
+FUNCTION AddExceptionToSet(exception: Class, VAR exceptions: ThrownExceptions)
+VAR
+	i: INTEGER
+BEGIN
+	FOR i=0 TO count(exceptions)-1 DO
+		IF exceptions[i] = exception THEN
+			RETURN
+		END
+	END
+	exceptions[] = exception
+END
+
+
+FUNCTION AddException(exception: Class)
+BEGIN
+	IF try_block_nesting_level = 0 THEN
+		IF curr_func <> NIL THEN
+			AddExceptionToSet(exception, curr_func[exceptions])
+		ELSIF curr_method <> NIL THEN
+			AddExceptionToSet(exception, curr_method[exceptions])
+		END
+	ELSE
+		AddExceptionToSet(exception, exceptions)
+	END
+END
+
+
+FUNCTION AddExceptions(exceptions: ThrownExceptions)
+VAR i: INTEGER
+BEGIN
+	FOR i = 0 TO count(exceptions)-1 DO
+		AddException(exceptions[i])
+	END
+END
+
+
+FUNCTION ThrowExceptions(exceptions: ThrownExceptions)
+VAR
+	throws, checked, orphans: ARRAY OF Class
+	s: STRING
+BEGIN
+	IF count(exceptions) = 0 THEN
+		RETURN
+	END
+
+	checked = CheckedExceptionsSubset(exceptions)
+	IF count(checked) = 0 THEN
+		RETURN
+	END
+
+	IF print_notices THEN
+		Notice("here generating exception(s) "
+			+ Classes.ClassesList( Classes.Sort(checked) ))
+	END
+
+	IF curr_func <> NIL THEN
+
+		IF try_block_nesting_level = 0 THEN
+			throws = curr_func[exceptions]
+			orphans = OrphanClasses(throws, checked)
+			IF count(orphans) > 0 THEN
+				Error("exception(s) must be caught or declared to be thrown: "
+				+ Classes.ClassesList( Classes.Sort(orphans) ) )
+				AddExceptions(orphans)  # Automatic collection.
+			END
+
+		ELSE
+			AddExceptions(checked)
+		END
+
+	ELSIF curr_method <> NIL THEN
+
+		IF try_block_nesting_level = 0 THEN
+			throws = curr_method[exceptions]
+			orphans = OrphanClasses(throws, checked)
+			IF count(orphans) > 0 THEN
+				Error("exception(s) must be caught or declared to be thrown: "
+				+ Classes.ClassesList( Classes.Sort(orphans) ) )
+				AddExceptions(orphans)  # Automatic collection.
+			END
+
+		ELSE
+			AddExceptions(checked)
+		END
+
+	ELSE
+		(* Global scope. *)
+		IF try_block_nesting_level = 0 THEN
+			orphans = checked
+			IF count(orphans) > 0 THEN
+				s = Classes.ClassesList( Classes.Sort(orphans) )
+				Warning("uncaught exception(s): " + s)
+				CurrPackageNotLibrary("Uncought exception(s) " + s
+				+ " at global scope in " + reference(here()) + ".")
+			END
+
+		ELSE
+			AddExceptions(checked)
+		END
+
+	END
+END
+
+
+FUNCTION ParseThrows()
+VAR
+	exception: Class
+BEGIN
+	ReadSym()  # skip "throws"
+	Expect(sym_x_identifier, "expected exception name")
+	LOOP
+		exception = SearchClass(s)
+		IF exception = NIL THEN
+			Error("unknown class `" + s + "'")
+		ELSIF NOT IsExceptionClass(exception) THEN
+			Error("class `" + s + "' is not an exception")
+		ELSE
+			AddException(exception)
+		END
+		ReadSym()
+		IF sym = sym_x_comma THEN
+			ReadSym()
+		ELSE
+			EXIT
+		END
+	END
+END
+
+
+FUNCTION RemoveExceptionFromSet(caught_exception: Class,
+	VAR thrown_exceptions: ThrownExceptions): BOOLEAN
+VAR
+	i: INTEGER
+	found: BOOLEAN
+	shorter: ThrownExceptions
+BEGIN
+	FOR i = 0 TO count(thrown_exceptions)-1 DO
+		IF (thrown_exceptions[i] <> NIL)
+		AND IsSubclassOf(thrown_exceptions[i], caught_exception) THEN
+			thrown_exceptions[i] = NIL
+			found = TRUE
+		END
+	END
+
+	IF found THEN
+		FOR i = 0 TO count(thrown_exceptions)-1 DO
+			IF thrown_exceptions[i] <> NIL THEN
+				shorter[] = thrown_exceptions[i]
+			END
+		END
+		thrown_exceptions = shorter
+	END
+
+	RETURN found
+END
+
+
+END
